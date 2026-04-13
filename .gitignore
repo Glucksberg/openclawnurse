@@ -1,0 +1,10 @@
+.DS_Store
+*.log
+*.tmp
+*.swp
+.env
+dist/
+build/
+tmp/
+state/
+logs/
