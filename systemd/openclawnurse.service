@@ -1,0 +1,9 @@
+[Unit]
+Description=OpenClawNurse daily doctor run
+After=default.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=__CONFIG_FILE__
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__INSTALL_DIR__/bin/openclaw-doctor.sh --config __CONFIG_FILE__

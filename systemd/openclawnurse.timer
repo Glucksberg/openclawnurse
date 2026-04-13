@@ -1,0 +1,10 @@
+[Unit]
+Description=Run OpenClawNurse daily
+
+[Timer]
+OnCalendar=__ON_CALENDAR__
+Persistent=true
+Unit=openclawnurse.service
+
+[Install]
+WantedBy=timers.target

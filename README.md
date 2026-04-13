@@ -9,17 +9,31 @@ OpenClawNurse e um utilitario portavel para manter instancias do OpenClaw saudav
 - relatorio local e via Telegram
 - instalacao repetivel em multiplas maquinas
 
-## Objetivo do repositorio
+## Como instalar
 
-Este repositorio sera a base distribuivel do projeto. Ele deve poder ser clonado em outra maquina e instalado sem depender de paths hardcoded fora do prefixo do usuario.
+1. Clone o repositorio em qualquer diretorio.
+2. Rode `./install.sh`.
+3. Ajuste `~/.config/openclawnurse/openclawnurse.env` se quiser alterar target, horario ou comportamento.
 
-## Estrutura inicial
+Por padrao, o instalador:
 
-- `docs/` documentacao de produto e implementacao
-- `scripts/` scripts executaveis e instalador
-- `systemd/` units para `systemd --user`
-- `config/` exemplos de configuracao local
+- copia o runtime para `~/.local/share/openclawnurse`
+- cria configuracao em `~/.config/openclawnurse/openclawnurse.env`
+- grava estado e logs em `~/.local/state/openclawnurse`
+- instala `systemd --user` com fallback para `crontab`
+- executa um `--dry-run` ao final
 
-## Proximo passo
+## Arquivos principais
 
-Implementar os artefatos da v2 descritos em `docs/PLAN.md`.
+- `scripts/openclaw-doctor.sh` runtime principal
+- `scripts/install-doctor.sh` instalador idempotente
+- `systemd/` templates de `systemd --user`
+- `config/openclaw-doctor.env.example` exemplo de configuracao
+- `docs/PLAN.md` plano v2
+
+## Comandos uteis
+
+- `./install.sh`
+- `~/.local/share/openclawnurse/bin/openclaw-doctor.sh --dry-run`
+- `systemctl --user status openclawnurse.timer`
+- `journalctl --user -u openclawnurse.service -n 200 --no-pager`
