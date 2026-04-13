@@ -15,6 +15,7 @@ CONFIG_FILE="${OPENCLAWNURSE_CONFIG_FILE:-$DEFAULT_CONFIG_FILE}"
 DRY_RUN=0
 RETRY_PENDING_ONLY=0
 NO_NOTIFY=0
+SELF_TEST=0
 
 usage() {
   cat <<'EOF'
@@ -25,6 +26,7 @@ Options:
   --dry-run             Skip state-changing actions like update, repair and restart.
   --retry-pending       Only retry pending notifications and exit.
   --no-notify           Skip notification delivery for this run.
+  --self-test           Validate config, connectivity and OpenClaw access without maintenance.
   -h, --help            Show this help.
 EOF
 }
@@ -45,6 +47,10 @@ while (($# > 0)); do
       ;;
     --no-notify)
       NO_NOTIFY=1
+      shift
+      ;;
+    --self-test)
+      SELF_TEST=1
       shift
       ;;
     -h|--help)
@@ -354,16 +360,76 @@ retry_pending_report() {
   if [[ "$send_status" -eq 0 ]]; then
     log INFO "Pending notification delivered"
     clear_pending_report
-  else
-    log ERROR "Pending notification delivery failed"
+    return 0
   fi
+
+  log ERROR "Pending notification delivery failed"
+  return 1
 }
 
 build_summary_from_output() {
   local output="$1"
   local extracted
-  extracted="$(printf '%s\n' "$output" | grep -E 'missing transcripts|No channel security warnings detected|Telegram:|Agents:|Session store|synced ' | sed 's/^[[:space:][:punct:]]*//g' | head -n 6)"
+  extracted="$(printf '%s\n' "$output" \
+    | grep -E 'missing transcripts|No channel security warnings detected|Telegram:|Agents:|Session store|synced ' \
+    | sed -E 's/[[:space:]]*│[[:space:]]*$//; s/^[[:space:][:punct:]]+//; s/[[:space:]]+/ /g' \
+    | head -n 6)"
   printf '%s' "$extracted"
+}
+
+run_self_test() {
+  log INFO "Running self-test"
+
+  if ! run_preflight_checks; then
+    printf 'SELF_TEST=FAILED\n'
+    printf 'Reason: preflight checks failed\n'
+    printf 'Errors:\n'
+    printf -- '- %s\n' "${ERRORS[@]}"
+    return 1
+  fi
+
+  if ! run_update_status; then
+    printf 'SELF_TEST=FAILED\n'
+    printf 'Reason: update status failed\n'
+    return 1
+  fi
+
+  local health_output health_status
+  local health_cmd
+  build_openclaw_cmd health_cmd
+  health_cmd+=(health --json --timeout "$HEALTH_TIMEOUT_MS")
+  run_capture health_output health_status "Self-test health check" "${health_cmd[@]}"
+
+  if [[ "$health_status" -ne 0 ]] || ! printf '%s' "$health_output" | jq -e '.ok == true' >/dev/null 2>&1; then
+    printf 'SELF_TEST=FAILED\n'
+    printf 'Reason: health check failed\n'
+    return 1
+  fi
+
+  if [[ "$NO_NOTIFY" -eq 0 && -n "$TELEGRAM_TARGET" ]]; then
+    local send_output send_status
+    local send_cmd
+    build_openclaw_cmd send_cmd
+    send_cmd+=(message send --channel "$REPORT_CHANNEL" --target "$TELEGRAM_TARGET" --message "OpenClawNurse self-test" --dry-run --json)
+    run_capture send_output send_status "Self-test notification dry-run" "${send_cmd[@]}"
+    if [[ "$send_status" -ne 0 ]]; then
+      printf 'SELF_TEST=FAILED\n'
+      printf 'Reason: notification dry-run failed\n'
+      return 1
+    fi
+  fi
+
+  printf 'SELF_TEST=OK\n'
+  printf 'Current version: %s\n' "${CURRENT_VERSION_BEFORE:-unknown}"
+  printf 'Available version: %s\n' "${AVAILABLE_VERSION:-unknown}"
+  printf 'Channel: %s\n' "${CHANNEL_VALUE:-unknown}"
+  printf 'Health: ok\n'
+  if [[ -n "$TELEGRAM_TARGET" ]]; then
+    printf 'Notification dry-run: ok (%s)\n' "$TELEGRAM_TARGET"
+  else
+    printf 'Notification dry-run: skipped (no target configured)\n'
+  fi
+  return 0
 }
 
 classify_doctor() {
@@ -745,14 +811,26 @@ main() {
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
     log WARN "Another run is already in progress"
+    if [[ "$SELF_TEST" -eq 1 || "$RETRY_PENDING_ONLY" -eq 1 || "$DRY_RUN" -eq 1 ]]; then
+      exit 75
+    fi
     exit 0
   fi
 
   load_previous_state
 
+  if [[ "$SELF_TEST" -eq 1 ]]; then
+    if run_self_test; then
+      exit 0
+    fi
+    exit 1
+  fi
+
   if [[ "$RETRY_PENDING_ONLY" -eq 1 ]]; then
-    retry_pending_report
-    exit 0
+    if retry_pending_report; then
+      exit 0
+    fi
+    exit 1
   fi
 
   if ! run_preflight_checks; then

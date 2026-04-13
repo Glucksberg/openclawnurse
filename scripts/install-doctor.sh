@@ -175,8 +175,32 @@ install_cron_job() {
 
 run_validation() {
   if [[ "$RUN_DRY_RUN" == "true" ]]; then
+    local status
+
+    log "Running post-install self-test"
+    set +e
+    "$INSTALL_DIR/bin/openclaw-doctor.sh" --config "$CONFIG_FILE" --self-test --no-notify
+    status=$?
+    set -e
+    if [[ "$status" -ne 0 ]]; then
+      if [[ "$status" -eq 75 ]]; then
+        log "Self-test skipped because another run is holding the lock"
+      else
+        return "$status"
+      fi
+    fi
     log "Running post-install dry run"
+    set +e
     "$INSTALL_DIR/bin/openclaw-doctor.sh" --config "$CONFIG_FILE" --dry-run --no-notify
+    status=$?
+    set -e
+    if [[ "$status" -ne 0 ]]; then
+      if [[ "$status" -eq 75 ]]; then
+        log "Dry run skipped because another run is holding the lock"
+      else
+        return "$status"
+      fi
+    fi
   fi
 }
 

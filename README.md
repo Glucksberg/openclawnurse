@@ -14,6 +14,8 @@ OpenClawNurse e um utilitario portavel para manter instancias do OpenClaw saudav
 1. Clone o repositorio em qualquer diretorio.
 2. Rode `./install.sh`.
 3. Ajuste `~/.config/openclawnurse/openclawnurse.env` se quiser alterar target, horario ou comportamento.
+4. Rode um `--self-test`.
+5. Rode um `--dry-run`.
 
 Por padrao, o instalador:
 
@@ -30,10 +32,13 @@ Por padrao, o instalador:
 - `systemd/` templates de `systemd --user`
 - `config/openclaw-doctor.env.example` exemplo de configuracao
 - `docs/PLAN.md` plano v2
+- `docs/CARTILHA.md` guia de instalacao e uso
+- `docs/REVIEW.md` revisao tecnica da ferramenta
 
 ## Comandos uteis
 
 - `./install.sh`
+- `~/.local/share/openclawnurse/bin/openclaw-doctor.sh --self-test`
 - `~/.local/share/openclawnurse/bin/openclaw-doctor.sh --dry-run`
 - `systemctl --user status openclawnurse.timer`
 - `journalctl --user -u openclawnurse.service -n 200 --no-pager`
