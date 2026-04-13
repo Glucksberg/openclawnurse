@@ -46,6 +46,18 @@ Depois:
 
 - existe cartilha dedicada com clonagem, instalacao, testes, operacao e troubleshooting
 
+### 5. Falta de remediacao automatica para o principal problema atual
+
+Antes:
+
+- o runtime detectava `missing transcripts`, mas so degradava o status
+
+Depois:
+
+- o runtime consegue confirmar a necessidade via `sessions cleanup --dry-run --fix-missing --json`
+- em execucao real, pode aplicar `sessions cleanup --enforce --fix-missing`
+- apos remediar, ele reroda o `doctor` para reclassificar o estado
+
 ## Riscos ainda existentes
 
 ### 1. Parsing do `doctor` ainda e heuristico

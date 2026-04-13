@@ -85,9 +85,21 @@ TELEGRAM_TARGET="-100xxxxxxxxxx"
 REPORT_CHANNEL="telegram"
 AUTO_UPDATE="true"
 UPDATE_CHANNEL="stable"
+AUTO_REMEDIATE_MISSING_TRANSCRIPTS="true"
 RESTART_MODE="systemd_user"
 SYSTEMD_UNIT_NAME="openclaw-gateway.service"
 TIMEZONE="America/Sao_Paulo"
+```
+
+Remediacao automatica atual:
+
+- limpeza de sessoes com transcripts ausentes usando `openclaw sessions cleanup --enforce --fix-missing`
+
+Flags relacionadas:
+
+```bash
+AUTO_REMEDIATE_MISSING_TRANSCRIPTS="true"
+AUTO_REMEDIATE_ALL_AGENTS="false"
 ```
 
 ## Como testar sem risco
@@ -179,6 +191,17 @@ Correcao:
 - ler `doctor-state.json`
 - revisar `outputs.doctor`
 - decidir se essas pendencias devem ser corrigidas automaticamente ou nao
+
+### Sessoes com transcripts ausentes
+
+Sintoma:
+
+- `doctor` reporta `missing transcripts`
+
+Comportamento atual:
+
+- se `AUTO_REMEDIATE_MISSING_TRANSCRIPTS=true`, o OpenClawNurse tenta limpar automaticamente essas entradas em execucao real
+- em `--dry-run`, ele apenas reporta quantas entradas seriam removidas
 
 ## Atualizacao do proprio OpenClawNurse
 

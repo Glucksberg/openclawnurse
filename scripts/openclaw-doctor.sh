@@ -87,6 +87,8 @@ GATEWAY_WAIT_INTERVAL="${GATEWAY_WAIT_INTERVAL:-5}"
 HEALTH_TIMEOUT_MS="${HEALTH_TIMEOUT_MS:-10000}"
 MAX_CONSECUTIVE_UPDATE_FAILURES="${MAX_CONSECUTIVE_UPDATE_FAILURES:-3}"
 RETRY_NOTIFICATION_ON_NEXT_RUN="${RETRY_NOTIFICATION_ON_NEXT_RUN:-true}"
+AUTO_REMEDIATE_MISSING_TRANSCRIPTS="${AUTO_REMEDIATE_MISSING_TRANSCRIPTS:-true}"
+AUTO_REMEDIATE_ALL_AGENTS="${AUTO_REMEDIATE_ALL_AGENTS:-false}"
 RESTART_MODE="${RESTART_MODE:-systemd_user}"
 SYSTEMD_UNIT_NAME="${SYSTEMD_UNIT_NAME:-openclaw-gateway.service}"
 RESTART_COMMAND="${RESTART_COMMAND:-}"
@@ -143,6 +145,28 @@ run_capture() {
   log INFO "$label"
   captured_output="$("$@" 2>&1)"
   captured_status=$?
+  printf -v "$output_var" '%s' "$captured_output"
+  printf -v "$status_var" '%s' "$captured_status"
+  if [[ "$captured_status" -eq 0 ]]; then
+    log INFO "$label succeeded"
+  else
+    log ERROR "$label failed with exit $captured_status"
+  fi
+}
+
+run_capture_allow_fail() {
+  local output_var="$1"
+  local status_var="$2"
+  local label="$3"
+  shift 3
+  local captured_output
+  local captured_status
+
+  log INFO "$label"
+  set +e
+  captured_output="$("$@" 2>&1)"
+  captured_status=$?
+  set -e
   printf -v "$output_var" '%s' "$captured_output"
   printf -v "$status_var" '%s' "$captured_status"
   if [[ "$captured_status" -eq 0 ]]; then
@@ -242,6 +266,7 @@ ERRORS=()
 FIXES=()
 ACTIONS=()
 PREVIOUS_PENDING_PRESENT=0
+REMEDIATION_APPLIED=0
 
 load_previous_state() {
   if [[ -f "$STATE_FILE" ]] && jq empty "$STATE_FILE" >/dev/null 2>&1; then
@@ -469,6 +494,79 @@ classify_doctor() {
   DOCTOR_SUMMARY="doctor did not report actionable problems"
 }
 
+run_sessions_cleanup_preview() {
+  local output_var="$1"
+  local status_var="$2"
+  local cmd
+  build_openclaw_cmd cmd
+  cmd+=(sessions cleanup --dry-run --fix-missing --json)
+  if [[ "$AUTO_REMEDIATE_ALL_AGENTS" == "true" ]]; then
+    cmd+=(--all-agents)
+  fi
+  run_capture_allow_fail "$output_var" "$status_var" "Previewing missing transcript cleanup" "${cmd[@]}"
+}
+
+run_sessions_cleanup_apply() {
+  local output_var="$1"
+  local status_var="$2"
+  local cmd
+  build_openclaw_cmd cmd
+  cmd+=(sessions cleanup --enforce --fix-missing --json)
+  if [[ "$AUTO_REMEDIATE_ALL_AGENTS" == "true" ]]; then
+    cmd+=(--all-agents)
+  fi
+  run_capture_allow_fail "$output_var" "$status_var" "Applying missing transcript cleanup" "${cmd[@]}"
+}
+
+maybe_auto_remediate_missing_transcripts() {
+  [[ "$AUTO_REMEDIATE_MISSING_TRANSCRIPTS" == "true" ]] || return 0
+  printf '%s' "$DOCTOR_OUTPUT" | grep -qi 'missing transcripts' || return 0
+
+  local preview_output preview_status missing_count would_mutate
+  run_sessions_cleanup_preview preview_output preview_status
+  if [[ "$preview_status" -ne 0 ]]; then
+    append_array ERRORS "Unable to preview missing transcript cleanup."
+    append_array ACTIONS "Run openclaw sessions cleanup --dry-run --fix-missing manually."
+    return 1
+  fi
+
+  if ! printf '%s' "$preview_output" | jq empty >/dev/null 2>&1; then
+    append_array ERRORS "Cleanup preview returned invalid JSON."
+    return 1
+  fi
+
+  missing_count="$(printf '%s' "$preview_output" | jq -r '.missing // 0')"
+  would_mutate="$(printf '%s' "$preview_output" | jq -r '.wouldMutate // false')"
+
+  if [[ "$missing_count" == "0" || "$would_mutate" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would prune $missing_count session entries with missing transcripts."
+    append_array ACTIONS "Run without --dry-run to auto-prune session entries with missing transcripts."
+    return 0
+  fi
+
+  local apply_output apply_status after_count
+  run_sessions_cleanup_apply apply_output apply_status
+  if [[ "$apply_status" -ne 0 ]]; then
+    append_array ERRORS "Automatic cleanup of missing transcripts failed."
+    append_array ACTIONS "Run openclaw sessions cleanup --enforce --fix-missing manually."
+    return 1
+  fi
+
+  if printf '%s' "$apply_output" | jq empty >/dev/null 2>&1; then
+    after_count="$(printf '%s' "$apply_output" | jq -r '.afterCount // empty')"
+  else
+    after_count=""
+  fi
+
+  REMEDIATION_APPLIED=1
+  append_array FIXES "Pruned $missing_count session entries with missing transcripts${after_count:+; remaining entries: $after_count}."
+  return 0
+}
+
 run_preflight_checks() {
   local missing=0
   local required=(jq flock timeout "$OPENCLAW_BIN")
@@ -576,7 +674,7 @@ run_update() {
   fi
 
   run_capture output status "Retrying update after repair" "${cmd[@]}"
-  UPDATE_OUTPUT="${UPDATE_OUTPUT}\n\n--- retry ---\n${output}"
+  UPDATE_OUTPUT="${UPDATE_OUTPUT}"$'\n\n--- retry ---\n'"${output}"
 
   if [[ "$status" -eq 0 ]]; then
     UPDATE_SUCCEEDED=1
@@ -850,6 +948,10 @@ main() {
   fi
 
   run_doctor_phase
+  maybe_auto_remediate_missing_transcripts || true
+  if [[ "$REMEDIATION_APPLIED" -eq 1 ]]; then
+    run_doctor_phase
+  fi
 
   if [[ "$UPDATE_SUCCEEDED" -eq 1 ]]; then
     restart_gateway || true
