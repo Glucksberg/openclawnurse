@@ -362,13 +362,15 @@ retry_pending_report() {
 build_summary_from_output() {
   local output="$1"
   local extracted
-  extracted="$(printf '%s\n' "$output" | grep -E '^\s*-\s|Telegram:|Agents:|Session store|No channel security warnings detected|synced ' | sed 's/^[[:space:]]*//g' | head -n 6)"
+  extracted="$(printf '%s\n' "$output" | grep -E 'missing transcripts|No channel security warnings detected|Telegram:|Agents:|Session store|synced ' | sed 's/^[[:space:][:punct:]]*//g' | head -n 6)"
   printf '%s' "$extracted"
 }
 
 classify_doctor() {
   local output="$1"
   local exit_code="$2"
+  local lowered
+  lowered="$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')"
 
   if [[ "$exit_code" -ne 0 ]]; then
     DOCTOR_CLASSIFICATION="needs_manual_attention"
@@ -377,17 +379,23 @@ classify_doctor() {
     return
   fi
 
-  if printf '%s' "$output" | grep -q 'Run "openclaw doctor --fix"'; then
+  if printf '%s' "$lowered" | grep -Eq 'missing transcripts|needs manual attention|lasterror|errors:[[:space:]]*[1-9]|warnings:[[:space:]]*[1-9]|failed|unhealthy|orphan|corrupt|broken'; then
     DOCTOR_CLASSIFICATION="needs_manual_attention"
     DOCTOR_SUMMARY="doctor found issues that still require intervention"
     append_array ACTIONS "Review the doctor recommendations that remain unresolved."
     return
   fi
 
-  if printf '%s' "$output" | grep -Eqi 'synced|repaired|fixed|migrated|normalized|generated and configured'; then
+  if printf '%s' "$lowered" | grep -Eq 'synced|repaired|fixed|migrated|normalized|generated and configured'; then
     DOCTOR_CLASSIFICATION="repaired"
     DOCTOR_SUMMARY="doctor applied at least one corrective action"
     append_array FIXES "Doctor reported corrective actions during the run."
+    return
+  fi
+
+  if printf '%s' "$lowered" | grep -Eq 'no channel security warnings detected|doctor complete'; then
+    DOCTOR_CLASSIFICATION="healthy"
+    DOCTOR_SUMMARY="doctor completed without actionable findings"
     return
   fi
 
