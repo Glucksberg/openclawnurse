@@ -70,6 +70,40 @@ if [[ -f "$CONFIG_FILE" ]]; then
   source "$CONFIG_FILE"
 fi
 
+prepend_path() {
+  local dir="$1"
+  [[ -n "$dir" && -d "$dir" ]] || return 0
+  case ":${PATH:-}:" in
+    *":$dir:"*) ;;
+    *)
+      if [[ -n "${PATH:-}" ]]; then
+        PATH="$dir:$PATH"
+      else
+        PATH="$dir"
+      fi
+      ;;
+  esac
+}
+
+bootstrap_path() {
+  local candidates=(
+    "$HOME/.npm-global/bin"
+    "$HOME/.local/bin"
+    "$HOME/bin"
+    "/home/linuxbrew/.linuxbrew/bin"
+    "/usr/local/bin"
+    "/usr/bin"
+    "/bin"
+  )
+  local dir
+  for dir in "${candidates[@]}"; do
+    prepend_path "$dir"
+  done
+  export PATH
+}
+
+bootstrap_path
+
 OPENCLAW_BIN="${OPENCLAW_BIN:-openclaw}"
 OPENCLAW_PROFILE="${OPENCLAW_PROFILE:-}"
 OPENCLAW_STATE_HOME="${OPENCLAW_STATE_HOME:-$HOME/.openclaw}"
@@ -92,6 +126,8 @@ AUTO_REMEDIATE_ALL_AGENTS="${AUTO_REMEDIATE_ALL_AGENTS:-false}"
 RESTART_MODE="${RESTART_MODE:-systemd_user}"
 SYSTEMD_UNIT_NAME="${SYSTEMD_UNIT_NAME:-openclaw-gateway.service}"
 RESTART_COMMAND="${RESTART_COMMAND:-}"
+NODE_COMPILE_CACHE="${NODE_COMPILE_CACHE:-}"
+OPENCLAW_NO_RESPAWN="${OPENCLAW_NO_RESPAWN:-}"
 TIMEZONE="${TIMEZONE:-America/Sao_Paulo}"
 REPORT_MAX_CHARS="${REPORT_MAX_CHARS:-3500}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
@@ -104,6 +140,19 @@ LOCK_FILE="${LOCK_FILE:-$STATE_DIR/doctor.lock}"
 STATE_FILE="${STATE_FILE:-$STATE_DIR/doctor-state.json}"
 PENDING_TEXT_FILE="${PENDING_TEXT_FILE:-$STATE_DIR/pending-report.txt}"
 PENDING_JSON_FILE="${PENDING_JSON_FILE:-$STATE_DIR/pending-report.json}"
+
+prepare_openclaw_env() {
+  if [[ -n "$NODE_COMPILE_CACHE" ]]; then
+    mkdir -p "$NODE_COMPILE_CACHE" >/dev/null 2>&1 || true
+    export NODE_COMPILE_CACHE
+  fi
+
+  if [[ -n "$OPENCLAW_NO_RESPAWN" ]]; then
+    export OPENCLAW_NO_RESPAWN
+  fi
+}
+
+prepare_openclaw_env
 
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$STATE_DIR" "$LOG_DIR"
 
@@ -193,6 +242,24 @@ json_bool() {
   fi
 }
 
+json_int() {
+  if [[ "$1" =~ ^-?[0-9]+$ ]]; then
+    printf '%s' "$1"
+  else
+    printf '0'
+  fi
+}
+
+json_array_from_name() {
+  local name="$1"
+  local -n ref="$name"
+  if ((${#ref[@]} == 0)); then
+    printf '[]'
+    return 0
+  fi
+  printf '%s\n' "${ref[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))' 2>/dev/null || printf '[]'
+}
+
 trim_report() {
   local text="$1"
   if ((${#text} <= REPORT_MAX_CHARS)); then
@@ -279,6 +346,11 @@ persist_json() {
   local report_text="$1"
   local report_json_tmp="$RUN_JSON_FILE.tmp"
   local state_json_tmp="$STATE_FILE.tmp"
+  local errors_json fixes_json actions_json
+
+  errors_json="$(json_array_from_name ERRORS)"
+  fixes_json="$(json_array_from_name FIXES)"
+  actions_json="$(json_array_from_name ACTIONS)"
 
   jq -n \
     --arg timestamp "$RUN_ISO" \
@@ -306,12 +378,12 @@ persist_json() {
     --argjson notificationDelivered "$(json_bool "$NOTIFICATION_DELIVERED")" \
     --argjson notificationPending "$(json_bool "$NOTIFICATION_PENDING")" \
     --argjson previousPendingPresent "$(json_bool "$PREVIOUS_PENDING_PRESENT")" \
-    --argjson doctorExitCode "$DOCTOR_EXIT_CODE" \
-    --argjson consecutiveFailures "$CONSECUTIVE_FAILURES" \
-    --argjson durationSeconds "$DURATION_SECONDS" \
-    --argjson errors "$(printf '%s\n' "${ERRORS[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-    --argjson fixes "$(printf '%s\n' "${FIXES[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-    --argjson actions "$(printf '%s\n' "${ACTIONS[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    --argjson doctorExitCode "$(json_int "$DOCTOR_EXIT_CODE")" \
+    --argjson consecutiveFailures "$(json_int "$CONSECUTIVE_FAILURES")" \
+    --argjson durationSeconds "$(json_int "$DURATION_SECONDS")" \
+    --argjson errors "$errors_json" \
+    --argjson fixes "$fixes_json" \
+    --argjson actions "$actions_json" \
     '{
       timestamp: $timestamp,
       hostname: $hostname,

@@ -25,6 +25,15 @@ Por padrao, o instalador:
 - instala `systemd --user` com fallback para `crontab`
 - executa um `--dry-run` ao final
 
+## Supervisao do gateway
+
+O `openclawnurse` nao e um daemon de longa duracao. Ele foi desenhado para rodar como job agendado (`systemd timer` ou `cron`), nao como processo permanente no `pm2`.
+
+Se o seu gateway OpenClaw for supervisionado por `pm2`, ajuste o arquivo `~/.config/openclawnurse/openclawnurse.env` para usar:
+
+- `RESTART_MODE="custom"`
+- `RESTART_COMMAND="pm2 restart openclaw-gateway"`
+
 ## Arquivos principais
 
 - `scripts/openclaw-doctor.sh` runtime principal
