@@ -137,6 +137,8 @@ ensure_config_file() {
 
 install_runtime_files() {
   install -m 0755 "$REPO_ROOT/scripts/openclaw-doctor.sh" "$INSTALL_DIR/bin/openclaw-doctor.sh"
+  install -m 0755 "$REPO_ROOT/scripts/openclaw-fleet-export.sh" "$INSTALL_DIR/bin/openclaw-fleet-export.sh"
+  install -m 0755 "$REPO_ROOT/scripts/openclaw-fleet-dashboard.sh" "$INSTALL_DIR/bin/openclaw-fleet-dashboard.sh"
   install -m 0644 "$REPO_ROOT/systemd/openclawnurse.service" "$INSTALL_DIR/systemd/openclawnurse.service.template"
   install -m 0644 "$REPO_ROOT/systemd/openclawnurse.timer" "$INSTALL_DIR/systemd/openclawnurse.timer.template"
 }

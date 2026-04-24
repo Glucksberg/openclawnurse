@@ -1,0 +1,22 @@
+{
+  "fleetName": "OpenClaw Fleet",
+  "overallKumaPushUrl": "",
+  "nodes": [
+    {
+      "id": "vps-sp-1",
+      "name": "Sao Paulo VPS",
+      "feedUrl": "https://vps-sp-1.example.com/openclawnurse/node-feed.json",
+      "dashboardUrl": "https://vps-sp-1.example.com",
+      "kumaPushUrl": "",
+      "tags": ["prod", "telegram"]
+    },
+    {
+      "id": "vps-us-1",
+      "name": "US VPS",
+      "feedUrl": "/srv/openclaw-fleet/us-vps-feed.json",
+      "dashboardUrl": "",
+      "kumaPushUrl": "",
+      "tags": ["prod", "whatsapp"]
+    }
+  ]
+}
