@@ -1,6 +1,7 @@
 {
   "fleetName": "OpenClaw Fleet",
   "overallKumaPushUrl": "",
+  "publishNotes": "Serve the generated index.html and fleet-status.json from any static web server or object storage.",
   "nodes": [
     {
       "id": "vps-sp-1",

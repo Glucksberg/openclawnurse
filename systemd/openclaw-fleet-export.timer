@@ -1,0 +1,10 @@
+[Unit]
+Description=Export OpenClaw fleet feed
+
+[Timer]
+OnCalendar=__ON_CALENDAR__
+Persistent=true
+Unit=openclaw-fleet-export.service
+
+[Install]
+WantedBy=timers.target

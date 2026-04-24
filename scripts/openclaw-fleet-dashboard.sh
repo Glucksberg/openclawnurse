@@ -7,6 +7,8 @@ OUTPUT_DIR=""
 WRITE_JSON=1
 WRITE_HTML=1
 PUSH_KUMA=0
+PUBLISH_DIR=""
+HISTORY_DIR=""
 
 usage() {
   cat <<'EOF'
@@ -15,6 +17,8 @@ Usage: openclaw-fleet-dashboard.sh --config <path> --output-dir <path> [options]
 Options:
   --config <path>      Fleet config JSON.
   --output-dir <path>  Where to write fleet-status.json and index.html.
+  --publish-dir <path> Copy the generated outputs to a static publish dir.
+  --history-dir <path> Keep timestamped snapshots of each aggregation run.
   --json-only          Only write fleet-status.json.
   --html-only          Only write index.html.
   --push-kuma          Push aggregate/per-node status to configured Kuma URLs.
@@ -30,6 +34,14 @@ while (($# > 0)); do
       ;;
     --output-dir)
       OUTPUT_DIR="${2:?missing value for --output-dir}"
+      shift 2
+      ;;
+    --publish-dir)
+      PUBLISH_DIR="${2:?missing value for --publish-dir}"
+      shift 2
+      ;;
+    --history-dir)
+      HISTORY_DIR="${2:?missing value for --history-dir}"
       shift 2
       ;;
     --json-only)
@@ -79,6 +91,17 @@ if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
 fi
 
 mkdir -p "$OUTPUT_DIR"
+
+publish_copy() {
+  local src="$1"
+  local dest_dir="$2"
+  local name="$3"
+  local tmp_path
+  mkdir -p "$dest_dir"
+  tmp_path="$dest_dir/.${name}.tmp.$$"
+  cp "$src" "$tmp_path"
+  mv "$tmp_path" "$dest_dir/$name"
+}
 
 fetch_node_feed() {
   local source="$1"
@@ -312,7 +335,7 @@ while IFS= read -r encoded; do
       if (.source.ok | not) then "down"
       elif .checks.gateway == "issue" or .checks.auth == "issue" then "down"
       elif .nurse.status == "FAILED" or .nurse.status == "FAILED_NOTIFICATION_PENDING" or .nurse.status == "UNREACHABLE" then "down"
-      elif .nurse.status == "DEGRADED" or .checks.doctor == "warn" or .checks.notifications == "pending" or .checks.update == "outdated" or .checks.doctor == "repaired" or .nurse.status == "UPDATED_WITH_REPAIRS" then "warn"
+      elif .nurse.status == "DEGRADED" or .checks.doctor == "warn" or .checks.notifications == "pending" or .checks.update == "outdated" or .nurse.status == "UPDATED_WITH_REPAIRS" then "warn"
       else "ok"
       end
     )')"
@@ -367,6 +390,26 @@ if [[ "$WRITE_JSON" -eq 0 ]]; then
   rm -f "$json_path"
 fi
 
+run_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+if [[ -n "$HISTORY_DIR" ]]; then
+  mkdir -p "$HISTORY_DIR"
+  if [[ "$WRITE_JSON" -eq 1 ]]; then
+    cp "$json_path" "$HISTORY_DIR/fleet-status-$run_stamp.json"
+  fi
+  if [[ "$WRITE_HTML" -eq 1 ]]; then
+    cp "$html_path" "$HISTORY_DIR/index-$run_stamp.html"
+  fi
+fi
+
+if [[ -n "$PUBLISH_DIR" ]]; then
+  if [[ "$WRITE_JSON" -eq 1 ]]; then
+    publish_copy "$json_path" "$PUBLISH_DIR" "fleet-status.json"
+  fi
+  if [[ "$WRITE_HTML" -eq 1 ]]; then
+    publish_copy "$html_path" "$PUBLISH_DIR" "index.html"
+  fi
+fi
+
 overall_kuma_url="$(jq -r '.overallKumaPushUrl // empty' "$CONFIG_FILE")"
 if [[ "$PUSH_KUMA" -eq 1 && -n "$overall_kuma_url" ]]; then
   overall_status="$(printf '%s' "$aggregate_json" | jq -r '.fleet.overallStatus')"
@@ -379,4 +422,7 @@ if [[ "$WRITE_JSON" -eq 1 ]]; then
 fi
 if [[ "$WRITE_HTML" -eq 1 ]]; then
   printf 'Wrote %s\n' "$html_path"
+fi
+if [[ -n "$PUBLISH_DIR" ]]; then
+  printf 'Published outputs to %s\n' "$PUBLISH_DIR"
 fi
