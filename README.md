@@ -29,10 +29,19 @@ Por padrao, o instalador:
 
 O `openclawnurse` nao e um daemon de longa duracao. Ele foi desenhado para rodar como job agendado (`systemd timer` ou `cron`), nao como processo permanente no `pm2`.
 
+Por padrao, ele tenta remediar automaticamente dois tipos de sujeira operacional comuns:
+
+- entradas de sessao com transcripts ausentes
+- arquivos `*.trajectory.jsonl` orfaos apontados pelo `openclaw doctor`
+
 Se o seu gateway OpenClaw for supervisionado por `pm2`, ajuste o arquivo `~/.config/openclawnurse/openclawnurse.env` para usar:
 
 - `RESTART_MODE="custom"`
 - `RESTART_COMMAND="pm2 restart openclaw-gateway"`
+
+Se o host usar bins fora do PATH padrao do usuario, como Linuxbrew, adicione por config:
+
+- `EXTRA_PATH="/home/linuxbrew/.linuxbrew/bin"`
 
 ## Arquivos principais
 

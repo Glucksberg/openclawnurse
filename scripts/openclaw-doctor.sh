@@ -86,15 +86,26 @@ prepend_path() {
 }
 
 bootstrap_path() {
+  local extra_dir
   local candidates=(
     "$HOME/.npm-global/bin"
     "$HOME/.local/bin"
     "$HOME/bin"
-    "/home/linuxbrew/.linuxbrew/bin"
     "/usr/local/bin"
     "/usr/bin"
     "/bin"
   )
+
+  if [[ -n "${EXTRA_PATH:-}" ]]; then
+    local old_ifs="$IFS"
+    IFS=':'
+    read -r -a extra_dirs <<<"${EXTRA_PATH}"
+    IFS="$old_ifs"
+    for extra_dir in "${extra_dirs[@]}"; do
+      prepend_path "$extra_dir"
+    done
+  fi
+
   local dir
   for dir in "${candidates[@]}"; do
     prepend_path "$dir"
@@ -122,6 +133,7 @@ HEALTH_TIMEOUT_MS="${HEALTH_TIMEOUT_MS:-10000}"
 MAX_CONSECUTIVE_UPDATE_FAILURES="${MAX_CONSECUTIVE_UPDATE_FAILURES:-3}"
 RETRY_NOTIFICATION_ON_NEXT_RUN="${RETRY_NOTIFICATION_ON_NEXT_RUN:-true}"
 AUTO_REMEDIATE_MISSING_TRANSCRIPTS="${AUTO_REMEDIATE_MISSING_TRANSCRIPTS:-true}"
+AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS="${AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS:-true}"
 AUTO_REMEDIATE_ALL_AGENTS="${AUTO_REMEDIATE_ALL_AGENTS:-false}"
 RESTART_MODE="${RESTART_MODE:-systemd_user}"
 SYSTEMD_UNIT_NAME="${SYSTEMD_UNIT_NAME:-openclaw-gateway.service}"
@@ -210,12 +222,18 @@ run_capture_allow_fail() {
   shift 3
   local captured_output
   local captured_status
+  local had_errexit=0
 
   log INFO "$label"
+  case $- in
+    *e*) had_errexit=1 ;;
+  esac
   set +e
   captured_output="$("$@" 2>&1)"
   captured_status=$?
-  set -e
+  if [[ "$had_errexit" -eq 1 ]]; then
+    set -e
+  fi
   printf -v "$output_var" '%s' "$captured_output"
   printf -v "$status_var" '%s' "$captured_status"
   if [[ "$captured_status" -eq 0 ]]; then
@@ -542,17 +560,17 @@ classify_doctor() {
     return
   fi
 
+  if printf '%s' "$lowered" | grep -Eq 'doctor changes|synced|repaired|fixed|migrated|normalized|generated and configured|archived [0-9]+ orphan transcript|pruned [0-9]+'; then
+    DOCTOR_CLASSIFICATION="repaired"
+    DOCTOR_SUMMARY="doctor applied at least one corrective action"
+    append_array FIXES "Doctor reported corrective actions during the run."
+    return
+  fi
+
   if printf '%s' "$lowered" | grep -Eq 'missing transcripts|needs manual attention|lasterror|errors:[[:space:]]*[1-9]|warnings:[[:space:]]*[1-9]|failed|unhealthy|orphan|corrupt|broken'; then
     DOCTOR_CLASSIFICATION="needs_manual_attention"
     DOCTOR_SUMMARY="doctor found issues that still require intervention"
     append_array ACTIONS "Review the doctor recommendations that remain unresolved."
-    return
-  fi
-
-  if printf '%s' "$lowered" | grep -Eq 'synced|repaired|fixed|migrated|normalized|generated and configured'; then
-    DOCTOR_CLASSIFICATION="repaired"
-    DOCTOR_SUMMARY="doctor applied at least one corrective action"
-    append_array FIXES "Doctor reported corrective actions during the run."
     return
   fi
 
@@ -636,6 +654,61 @@ maybe_auto_remediate_missing_transcripts() {
 
   REMEDIATION_APPLIED=1
   append_array FIXES "Pruned $missing_count session entries with missing transcripts${after_count:+; remaining entries: $after_count}."
+  return 0
+}
+
+maybe_auto_archive_orphan_transcripts() {
+  [[ "$DRY_RUN" -eq 1 ]] || return 0
+  [[ "$AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS" == "true" ]] || return 0
+  printf '%s' "$DOCTOR_OUTPUT" | grep -qi 'orphan transcript file' || return 0
+
+  local transcript_names=()
+  while IFS= read -r transcript_name; do
+    [[ -n "$transcript_name" ]] || continue
+    transcript_names+=("$transcript_name")
+  done < <(printf '%s' "$DOCTOR_OUTPUT" | grep -oE '[[:alnum:]_.-]+\.trajectory\.jsonl' | sort -u)
+
+  if ((${#transcript_names[@]} == 0)); then
+    append_array ACTIONS "Doctor reported orphan transcripts, but no transcript filenames could be extracted automatically."
+    return 1
+  fi
+
+  local transcript_paths=()
+  local transcript_name transcript_path
+  for transcript_name in "${transcript_names[@]}"; do
+    while IFS= read -r transcript_path; do
+      [[ -n "$transcript_path" ]] || continue
+      transcript_paths+=("$transcript_path")
+    done < <(find "$OPENCLAW_STATE_HOME/agents" -type f -name "$transcript_name" 2>/dev/null)
+  done
+
+  if ((${#transcript_paths[@]} == 0)); then
+    append_array ACTIONS "Doctor reported orphan transcripts, but no matching files were found under $OPENCLAW_STATE_HOME/agents."
+    return 1
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would archive ${#transcript_paths[@]} orphan transcript file(s)."
+    append_array ACTIONS "Run without --dry-run to archive orphan transcript files automatically."
+    return 0
+  fi
+
+  local archived_count=0
+  local ts
+  ts="$(date --iso-8601=seconds | tr ':' '-')"
+  for transcript_path in "${transcript_paths[@]}"; do
+    [[ -f "$transcript_path" ]] || continue
+    mv "$transcript_path" "$transcript_path.deleted.$ts"
+    archived_count=$((archived_count + 1))
+  done
+
+  if ((archived_count == 0)); then
+    append_array ACTIONS "Doctor reported orphan transcripts, but no matching files remained by the time remediation ran."
+    return 1
+  fi
+
+  REMEDIATION_APPLIED=1
+  append_array FIXES "Archived $archived_count orphan transcript file(s)."
   return 0
 }
 
@@ -1008,8 +1081,13 @@ main() {
     DURATION_SECONDS=$(( $(date +%s) - start_epoch ))
     local preflight_report
     preflight_report="$(build_report)"
-    persist_json "$preflight_report"
-    persist_pending_report "$preflight_report"
+    if command_exists jq; then
+      persist_json "$preflight_report"
+      persist_pending_report "$preflight_report"
+    else
+      log ERROR "jq is unavailable; skipping JSON persistence for the failed preflight report"
+      printf '%s\n' "$preflight_report"
+    fi
     exit 1
   fi
 
@@ -1020,6 +1098,7 @@ main() {
   fi
 
   run_doctor_phase
+  maybe_auto_archive_orphan_transcripts || true
   maybe_auto_remediate_missing_transcripts || true
   if [[ "$REMEDIATION_APPLIED" -eq 1 ]]; then
     run_doctor_phase

@@ -83,6 +83,12 @@ log() {
   printf '[install] %s\n' "$*"
 }
 
+shell_quote() {
+  local value="$1"
+  value="${value//\'/\'\\\'\'}"
+  printf "'%s'" "$value"
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "Missing required command: $1" >&2
@@ -158,7 +164,11 @@ enable_systemd_timer() {
 }
 
 install_cron_job() {
-  local cron_line="$CRON_SCHEDULE $INSTALL_DIR/bin/openclaw-doctor.sh --config $CONFIG_FILE >> $STATE_DIR/logs/cron.log 2>&1"
+  local script_path config_path cron_log
+  script_path="$(shell_quote "$INSTALL_DIR/bin/openclaw-doctor.sh")"
+  config_path="$(shell_quote "$CONFIG_FILE")"
+  cron_log="$(shell_quote "$STATE_DIR/logs/cron.log")"
+  local cron_line="$CRON_SCHEDULE $script_path --config $config_path >> $cron_log 2>&1"
   mkdir -p "$STATE_DIR/logs"
   local current
   current="$(crontab -l 2>/dev/null || true)"
