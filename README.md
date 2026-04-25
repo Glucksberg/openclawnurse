@@ -8,10 +8,16 @@ OpenClawNurse e um utilitario portavel para manter instancias do OpenClaw saudav
 - health check apos manutencao
 - relatorio local e via Telegram
 - instalacao repetivel em multiplas maquinas
-- feed por no para monitoramento centralizado
-- agregacao de fleet em JSON + HTML
-- publish estatico do dashboard
-- plano de remediacao assistida com guardrails
+
+O fluxo principal deste repo, hoje, e:
+
+- uma VPS por instancia
+- um OpenClaw por VPS
+- um openclawnurse por VPS
+- um grupo de Telegram por VPS
+- sem dependencia de host central
+
+Multi-host e fleet continuam no repo, mas foram movidos para `docs/future-planning/`.
 
 ## Como instalar
 
@@ -50,33 +56,34 @@ Se o host usar bins fora do PATH padrao do usuario, como Linuxbrew, adicione por
 ## Arquivos principais
 
 - `scripts/openclaw-doctor.sh` runtime principal
-- `scripts/openclaw-fleet-export.sh` feed JSON por no
-- `scripts/openclaw-fleet-dashboard.sh` agregador central + pagina HTML
-- `scripts/openclaw-fleet-export-run.sh` wrapper para timer/cron do feed
-- `scripts/openclaw-fleet-dashboard-run.sh` wrapper para timer/cron do dashboard
-- `scripts/openclaw-fleet-remediation-plan.sh` plano de acao seguro para operacao central
 - `scripts/install-doctor.sh` instalador idempotente
 - `systemd/` templates de `systemd --user`
 - `config/openclaw-doctor.env.example` exemplo de configuracao
-- `config/fleet-nodes.example.json` exemplo de fleet centralizado
-- `config/fleet-remediation-policy.example.json` politica de guardrails para remediacao
 - `docs/PLAN.md` plano v2
-- `docs/CARTILHA.md` guia de instalacao e uso
-- `docs/SETUP-NODE.md` guia rapido de node
-- `docs/SETUP-HOST-CENTRAL.md` guia rapido de host central
-- `docs/SETUP-HOST-CENTRAL-KUMA.md` guia rapido de host central com Uptime Kuma
+- `docs/CARTILHA.md` cartilha principal para VPS isolada
+- `docs/SETUP-SINGLE-VPS.md` guia rapido de setup manual
+- `docs/AGENT-REMOTE-SETUP.md` prompt pronto para enviar ao agente remoto
+- `docs/future-planning/` documentacao de fleet e host central
 - `docs/REVIEW.md` revisao tecnica da ferramenta
-- `docs/FLEET.md` operacao do dashboard central
 
 ## Comandos uteis
 
 - `./install.sh`
 - `~/.local/share/openclawnurse/bin/openclaw-doctor.sh --self-test`
 - `~/.local/share/openclawnurse/bin/openclaw-doctor.sh --dry-run`
-- `~/.local/share/openclawnurse/bin/openclaw-fleet-export-run.sh --config ~/.config/openclawnurse/openclawnurse.env`
-- `~/.local/share/openclawnurse/bin/openclaw-fleet-dashboard-run.sh --config ~/.config/openclawnurse/openclawnurse.env`
-- `~/.local/share/openclawnurse/bin/openclaw-fleet-remediation-plan.sh --fleet-status ~/.local/state/openclawnurse/fleet-dashboard/fleet-status.json --policy ~/.local/share/openclawnurse/config-examples/fleet-remediation-policy.example.json`
 - `systemctl --user status openclawnurse.timer`
-- `systemctl --user status openclaw-fleet-export.timer`
-- `systemctl --user status openclaw-fleet-dashboard.timer`
 - `journalctl --user -u openclawnurse.service -n 200 --no-pager`
+
+## Planejamento futuro
+
+Os scripts e configuracoes de multi-host continuam disponiveis no repo:
+
+- `scripts/openclaw-fleet-export.sh`
+- `scripts/openclaw-fleet-dashboard.sh`
+- `scripts/openclaw-fleet-remediation-plan.sh`
+- `config/fleet-nodes.example.json`
+- `config/fleet-remediation-policy.example.json`
+
+Mas a documentacao correspondente foi movida para:
+
+- `docs/future-planning/`
