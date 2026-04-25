@@ -162,6 +162,7 @@ install_runtime_files() {
   install -m 0755 "$REPO_ROOT/scripts/openclaw-fleet-dashboard.sh" "$INSTALL_DIR/bin/openclaw-fleet-dashboard.sh"
   install -m 0755 "$REPO_ROOT/scripts/openclaw-fleet-dashboard-run.sh" "$INSTALL_DIR/bin/openclaw-fleet-dashboard-run.sh"
   install -m 0755 "$REPO_ROOT/scripts/openclaw-fleet-remediation-plan.sh" "$INSTALL_DIR/bin/openclaw-fleet-remediation-plan.sh"
+  install -m 0755 "$REPO_ROOT/scripts/openclaw-fleet-remediation-exec.sh" "$INSTALL_DIR/bin/openclaw-fleet-remediation-exec.sh"
   install -m 0644 "$REPO_ROOT/config/fleet-nodes.example.json" "$INSTALL_DIR/config-examples/fleet-nodes.example.json"
   install -m 0644 "$REPO_ROOT/config/fleet-remediation-policy.example.json" "$INSTALL_DIR/config-examples/fleet-remediation-policy.example.json"
   install -m 0644 "$REPO_ROOT/systemd/openclawnurse.service" "$INSTALL_DIR/systemd/openclawnurse.service.template"

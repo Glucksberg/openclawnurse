@@ -135,6 +135,18 @@ RETRY_NOTIFICATION_ON_NEXT_RUN="${RETRY_NOTIFICATION_ON_NEXT_RUN:-true}"
 AUTO_REMEDIATE_MISSING_TRANSCRIPTS="${AUTO_REMEDIATE_MISSING_TRANSCRIPTS:-true}"
 AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS="${AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS:-true}"
 AUTO_REMEDIATE_ALL_AGENTS="${AUTO_REMEDIATE_ALL_AGENTS:-false}"
+AUTO_RESTART_UNHEALTHY_GATEWAY="${AUTO_RESTART_UNHEALTHY_GATEWAY:-true}"
+MAX_GATEWAY_RESTARTS_PER_DAY="${MAX_GATEWAY_RESTARTS_PER_DAY:-1}"
+MAX_GATEWAY_RESTARTS_PER_WINDOW="${MAX_GATEWAY_RESTARTS_PER_WINDOW:-3}"
+GATEWAY_RESTART_WINDOW_SECONDS="${GATEWAY_RESTART_WINDOW_SECONDS:-300}"
+MAX_ORPHAN_TRANSCRIPTS_PER_RUN="${MAX_ORPHAN_TRANSCRIPTS_PER_RUN:-20}"
+OPENCLAW_CONFIG_FILE="${OPENCLAW_CONFIG_FILE:-$OPENCLAW_STATE_HOME/openclaw.json}"
+CONFIG_BACKUP_ENABLED="${CONFIG_BACKUP_ENABLED:-true}"
+CONFIG_BACKUP_DIR="${CONFIG_BACKUP_DIR:-$STATE_DIR/config-backups/openclaw}"
+CONFIG_BACKUP_RETENTION="${CONFIG_BACKUP_RETENTION:-20}"
+AUTO_RESTORE_BROKEN_CONFIG="${AUTO_RESTORE_BROKEN_CONFIG:-true}"
+CONFIG_DIFF_MAX_CHARS="${CONFIG_DIFF_MAX_CHARS:-1200}"
+DIAGNOSTIC_LOG_LINES="${DIAGNOSTIC_LOG_LINES:-20}"
 RESTART_MODE="${RESTART_MODE:-systemd_user}"
 SYSTEMD_UNIT_NAME="${SYSTEMD_UNIT_NAME:-openclaw-gateway.service}"
 RESTART_COMMAND="${RESTART_COMMAND:-}"
@@ -150,6 +162,7 @@ STATE_DIR="${STATE_DIR:-$DEFAULT_STATE_DIR}"
 LOG_DIR="${LOG_DIR:-$STATE_DIR/logs}"
 LOCK_FILE="${LOCK_FILE:-$STATE_DIR/doctor.lock}"
 STATE_FILE="${STATE_FILE:-$STATE_DIR/doctor-state.json}"
+GATEWAY_RESTART_STATE_FILE="${GATEWAY_RESTART_STATE_FILE:-$STATE_DIR/gateway-restart-state.json}"
 PENDING_TEXT_FILE="${PENDING_TEXT_FILE:-$STATE_DIR/pending-report.txt}"
 PENDING_JSON_FILE="${PENDING_JSON_FILE:-$STATE_DIR/pending-report.json}"
 
@@ -167,6 +180,9 @@ prepare_openclaw_env() {
 prepare_openclaw_env
 
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$STATE_DIR" "$LOG_DIR"
+if [[ "$CONFIG_BACKUP_ENABLED" == "true" ]]; then
+  mkdir -p "$CONFIG_BACKUP_DIR"
+fi
 
 RUN_ID="$(TZ="$TIMEZONE" date '+%Y%m%d-%H%M%S')"
 RUN_DATE="$(TZ="$TIMEZONE" date '+%Y-%m-%d %H:%M:%S %Z')"
@@ -346,29 +362,128 @@ UPDATE_ERROR=""
 RESTART_ERROR=""
 HEALTH_ERROR=""
 DURATION_SECONDS=0
+CONFIG_HEALTH="unknown"
+CONFIG_RESTORED=0
+CONFIG_BACKUP_CREATED=0
+CONFIG_RESTORE_DIFF=""
+DIAGNOSTICS_JSON="{}"
 
 ERRORS=()
 FIXES=()
 ACTIONS=()
+INCIDENT_CODES=()
+REMEDIATIONS=()
 PREVIOUS_PENDING_PRESENT=0
 REMEDIATION_APPLIED=0
+GATEWAY_RESTARTS_TODAY=0
+GATEWAY_RESTARTS_IN_WINDOW=0
 
 load_previous_state() {
   if [[ -f "$STATE_FILE" ]] && jq empty "$STATE_FILE" >/dev/null 2>&1; then
     CONSECUTIVE_FAILURES="$(jq -r '.consecutiveFailures // 0' "$STATE_FILE" 2>/dev/null)"
   fi
+  load_gateway_restart_state
   [[ -f "$PENDING_TEXT_FILE" || -f "$PENDING_JSON_FILE" ]] && PREVIOUS_PENDING_PRESENT=1 || PREVIOUS_PENDING_PRESENT=0
+}
+
+today_key() {
+  TZ="$TIMEZONE" date '+%Y-%m-%d'
+}
+
+add_incident_code() {
+  local code="$1"
+  local existing
+  for existing in "${INCIDENT_CODES[@]}"; do
+    [[ "$existing" == "$code" ]] && return 0
+  done
+  INCIDENT_CODES+=("$code")
+}
+
+record_remediation() {
+  local code="$1"
+  local result="$2"
+  local detail="$3"
+  REMEDIATIONS+=("$code|$result|$detail")
+}
+
+json_remediations_from_name() {
+  local name="$1"
+  local -n ref="$name"
+  if ((${#ref[@]} == 0)); then
+    printf '[]'
+    return 0
+  fi
+  printf '%s\n' "${ref[@]}" | jq -Rsc '
+    split("\n")
+    | map(select(length > 0))
+    | map(split("|") | {
+        code: .[0],
+        result: (.[1] // "unknown"),
+        detail: (.[2:] | join("|"))
+      })' 2>/dev/null || printf '[]'
+}
+
+load_gateway_restart_state() {
+  GATEWAY_RESTARTS_TODAY=0
+  GATEWAY_RESTARTS_IN_WINDOW=0
+  [[ -f "$GATEWAY_RESTART_STATE_FILE" ]] || return 0
+  jq empty "$GATEWAY_RESTART_STATE_FILE" >/dev/null 2>&1 || return 0
+  local stored_day
+  stored_day="$(jq -r '.day // empty' "$GATEWAY_RESTART_STATE_FILE" 2>/dev/null)"
+  if [[ "$stored_day" == "$(today_key)" ]]; then
+    GATEWAY_RESTARTS_TODAY="$(jq -r '.count // 0' "$GATEWAY_RESTART_STATE_FILE" 2>/dev/null)"
+  fi
+  local now
+  now="$(date +%s)"
+  GATEWAY_RESTARTS_IN_WINDOW="$(jq -r \
+    --argjson now "$now" \
+    --argjson window "$(json_int "$GATEWAY_RESTART_WINDOW_SECONDS")" \
+    '[.history[]? | select(($now - .) < $window)] | length' \
+    "$GATEWAY_RESTART_STATE_FILE" 2>/dev/null)"
+  GATEWAY_RESTARTS_IN_WINDOW="${GATEWAY_RESTARTS_IN_WINDOW:-0}"
+}
+
+record_gateway_restart() {
+  local tmp="$GATEWAY_RESTART_STATE_FILE.tmp"
+  local now
+  local previous_file
+  now="$(date +%s)"
+  previous_file="$GATEWAY_RESTART_STATE_FILE"
+  [[ -f "$previous_file" ]] || previous_file="/dev/null"
+  GATEWAY_RESTARTS_TODAY=$((GATEWAY_RESTARTS_TODAY + 1))
+  GATEWAY_RESTARTS_IN_WINDOW=$((GATEWAY_RESTARTS_IN_WINDOW + 1))
+  jq -n \
+    --arg day "$(today_key)" \
+    --arg timestamp "$(TZ="$TIMEZONE" date --iso-8601=seconds)" \
+    --argjson count "$(json_int "$GATEWAY_RESTARTS_TODAY")" \
+    --argjson now "$now" \
+    --argjson window "$(json_int "$GATEWAY_RESTART_WINDOW_SECONDS")" \
+    --slurpfile previous "$previous_file" \
+    '{
+      day: $day,
+      count: $count,
+      lastRestartAt: $timestamp,
+      history: (((($previous[0].history // []) + [$now]) | map(select(($now - .) < $window))))
+    }' >"$tmp"
+  mv "$tmp" "$GATEWAY_RESTART_STATE_FILE"
 }
 
 persist_json() {
   local report_text="$1"
   local report_json_tmp="$RUN_JSON_FILE.tmp"
   local state_json_tmp="$STATE_FILE.tmp"
-  local errors_json fixes_json actions_json
+  local errors_json fixes_json actions_json incident_codes_json remediations_json diagnostics_json
 
   errors_json="$(json_array_from_name ERRORS)"
   fixes_json="$(json_array_from_name FIXES)"
   actions_json="$(json_array_from_name ACTIONS)"
+  incident_codes_json="$(json_array_from_name INCIDENT_CODES)"
+  remediations_json="$(json_remediations_from_name REMEDIATIONS)"
+  if printf '%s' "$DIAGNOSTICS_JSON" | jq empty >/dev/null 2>&1; then
+    diagnostics_json="$DIAGNOSTICS_JSON"
+  else
+    diagnostics_json="{}"
+  fi
 
   jq -n \
     --arg timestamp "$RUN_ISO" \
@@ -385,6 +500,8 @@ persist_json() {
     --arg updateError "$UPDATE_ERROR" \
     --arg restartError "$RESTART_ERROR" \
     --arg healthError "$HEALTH_ERROR" \
+    --arg configHealth "$CONFIG_HEALTH" \
+    --arg configRestoreDiff "$CONFIG_RESTORE_DIFF" \
     --arg reportText "$report_text" \
     --argjson dryRun "$(json_bool "$DRY_RUN")" \
     --argjson updateAttempted "$(json_bool "$UPDATE_ATTEMPTED")" \
@@ -402,6 +519,13 @@ persist_json() {
     --argjson errors "$errors_json" \
     --argjson fixes "$fixes_json" \
     --argjson actions "$actions_json" \
+    --argjson incidentCodes "$incident_codes_json" \
+    --argjson remediations "$remediations_json" \
+    --argjson gatewayRestartsToday "$(json_int "$GATEWAY_RESTARTS_TODAY")" \
+    --argjson gatewayRestartsInWindow "$(json_int "$GATEWAY_RESTARTS_IN_WINDOW")" \
+    --argjson configRestored "$(json_bool "$CONFIG_RESTORED")" \
+    --argjson configBackupCreated "$(json_bool "$CONFIG_BACKUP_CREATED")" \
+    --argjson diagnostics "$diagnostics_json" \
     '{
       timestamp: $timestamp,
       hostname: $hostname,
@@ -427,6 +551,17 @@ persist_json() {
       errors: $errors,
       fixes: $fixes,
       actions: $actions,
+      incidentCodes: $incidentCodes,
+      remediations: $remediations,
+      gatewayRestartsToday: $gatewayRestartsToday,
+      gatewayRestartsInWindow: $gatewayRestartsInWindow,
+      config: {
+        health: $configHealth,
+        restored: $configRestored,
+        backupCreated: $configBackupCreated,
+        restoreDiff: $configRestoreDiff
+      },
+      diagnostics: $diagnostics,
       outputs: {
         update: $updateOutput,
         doctor: $doctorOutput,
@@ -492,6 +627,137 @@ build_summary_from_output() {
   printf '%s' "$extracted"
 }
 
+is_valid_json_file() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  jq empty "$path" >/dev/null 2>&1
+}
+
+latest_valid_config_backup() {
+  [[ -d "$CONFIG_BACKUP_DIR" ]] || return 1
+  local backup
+  while IFS= read -r backup; do
+    [[ -n "$backup" ]] || continue
+    if is_valid_json_file "$backup"; then
+      printf '%s' "$backup"
+      return 0
+    fi
+  done < <(find "$CONFIG_BACKUP_DIR" -type f -name "$(basename "$OPENCLAW_CONFIG_FILE").*" -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+  return 1
+}
+
+trim_diff() {
+  local text="$1"
+  if ((${#text} <= CONFIG_DIFF_MAX_CHARS)); then
+    printf '%s' "$text"
+  else
+    printf '%s\n\n[diff truncated to %s characters]' "${text:0:CONFIG_DIFF_MAX_CHARS}" "$CONFIG_DIFF_MAX_CHARS"
+  fi
+}
+
+config_diff_against_backup() {
+  local backup="$1"
+  [[ -f "$OPENCLAW_CONFIG_FILE" && -f "$backup" ]] || return 0
+  command_exists diff || return 0
+  local diff_output
+  diff_output="$(diff -u "$OPENCLAW_CONFIG_FILE" "$backup" 2>/dev/null || true)"
+  trim_diff "$diff_output"
+}
+
+rotate_config_backups() {
+  [[ -d "$CONFIG_BACKUP_DIR" ]] || return 0
+  local retention
+  retention="$(json_int "$CONFIG_BACKUP_RETENTION")"
+  ((retention > 0)) || retention=20
+  find "$CONFIG_BACKUP_DIR" -type f -name "$(basename "$OPENCLAW_CONFIG_FILE").*" -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn \
+    | tail -n "+$((retention + 1))" \
+    | cut -d' ' -f2- \
+    | while IFS= read -r old_backup; do
+        [[ -n "$old_backup" ]] && rm -f "$old_backup"
+      done
+}
+
+backup_openclaw_config_if_changed() {
+  [[ "$CONFIG_BACKUP_ENABLED" == "true" ]] || return 0
+  [[ -f "$OPENCLAW_CONFIG_FILE" ]] || return 0
+  is_valid_json_file "$OPENCLAW_CONFIG_FILE" || return 0
+
+  CONFIG_HEALTH="valid"
+
+  local latest
+  latest="$(latest_valid_config_backup || true)"
+  if [[ -n "$latest" ]] && cmp -s "$OPENCLAW_CONFIG_FILE" "$latest"; then
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would snapshot OpenClaw config before maintenance."
+    record_remediation "config_backup" "would_apply" "would back up $OPENCLAW_CONFIG_FILE"
+    return 0
+  fi
+
+  mkdir -p "$CONFIG_BACKUP_DIR"
+  local ts dest
+  ts="$(TZ="$TIMEZONE" date '+%Y%m%d-%H%M%S')"
+  dest="$CONFIG_BACKUP_DIR/$(basename "$OPENCLAW_CONFIG_FILE").$ts"
+  cp -p "$OPENCLAW_CONFIG_FILE" "$dest"
+  CONFIG_BACKUP_CREATED=1
+  append_array FIXES "Backed up OpenClaw config to $dest."
+  record_remediation "config_backup" "applied" "$dest"
+  rotate_config_backups
+}
+
+maybe_restore_broken_config() {
+  [[ -f "$OPENCLAW_CONFIG_FILE" ]] || {
+    CONFIG_HEALTH="missing"
+    add_incident_code "config_missing"
+    append_array ACTIONS "OpenClaw config file was not found at $OPENCLAW_CONFIG_FILE."
+    return 0
+  }
+
+  if is_valid_json_file "$OPENCLAW_CONFIG_FILE"; then
+    CONFIG_HEALTH="valid"
+    backup_openclaw_config_if_changed
+    return 0
+  fi
+
+  CONFIG_HEALTH="invalid"
+  add_incident_code "config_invalid"
+
+  local backup
+  backup="$(latest_valid_config_backup || true)"
+  if [[ -z "$backup" ]]; then
+    append_array ERRORS "OpenClaw config is invalid JSON and no valid backup exists."
+    append_array ACTIONS "Fix $OPENCLAW_CONFIG_FILE manually or provide a valid backup."
+    record_remediation "config_restore" "blocked_no_backup" "no valid backup found"
+    return 1
+  fi
+
+  CONFIG_RESTORE_DIFF="$(config_diff_against_backup "$backup")"
+
+  if [[ "$AUTO_RESTORE_BROKEN_CONFIG" != "true" ]]; then
+    append_array ACTIONS "OpenClaw config is invalid; latest valid backup is $backup, but auto-restore is disabled."
+    record_remediation "config_restore" "blocked_by_policy" "$backup"
+    return 1
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would restore invalid OpenClaw config from $backup."
+    record_remediation "config_restore" "would_apply" "$backup"
+    return 0
+  fi
+
+  cp -p "$OPENCLAW_CONFIG_FILE" "$OPENCLAW_CONFIG_FILE.broken.$RUN_ID" 2>/dev/null || true
+  cp -p "$backup" "$OPENCLAW_CONFIG_FILE"
+  CONFIG_HEALTH="restored"
+  CONFIG_RESTORED=1
+  REMEDIATION_APPLIED=1
+  append_array FIXES "Restored invalid OpenClaw config from $backup."
+  record_remediation "config_restore" "applied" "$backup"
+  return 0
+}
+
 run_self_test() {
   log INFO "Running self-test"
 
@@ -554,6 +820,7 @@ classify_doctor() {
   lowered="$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')"
 
   if [[ "$exit_code" -ne 0 ]]; then
+    add_incident_code "doctor_failed"
     DOCTOR_CLASSIFICATION="needs_manual_attention"
     DOCTOR_SUMMARY="doctor exited with code $exit_code"
     append_array ACTIONS "Inspect the doctor output and run manual remediation."
@@ -561,6 +828,7 @@ classify_doctor() {
   fi
 
   if printf '%s' "$lowered" | grep -Eq 'doctor changes|synced|repaired|fixed|migrated|normalized|generated and configured|archived [0-9]+ orphan transcript|pruned [0-9]+'; then
+    add_incident_code "doctor_repaired"
     DOCTOR_CLASSIFICATION="repaired"
     DOCTOR_SUMMARY="doctor applied at least one corrective action"
     append_array FIXES "Doctor reported corrective actions during the run."
@@ -568,6 +836,15 @@ classify_doctor() {
   fi
 
   if printf '%s' "$lowered" | grep -Eq 'missing transcripts|needs manual attention|lasterror|errors:[[:space:]]*[1-9]|warnings:[[:space:]]*[1-9]|failed|unhealthy|orphan|corrupt|broken'; then
+    if printf '%s' "$lowered" | grep -q 'missing transcripts'; then
+      add_incident_code "missing_transcripts"
+    fi
+    if printf '%s' "$lowered" | grep -q 'orphan transcript'; then
+      add_incident_code "orphan_transcripts"
+    fi
+    if printf '%s' "$lowered" | grep -Eq 'unhealthy|gateway'; then
+      add_incident_code "gateway_unhealthy"
+    fi
     DOCTOR_CLASSIFICATION="needs_manual_attention"
     DOCTOR_SUMMARY="doctor found issues that still require intervention"
     append_array ACTIONS "Review the doctor recommendations that remain unresolved."
@@ -611,17 +888,20 @@ run_sessions_cleanup_apply() {
 maybe_auto_remediate_missing_transcripts() {
   [[ "$AUTO_REMEDIATE_MISSING_TRANSCRIPTS" == "true" ]] || return 0
   printf '%s' "$DOCTOR_OUTPUT" | grep -qi 'missing transcripts' || return 0
+  add_incident_code "missing_transcripts"
 
   local preview_output preview_status missing_count would_mutate
   run_sessions_cleanup_preview preview_output preview_status
   if [[ "$preview_status" -ne 0 ]]; then
     append_array ERRORS "Unable to preview missing transcript cleanup."
     append_array ACTIONS "Run openclaw sessions cleanup --dry-run --fix-missing manually."
+    record_remediation "missing_transcripts" "preview_failed" "sessions cleanup preview failed"
     return 1
   fi
 
   if ! printf '%s' "$preview_output" | jq empty >/dev/null 2>&1; then
     append_array ERRORS "Cleanup preview returned invalid JSON."
+    record_remediation "missing_transcripts" "preview_failed" "sessions cleanup preview returned invalid JSON"
     return 1
   fi
 
@@ -629,12 +909,14 @@ maybe_auto_remediate_missing_transcripts() {
   would_mutate="$(printf '%s' "$preview_output" | jq -r '.wouldMutate // false')"
 
   if [[ "$missing_count" == "0" || "$would_mutate" != "true" ]]; then
+    record_remediation "missing_transcripts" "not_needed" "cleanup preview found no missing transcripts to prune"
     return 0
   fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     append_array FIXES "Dry-run: would prune $missing_count session entries with missing transcripts."
     append_array ACTIONS "Run without --dry-run to auto-prune session entries with missing transcripts."
+    record_remediation "missing_transcripts" "would_apply" "would prune $missing_count session entries"
     return 0
   fi
 
@@ -643,6 +925,7 @@ maybe_auto_remediate_missing_transcripts() {
   if [[ "$apply_status" -ne 0 ]]; then
     append_array ERRORS "Automatic cleanup of missing transcripts failed."
     append_array ACTIONS "Run openclaw sessions cleanup --enforce --fix-missing manually."
+    record_remediation "missing_transcripts" "apply_failed" "sessions cleanup enforce failed"
     return 1
   fi
 
@@ -654,13 +937,14 @@ maybe_auto_remediate_missing_transcripts() {
 
   REMEDIATION_APPLIED=1
   append_array FIXES "Pruned $missing_count session entries with missing transcripts${after_count:+; remaining entries: $after_count}."
+  record_remediation "missing_transcripts" "applied" "pruned $missing_count session entries"
   return 0
 }
 
 maybe_auto_archive_orphan_transcripts() {
-  [[ "$DRY_RUN" -eq 1 ]] || return 0
   [[ "$AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS" == "true" ]] || return 0
   printf '%s' "$DOCTOR_OUTPUT" | grep -qi 'orphan transcript file' || return 0
+  add_incident_code "orphan_transcripts"
 
   local transcript_names=()
   while IFS= read -r transcript_name; do
@@ -670,6 +954,7 @@ maybe_auto_archive_orphan_transcripts() {
 
   if ((${#transcript_names[@]} == 0)); then
     append_array ACTIONS "Doctor reported orphan transcripts, but no transcript filenames could be extracted automatically."
+    record_remediation "orphan_transcripts" "preview_failed" "no transcript filenames could be extracted"
     return 1
   fi
 
@@ -684,12 +969,20 @@ maybe_auto_archive_orphan_transcripts() {
 
   if ((${#transcript_paths[@]} == 0)); then
     append_array ACTIONS "Doctor reported orphan transcripts, but no matching files were found under $OPENCLAW_STATE_HOME/agents."
+    record_remediation "orphan_transcripts" "preview_failed" "no matching files found under agent state"
+    return 1
+  fi
+
+  if ((${#transcript_paths[@]} > MAX_ORPHAN_TRANSCRIPTS_PER_RUN)); then
+    append_array ACTIONS "Doctor reported ${#transcript_paths[@]} orphan transcripts, exceeding MAX_ORPHAN_TRANSCRIPTS_PER_RUN=$MAX_ORPHAN_TRANSCRIPTS_PER_RUN."
+    record_remediation "orphan_transcripts" "blocked_by_limit" "${#transcript_paths[@]} files exceed per-run archive limit"
     return 1
   fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     append_array FIXES "Dry-run: would archive ${#transcript_paths[@]} orphan transcript file(s)."
     append_array ACTIONS "Run without --dry-run to archive orphan transcript files automatically."
+    record_remediation "orphan_transcripts" "would_apply" "would archive ${#transcript_paths[@]} orphan transcript files"
     return 0
   fi
 
@@ -704,11 +997,13 @@ maybe_auto_archive_orphan_transcripts() {
 
   if ((archived_count == 0)); then
     append_array ACTIONS "Doctor reported orphan transcripts, but no matching files remained by the time remediation ran."
+    record_remediation "orphan_transcripts" "not_needed" "no matching files remained by apply time"
     return 1
   fi
 
   REMEDIATION_APPLIED=1
   append_array FIXES "Archived $archived_count orphan transcript file(s)."
+  record_remediation "orphan_transcripts" "applied" "archived $archived_count orphan transcript files"
   return 0
 }
 
@@ -767,10 +1062,57 @@ run_update_status() {
 
 should_attempt_update() {
   [[ "$AUTO_UPDATE" == "true" ]] || return 1
+  [[ "$CONFIG_HEALTH" != "invalid" ]] || return 1
   [[ -n "$AVAILABLE_VERSION" ]] || return 1
   [[ "$CURRENT_VERSION_BEFORE" != "$AVAILABLE_VERSION" ]] || return 1
   (( CONSECUTIVE_FAILURES < MAX_CONSECUTIVE_UPDATE_FAILURES )) || return 1
   return 0
+}
+
+classify_update_failure() {
+  local output="$1"
+  local lowered
+  lowered="$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')"
+
+  add_incident_code "update_failed"
+
+  if printf '%s' "$lowered" | grep -Eq 'timed out|timeout|etimedout'; then
+    add_incident_code "update_timeout"
+    append_array ACTIONS "Update timed out; check registry/network latency or increase UPDATE_TIMEOUT for the next run."
+    return 0
+  fi
+
+  if printf '%s' "$lowered" | grep -Eq 'eai_again|enotfound|econnreset|econnrefused|network|registry|fetch failed|could not resolve|temporary failure'; then
+    add_incident_code "update_network"
+    append_array ACTIONS "Update appears blocked by network or registry access; verify DNS, outbound HTTPS and package registry reachability."
+    return 0
+  fi
+
+  if printf '%s' "$lowered" | grep -Eq 'no space left|enospc|disk full'; then
+    add_incident_code "update_disk_full"
+    append_array ACTIONS "Update failed because disk space is exhausted; free disk space before the next automatic attempt."
+    return 0
+  fi
+
+  if printf '%s' "$lowered" | grep -Eq 'permission denied|eacces|operation not permitted|eperm'; then
+    add_incident_code "update_permission"
+    append_array ACTIONS "Update failed due to permissions; check ownership of the OpenClaw install and cache directories."
+    return 0
+  fi
+
+  if printf '%s' "$lowered" | grep -Eq 'lock|already running|resource busy|ebusy'; then
+    add_incident_code "update_lock"
+    append_array ACTIONS "Update appears blocked by a lock or concurrent process; check for another OpenClaw maintenance process."
+    return 0
+  fi
+
+  if printf '%s' "$lowered" | grep -Eq 'command not found|npm err|node:|cannot find module|module not found'; then
+    add_incident_code "update_dependency"
+    append_array ACTIONS "Update failed in the runtime/package toolchain; verify node/npm/openclaw binaries and PATH."
+    return 0
+  fi
+
+  append_array ACTIONS "Run openclaw update manually after reviewing the error output."
 }
 
 run_update() {
@@ -832,7 +1174,7 @@ run_update() {
   UPDATE_ERROR="$output"
   CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
   append_array ERRORS "OpenClaw update failed after a single retry."
-  append_array ACTIONS "Run openclaw update manually after reviewing the error output."
+  classify_update_failure "$UPDATE_OUTPUT"$'\n'"$output"
   return 1
 }
 
@@ -915,6 +1257,158 @@ wait_for_gateway_health() {
   return 1
 }
 
+check_gateway_health_once() {
+  local output status
+  local cmd
+  build_openclaw_cmd cmd
+  cmd+=(health --json --timeout "$HEALTH_TIMEOUT_MS")
+  run_capture output status "Checking gateway health without restart" "${cmd[@]}"
+  HEALTH_OUTPUT="$output"
+
+  if [[ "$status" -eq 0 ]] && printf '%s' "$output" | jq -e '.ok == true' >/dev/null 2>&1; then
+    GATEWAY_HEALTHY=1
+    return 0
+  fi
+
+  GATEWAY_HEALTHY=0
+  HEALTH_ERROR="$output"
+  add_incident_code "gateway_unhealthy"
+  return 1
+}
+
+should_auto_restart_unhealthy_gateway() {
+  [[ "$AUTO_RESTART_UNHEALTHY_GATEWAY" == "true" ]] || return 1
+  [[ "$DRY_RUN" -eq 0 ]] || return 1
+  (( GATEWAY_RESTARTS_TODAY < MAX_GATEWAY_RESTARTS_PER_DAY )) || return 1
+  (( GATEWAY_RESTARTS_IN_WINDOW < MAX_GATEWAY_RESTARTS_PER_WINDOW )) || return 1
+  return 0
+}
+
+maybe_auto_restart_unhealthy_gateway() {
+  if check_gateway_health_once; then
+    return 0
+  fi
+
+  if ! should_auto_restart_unhealthy_gateway; then
+    append_array ACTIONS "Gateway is unhealthy; automatic restart skipped by policy, daily limit or short-window loop guard."
+    record_remediation "gateway_unhealthy" "blocked_by_policy" "restart disabled, daily limit reached, or restart loop guard active"
+    return 1
+  fi
+
+  append_array FIXES "Gateway health failed; attempting one policy-limited restart."
+  if restart_gateway; then
+    record_gateway_restart
+    record_remediation "gateway_unhealthy" "applied" "gateway restart attempted after failed health check"
+    wait_for_gateway_health || return 1
+    return 0
+  fi
+
+  record_remediation "gateway_unhealthy" "apply_failed" "gateway restart command failed"
+  return 1
+}
+
+diag_capture() {
+  local timeout_seconds="$1"
+  shift
+  local output status
+  local had_errexit=0
+  case $- in
+    *e*) had_errexit=1 ;;
+  esac
+  set +e
+  output="$(timeout "${timeout_seconds}s" "$@" 2>&1)"
+  status=$?
+  if [[ "$had_errexit" -eq 1 ]]; then
+    set -e
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    printf '%s' "$output"
+  else
+    printf ''
+  fi
+}
+
+diag_shell_capture() {
+  local timeout_seconds="$1"
+  local command_string="$2"
+  local output status
+  local had_errexit=0
+  case $- in
+    *e*) had_errexit=1 ;;
+  esac
+  set +e
+  output="$(timeout "${timeout_seconds}s" bash -lc "$command_string" 2>&1)"
+  status=$?
+  if [[ "$had_errexit" -eq 1 ]]; then
+    set -e
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    printf '%s' "$output"
+  else
+    printf ''
+  fi
+}
+
+collect_diagnostics() {
+  local version process_snapshot disk_snapshot mem_snapshot config_error gateway_log gateway_err openclaw_status
+  version="$(diag_capture 5 "$OPENCLAW_BIN" --version)"
+  process_snapshot="$(diag_shell_capture 5 "ps -eo pid,pcpu,pmem,args 2>/dev/null | grep -i '[o]penclaw' | head -5")"
+  disk_snapshot="$(diag_shell_capture 5 "df -h \"${OPENCLAW_STATE_HOME}\" 2>/dev/null | tail -1 || df -h / | tail -1")"
+  mem_snapshot="$(diag_shell_capture 5 "free -h 2>/dev/null | awk '/Mem:/{print \$3\"/\"\$2}'")"
+  gateway_log="$(diag_shell_capture 5 "tail -n \"${DIAGNOSTIC_LOG_LINES}\" \"${OPENCLAW_STATE_HOME}/logs/gateway.log\" 2>/dev/null")"
+  gateway_err="$(diag_shell_capture 5 "tail -n \"${DIAGNOSTIC_LOG_LINES}\" \"${OPENCLAW_STATE_HOME}/logs/gateway.err.log\" 2>/dev/null")"
+
+  if [[ -f "$OPENCLAW_CONFIG_FILE" ]] && ! is_valid_json_file "$OPENCLAW_CONFIG_FILE"; then
+    config_error="$(jq empty "$OPENCLAW_CONFIG_FILE" 2>&1 || true)"
+  else
+    config_error=""
+  fi
+
+  if command_exists timeout; then
+    local status_cmd
+    build_openclaw_cmd status_cmd
+    status_cmd+=(status --json)
+    openclaw_status="$(diag_capture "$STATUS_TIMEOUT" "${status_cmd[@]}")"
+    if ! printf '%s' "$openclaw_status" | jq empty >/dev/null 2>&1; then
+      openclaw_status="null"
+    fi
+  else
+    openclaw_status="null"
+  fi
+
+  DIAGNOSTICS_JSON="$(
+    jq -n \
+      --arg collectedAt "$(TZ="$TIMEZONE" date --iso-8601=seconds)" \
+      --arg version "$version" \
+      --arg processSnapshot "$process_snapshot" \
+      --arg diskSnapshot "$disk_snapshot" \
+      --arg memorySnapshot "$mem_snapshot" \
+      --arg configFile "$OPENCLAW_CONFIG_FILE" \
+      --arg configHealth "$CONFIG_HEALTH" \
+      --arg configError "$config_error" \
+      --arg gatewayLog "$gateway_log" \
+      --arg gatewayErr "$gateway_err" \
+      --argjson openclawStatus "$openclaw_status" \
+      '{
+        collectedAt: $collectedAt,
+        openclawVersion: $version,
+        processSnapshot: $processSnapshot,
+        diskSnapshot: $diskSnapshot,
+        memorySnapshot: $memorySnapshot,
+        config: {
+          file: $configFile,
+          health: $configHealth,
+          error: (if $configError == "" then null else $configError end)
+        },
+        logs: {
+          gateway: $gatewayLog,
+          gatewayErr: $gatewayErr
+        },
+        openclawStatus: $openclawStatus
+      }'
+  )"
+}
+
 build_report() {
   local mode_text="live"
   [[ "$DRY_RUN" -eq 1 ]] && mode_text="dry-run"
@@ -957,8 +1451,21 @@ Update: $update_line
 Doctor: $DOCTOR_SUMMARY
 Restart: $restart_line
 Health check: $health_line
+Config: $CONFIG_HEALTH
 Duration: ${DURATION_SECONDS}s
 EOF
+
+  if [[ "$CONFIG_BACKUP_CREATED" -eq 1 ]]; then
+    printf '\nConfig backup: created\n'
+  fi
+
+  if [[ "$CONFIG_RESTORED" -eq 1 ]]; then
+    printf '\nConfig restore: applied\n'
+  fi
+
+  if [[ -n "$CONFIG_RESTORE_DIFF" ]]; then
+    printf '\nConfig restore diff preview:\n%s\n' "$CONFIG_RESTORE_DIFF"
+  fi
 
   if [[ -n "$summary_lines" ]]; then
     printf '\nDoctor highlights:\n%s\n' "$summary_lines"
@@ -967,6 +1474,20 @@ EOF
   if ((${#FIXES[@]} > 0)); then
     printf '\nActions applied:\n'
     printf -- '- %s\n' "${FIXES[@]}"
+  fi
+
+  if ((${#INCIDENT_CODES[@]} > 0)); then
+    printf '\nIncident codes:\n'
+    printf -- '- %s\n' "${INCIDENT_CODES[@]}"
+  fi
+
+  if ((${#REMEDIATIONS[@]} > 0)); then
+    printf '\nRemediation registry:\n'
+    local remediation_entry
+    for remediation_entry in "${REMEDIATIONS[@]}"; do
+      IFS='|' read -r remediation_code remediation_result remediation_detail <<<"$remediation_entry"
+      printf -- '- %s: %s%s\n' "$remediation_code" "$remediation_result" "${remediation_detail:+ - $remediation_detail}"
+    done
   fi
 
   if ((${#ERRORS[@]} > 0)); then
@@ -1091,6 +1612,8 @@ main() {
     exit 1
   fi
 
+  maybe_restore_broken_config || true
+
   run_update_status || true
 
   if should_attempt_update; then
@@ -1104,22 +1627,14 @@ main() {
     run_doctor_phase
   fi
 
-  if [[ "$UPDATE_SUCCEEDED" -eq 1 ]]; then
+  if [[ "$UPDATE_SUCCEEDED" -eq 1 || "$CONFIG_RESTORED" -eq 1 ]]; then
     restart_gateway || true
     wait_for_gateway_health || true
   else
-    local health_output health_status
-    local cmd
-    build_openclaw_cmd cmd
-    cmd+=(health --json --timeout "$HEALTH_TIMEOUT_MS")
-    run_capture health_output health_status "Checking gateway health without restart" \
-      "${cmd[@]}"
-    HEALTH_OUTPUT="$health_output"
-    if [[ "$health_status" -eq 0 ]] && printf '%s' "$health_output" | jq -e '.ok == true' >/dev/null 2>&1; then
-      GATEWAY_HEALTHY=1
-    fi
+    maybe_auto_restart_unhealthy_gateway || true
   fi
 
+  collect_diagnostics
   finalize_status
 
   DURATION_SECONDS=$(( $(date +%s) - start_epoch ))

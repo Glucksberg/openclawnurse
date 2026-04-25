@@ -43,6 +43,7 @@ Por padrao, ele tenta remediar automaticamente dois tipos de sujeira operacional
 
 - entradas de sessao com transcripts ausentes
 - arquivos `*.trajectory.jsonl` orfaos apontados pelo `openclaw doctor`
+- config `openclaw.json` invalida, restaurando o ultimo backup JSON valido quando existir
 
 Se o seu gateway OpenClaw for supervisionado por `pm2`, ajuste o arquivo `~/.config/openclawnurse/openclawnurse.env` para usar:
 
@@ -81,6 +82,7 @@ Os scripts e configuracoes de multi-host continuam disponiveis no repo:
 - `scripts/openclaw-fleet-export.sh`
 - `scripts/openclaw-fleet-dashboard.sh`
 - `scripts/openclaw-fleet-remediation-plan.sh`
+- `scripts/openclaw-fleet-remediation-exec.sh`
 - `config/fleet-nodes.example.json`
 - `config/fleet-remediation-policy.example.json`
 

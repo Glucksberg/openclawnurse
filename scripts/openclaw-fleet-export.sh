@@ -236,7 +236,7 @@ payload="$(
     --arg doctorState "$doctor_state" \
     --arg statusError "$status_error" \
     --argjson statusFetchOk "$status_fetch_ok" \
-    --argjson nurse "$(jq '{timestamp, status, currentVersionBefore, currentVersionAfter, availableVersion, channel, dryRun, doctorAttempted, doctorExitCode, doctorSummary, gatewayHealthy, notificationPending, consecutiveFailures, durationSeconds, errors, fixes, actions}' "$STATE_FILE")" \
+    --argjson nurse "$(jq '{timestamp, status, currentVersionBefore, currentVersionAfter, availableVersion, channel, dryRun, doctorAttempted, doctorExitCode, doctorSummary, gatewayHealthy, notificationPending, consecutiveFailures, gatewayRestartsToday, gatewayRestartsInWindow, config, durationSeconds, errors, fixes, actions, incidentCodes, remediations}' "$STATE_FILE")" \
     --argjson statusSnapshot "$status_json" \
     '{
       schemaVersion: 1,

@@ -83,6 +83,7 @@ plan_json="$(
     | def category($n):
         if (($n.source.ok // false) | not) then "feed_unreachable"
         elif $n.checks.auth == "issue" then "auth_issue"
+        elif (($n.nurse.incidentCodes // []) | index("config_invalid") != null) then "config_issue"
         elif $n.checks.gateway == "issue" then "gateway_issue"
         elif ($n.nurse.status == "FAILED" or $n.nurse.status == "FAILED_NOTIFICATION_PENDING") then "nurse_failed"
         elif $n.checks.update == "outdated" then "update_available"
@@ -93,6 +94,7 @@ plan_json="$(
       def action_for($category):
         if $category == "feed_unreachable" then "check_export_timer"
         elif $category == "auth_issue" then "manual_auth_refresh"
+        elif $category == "config_issue" then "manual_config_repair"
         elif $category == "gateway_issue" then "restart_gateway"
         elif $category == "nurse_failed" then "run_nurse_now"
         elif $category == "update_available" then "run_nurse_now"
@@ -103,14 +105,16 @@ plan_json="$(
       def command_hint($action):
         if $action == "check_export_timer" then "systemctl --user status openclaw-fleet-export.timer"
         elif $action == "manual_auth_refresh" then "claude auth login"
+        elif $action == "manual_config_repair" then "review OpenClaw config restore status and fix ~/.openclaw/openclaw.json manually if no valid backup exists"
         elif $action == "restart_gateway" then "pm2 restart openclaw-gateway"
         elif $action == "run_nurse_now" then "~/.local/share/openclawnurse/bin/openclaw-doctor.sh --config ~/.config/openclawnurse/openclawnurse.env --no-notify"
-        elif $action == "replay_notification" then "review nurse logs and re-run with notifications enabled"
+        elif $action == "replay_notification" then "~/.local/share/openclawnurse/bin/openclaw-doctor.sh --config ~/.config/openclawnurse/openclawnurse.env --retry-pending"
         else ""
         end;
       def requires_human($action):
         ($action == "none")
         or ($action == "manual_auth_refresh")
+        or ($action == "manual_config_repair")
         or (($policy_doc.manualApprovalRequiredActions // []) | index($action) != null);
       def auto_eligible($action):
         (($policy_doc.allowedActions // []) | index($action) != null)
@@ -150,7 +154,8 @@ plan_json="$(
                 gateway: ($node.checks.gateway // "unknown"),
                 update: ($node.checks.update // "unknown"),
                 notifications: ($node.checks.notifications // "unknown"),
-                feedOk: ($node.source.ok // false)
+                feedOk: ($node.source.ok // false),
+                incidentCodes: ($node.nurse.incidentCodes // [])
               },
               llmBrief: (
                 "Node "

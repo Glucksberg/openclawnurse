@@ -17,5 +17,5 @@
   ],
   "maxAutoActionsPerRun": 2,
   "maxNodesPerRun": 3,
-  "notes": "The LLM may classify incidents and summarize evidence, but execution must stay inside the allowed action list and forbidden patterns."
+  "notes": "Default is advisory. To allow openclaw-fleet-remediation-exec.sh --execute to run eligible local actions, set mode to execute and keep allowed actions, manual approvals and limits explicit."
 }
