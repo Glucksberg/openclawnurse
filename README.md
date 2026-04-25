@@ -62,6 +62,9 @@ Se o host usar bins fora do PATH padrao do usuario, como Linuxbrew, adicione por
 - `config/fleet-remediation-policy.example.json` politica de guardrails para remediacao
 - `docs/PLAN.md` plano v2
 - `docs/CARTILHA.md` guia de instalacao e uso
+- `docs/SETUP-NODE.md` guia rapido de node
+- `docs/SETUP-HOST-CENTRAL.md` guia rapido de host central
+- `docs/SETUP-HOST-CENTRAL-KUMA.md` guia rapido de host central com Uptime Kuma
 - `docs/REVIEW.md` revisao tecnica da ferramenta
 - `docs/FLEET.md` operacao do dashboard central
 
