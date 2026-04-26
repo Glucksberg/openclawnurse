@@ -84,6 +84,8 @@ if [[ -f "$CONFIG_FILE" ]]; then
   source "$CONFIG_FILE"
 fi
 
+OPENCLAW_BIN="${OPENCLAW_BIN:-openclaw}"
+OPENCLAW_PROFILE="${OPENCLAW_PROFILE:-}"
 STATE_FILE="${STATE_FILE:-${STATE_DIR:-$DEFAULT_STATE_DIR}/doctor-state.json}"
 
 prepend_path() {
@@ -122,6 +124,24 @@ bootstrap_path() {
 
 bootstrap_path
 
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing required command: $1" >&2
+    exit 1
+  }
+}
+
+build_openclaw_cmd() {
+  local name="$1"
+  local -n ref="$name"
+  ref=("$OPENCLAW_BIN")
+  if [[ -n "$OPENCLAW_PROFILE" ]]; then
+    ref+=(--profile "$OPENCLAW_PROFILE")
+  fi
+}
+
+require_cmd jq
+
 if [[ ! -f "$STATE_FILE" ]]; then
   echo "Missing state file: $STATE_FILE" >&2
   exit 1
@@ -137,9 +157,13 @@ status_fetch_ok=false
 status_error=""
 
 if [[ "$INCLUDE_STATUS" -eq 1 ]]; then
-  if command -v openclaw >/dev/null 2>&1; then
+  require_cmd timeout
+  if command -v "$OPENCLAW_BIN" >/dev/null 2>&1; then
+    status_cmd=()
+    build_openclaw_cmd status_cmd
+    status_cmd+=(status --json)
     set +e
-    status_output="$(timeout "${STATUS_TIMEOUT}s" openclaw status --json 2>&1)"
+    status_output="$(timeout "${STATUS_TIMEOUT}s" "${status_cmd[@]}" 2>&1)"
     status_code=$?
     set -e
     if [[ "$status_code" -eq 0 ]] && printf '%s' "$status_output" | jq empty >/dev/null 2>&1; then
@@ -171,7 +195,7 @@ if [[ "$INCLUDE_STATUS" -eq 1 ]]; then
       status_error="$(printf '%s' "$status_output" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-300)"
     fi
   else
-    status_error="openclaw command not found"
+    status_error="$OPENCLAW_BIN command not found"
   fi
 fi
 

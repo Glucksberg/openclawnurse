@@ -127,6 +127,13 @@ build_html() {
       | gsub("&"; "&amp;")
       | gsub("<"; "&lt;")
       | gsub(">"; "&gt;");
+    def attr:
+      esc
+      | gsub("\""; "&quot;")
+      | gsub("\u0027"; "&#39;");
+    def safe_url:
+      (if . == null then "" else tostring end)
+      | if test("^https?://") then . else "" end;
     "<!doctype html>
 <html lang=\"en\">
 <head>
@@ -209,7 +216,7 @@ build_html() {
               <div class=\"fact\"><strong>Updated At</strong><span>\(.nurse.timestamp | esc)</span></div>
             </div>
             <div class=\"summary\">\(.nurse.doctorSummary // "" | esc)
-              <small>Source: \(.source.feedUrl | esc)\(if .node.publicUrl then " · <a href=\"\(.node.publicUrl | esc)\">open</a>" else "" end)</small>
+              <small>Source: \(.source.feedUrl | esc)\(if (.node.publicUrl | safe_url) != "" then " · <a href=\"\(.node.publicUrl | safe_url | attr)\">open</a>" else "" end)</small>
             </div>
           </section>"
         )

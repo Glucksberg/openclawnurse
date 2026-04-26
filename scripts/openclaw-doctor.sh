@@ -12,6 +12,9 @@ DEFAULT_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/openclawnurse"
 DEFAULT_CONFIG_FILE="$DEFAULT_CONFIG_DIR/openclawnurse.env"
 
 CONFIG_FILE="${OPENCLAWNURSE_CONFIG_FILE:-$DEFAULT_CONFIG_FILE}"
+CONFIG_DIR="${CONFIG_DIR:-$DEFAULT_CONFIG_DIR}"
+DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
+STATE_DIR="${STATE_DIR:-$DEFAULT_STATE_DIR}"
 DRY_RUN=0
 RETRY_PENDING_ONLY=0
 NO_NOTIFY=0
@@ -1644,6 +1647,7 @@ main() {
 
   if ! deliver_report "$report_text"; then
     finalize_status
+    report_text="$(build_report)"
     persist_json "$report_text"
     persist_pending_report "$report_text"
   else
