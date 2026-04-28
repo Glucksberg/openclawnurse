@@ -75,6 +75,19 @@ Se o host usar bins fora do PATH padrao do usuario, como Linuxbrew, adicione por
 - `systemctl --user status openclawnurse.timer`
 - `journalctl --user -u openclawnurse.service -n 200 --no-pager`
 
+## Validacao local
+
+Antes de publicar mudancas, rode:
+
+```bash
+bash -n install.sh
+for script in scripts/*.sh; do bash -n "$script"; done
+jq empty config/*.json
+scripts/test-smoke.sh
+```
+
+O CI do GitHub Actions executa essas mesmas validacoes. Ele tambem roda `shellcheck` como aviso nao bloqueante.
+
 ## Planejamento futuro
 
 Os scripts e configuracoes de multi-host continuam disponiveis no repo:
