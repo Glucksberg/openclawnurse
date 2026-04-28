@@ -106,7 +106,7 @@ plan_json="$(
         if $action == "check_export_timer" then "systemctl --user status openclaw-fleet-export.timer"
         elif $action == "manual_auth_refresh" then "claude auth login"
         elif $action == "manual_config_repair" then "review OpenClaw config restore status and fix ~/.openclaw/openclaw.json manually if no valid backup exists"
-        elif $action == "restart_gateway" then "pm2 restart openclaw-gateway"
+        elif $action == "restart_gateway" then "systemctl --user restart openclaw-gateway.service"
         elif $action == "run_nurse_now" then "~/.local/share/openclawnurse/bin/openclaw-doctor.sh --config ~/.config/openclawnurse/openclawnurse.env --no-notify"
         elif $action == "replay_notification" then "~/.local/share/openclawnurse/bin/openclaw-doctor.sh --config ~/.config/openclawnurse/openclawnurse.env --retry-pending"
         else ""

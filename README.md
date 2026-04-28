@@ -45,10 +45,13 @@ Por padrao, ele tenta remediar automaticamente dois tipos de sujeira operacional
 - arquivos `*.trajectory.jsonl` orfaos apontados pelo `openclaw doctor`
 - config `openclaw.json` invalida, restaurando o ultimo backup JSON valido quando existir
 
-Se o seu gateway OpenClaw for supervisionado por `pm2`, ajuste o arquivo `~/.config/openclawnurse/openclawnurse.env` para usar:
+Para evitar duplicidade em updates, o Gateway OpenClaw deve ficar sob `systemd --user`:
 
-- `RESTART_MODE="custom"`
-- `RESTART_COMMAND="pm2 restart openclaw-gateway"`
+- `RESTART_MODE="systemd_user"`
+- `SYSTEMD_UNIT_NAME="openclaw-gateway.service"`
+- `AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="true"`
+
+Se um app legado chamado exatamente `openclaw-gateway` aparecer no PM2, o Nurse pode remover apenas esse app do PM2 e garantir que o `openclaw-gateway.service` esteja habilitado/rodando. Outros apps PM2 nao sao tocados.
 
 Se o host usar bins fora do PATH padrao do usuario, como Linuxbrew, adicione por config:
 

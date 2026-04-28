@@ -97,8 +97,11 @@ MAX_ORPHAN_TRANSCRIPTS_PER_RUN="20"
 CONFIG_BACKUP_ENABLED="true"
 CONFIG_BACKUP_RETENTION="20"
 AUTO_RESTORE_BROKEN_CONFIG="true"
-RESTART_MODE="custom"
-RESTART_COMMAND="pm2 restart openclaw-gateway"
+AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="true"
+PM2_GATEWAY_APP_NAME="openclaw-gateway"
+RESTART_MODE="systemd_user"
+SYSTEMD_UNIT_NAME="openclaw-gateway.service"
+RESTART_COMMAND=""
 NODE_COMPILE_CACHE="/var/tmp/openclaw-compile-cache"
 OPENCLAW_NO_RESPAWN="1"
 EXTRA_PATH="/home/linuxbrew/.linuxbrew/bin"
@@ -110,7 +113,7 @@ LOG_RETENTION_MB="200"
 Notas:
 
 - troque `TELEGRAM_TARGET` pelo grupo daquela VPS
-- se o gateway nao estiver no `pm2`, ajuste `RESTART_MODE`
+- mantenha o Gateway OpenClaw em `systemd --user`; se existir um app legado `openclaw-gateway` no PM2, o Nurse remove apenas esse app e garante o systemd ativo
 - se nao usa Linuxbrew, remova `EXTRA_PATH`
 
 ## Validacao minima por VPS

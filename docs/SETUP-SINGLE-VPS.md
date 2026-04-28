@@ -39,8 +39,11 @@ MAX_ORPHAN_TRANSCRIPTS_PER_RUN="20"
 CONFIG_BACKUP_ENABLED="true"
 CONFIG_BACKUP_RETENTION="20"
 AUTO_RESTORE_BROKEN_CONFIG="true"
-RESTART_MODE="custom"
-RESTART_COMMAND="pm2 restart openclaw-gateway"
+AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="true"
+PM2_GATEWAY_APP_NAME="openclaw-gateway"
+RESTART_MODE="systemd_user"
+SYSTEMD_UNIT_NAME="openclaw-gateway.service"
+RESTART_COMMAND=""
 NODE_COMPILE_CACHE="/var/tmp/openclaw-compile-cache"
 OPENCLAW_NO_RESPAWN="1"
 EXTRA_PATH="/home/linuxbrew/.linuxbrew/bin"
@@ -49,7 +52,7 @@ EXTRA_PATH="/home/linuxbrew/.linuxbrew/bin"
 Troque:
 
 - `TELEGRAM_TARGET`
-- `RESTART_MODE` e `RESTART_COMMAND` se o host nao usar `pm2`
+- `RESTART_MODE` e `SYSTEMD_UNIT_NAME` somente se o host usar outro supervisor; o recomendado e systemd user
 
 ## 3. Reaplicar a instalacao
 

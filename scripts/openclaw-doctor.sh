@@ -139,6 +139,8 @@ AUTO_REMEDIATE_MISSING_TRANSCRIPTS="${AUTO_REMEDIATE_MISSING_TRANSCRIPTS:-true}"
 AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS="${AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS:-true}"
 AUTO_REMEDIATE_ALL_AGENTS="${AUTO_REMEDIATE_ALL_AGENTS:-false}"
 AUTO_RESTART_UNHEALTHY_GATEWAY="${AUTO_RESTART_UNHEALTHY_GATEWAY:-true}"
+AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="${AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD:-true}"
+PM2_GATEWAY_APP_NAME="${PM2_GATEWAY_APP_NAME:-openclaw-gateway}"
 MAX_GATEWAY_RESTARTS_PER_DAY="${MAX_GATEWAY_RESTARTS_PER_DAY:-1}"
 MAX_GATEWAY_RESTARTS_PER_WINDOW="${MAX_GATEWAY_RESTARTS_PER_WINDOW:-3}"
 GATEWAY_RESTART_WINDOW_SECONDS="${GATEWAY_RESTART_WINDOW_SECONDS:-300}"
@@ -991,6 +993,11 @@ maybe_auto_archive_orphan_transcripts() {
   done
 
   if ((${#transcript_paths[@]} == 0)); then
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+      append_array FIXES "Doctor reported orphan transcripts, but no matching files remained after doctor repair."
+      record_remediation "orphan_transcripts" "not_needed" "no matching files remained after doctor repair"
+      return 0
+    fi
     append_array ACTIONS "Doctor reported orphan transcripts, but no matching files were found under $OPENCLAW_STATE_HOME/agents."
     record_remediation "orphan_transcripts" "preview_failed" "no matching files found under agent state"
     return 1
@@ -1054,6 +1061,86 @@ run_preflight_checks() {
   fi
 
   return "$missing"
+}
+
+
+pm2_gateway_app_exists() {
+  command_exists pm2 || return 1
+
+  local output status
+  run_capture_allow_fail output status "Inspecting PM2 for legacy OpenClaw gateway app" pm2 jlist
+  [[ "$status" -eq 0 ]] || return 1
+
+  printf '%s' "$output" | jq -e --arg name "$PM2_GATEWAY_APP_NAME" '
+    any(.[]?; .name == $name)
+  ' >/dev/null 2>&1
+}
+
+ensure_systemd_gateway_enabled() {
+  local output status
+
+  run_capture output status "Enabling systemd user gateway service" systemctl --user enable "$SYSTEMD_UNIT_NAME"
+  if [[ "$status" -ne 0 ]]; then
+    RESTART_ERROR="$output"
+    append_array ERRORS "Could not enable systemd user gateway service."
+    return 1
+  fi
+
+  run_capture output status "Starting systemd user gateway service" systemctl --user start "$SYSTEMD_UNIT_NAME"
+  if [[ "$status" -ne 0 ]]; then
+    RESTART_ERROR="$output"
+    append_array ERRORS "Could not start systemd user gateway service."
+    return 1
+  fi
+
+  return 0
+}
+
+maybe_migrate_pm2_gateway_to_systemd() {
+  [[ "$AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD" == "true" ]] || return 0
+
+  if ! pm2_gateway_app_exists; then
+    return 0
+  fi
+
+  add_incident_code "pm2_gateway_legacy"
+
+  if [[ "$RESTART_MODE" != "systemd_user" ]]; then
+    append_array ACTIONS "PM2 has an OpenClaw gateway app, but RESTART_MODE=$RESTART_MODE; set RESTART_MODE=systemd_user before automatic PM2 migration."
+    record_remediation "pm2_gateway_legacy" "blocked_by_policy" "restart mode is not systemd_user"
+    return 1
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would remove PM2 app '$PM2_GATEWAY_APP_NAME' and ensure systemd user gateway service is enabled/running."
+    record_remediation "pm2_gateway_legacy" "would_apply" "would delete exact PM2 app $PM2_GATEWAY_APP_NAME and start $SYSTEMD_UNIT_NAME"
+    return 0
+  fi
+
+  local output status
+  run_capture output status "Removing legacy PM2 gateway app" pm2 delete "$PM2_GATEWAY_APP_NAME"
+  if [[ "$status" -ne 0 ]]; then
+    RESTART_ERROR="$output"
+    append_array ERRORS "Failed to remove legacy PM2 gateway app '$PM2_GATEWAY_APP_NAME'."
+    record_remediation "pm2_gateway_legacy" "apply_failed" "pm2 delete failed for exact app $PM2_GATEWAY_APP_NAME"
+    return 1
+  fi
+
+  if pm2 save >/dev/null 2>&1; then
+    append_array FIXES "PM2 process list saved after removing legacy OpenClaw gateway app."
+  else
+    append_array ACTIONS "Legacy PM2 gateway app was removed, but 'pm2 save' failed; verify PM2 startup state manually if PM2 is used for other apps."
+  fi
+
+  if ! ensure_systemd_gateway_enabled; then
+    record_remediation "pm2_gateway_legacy" "apply_failed" "systemd user gateway service could not be enabled or started"
+    return 1
+  fi
+
+  REMEDIATION_APPLIED=1
+  append_array FIXES "Removed legacy PM2 OpenClaw gateway app and ensured systemd user gateway service is enabled/running."
+  record_remediation "pm2_gateway_legacy" "applied" "deleted exact PM2 app $PM2_GATEWAY_APP_NAME and started $SYSTEMD_UNIT_NAME"
+  return 0
 }
 
 run_update_status() {
@@ -1636,6 +1723,7 @@ main() {
   fi
 
   maybe_restore_broken_config || true
+  maybe_migrate_pm2_gateway_to_systemd || true
 
   run_update_status || true
 
