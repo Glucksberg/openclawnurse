@@ -29,6 +29,9 @@ O `openclawnurse` e um job agendado de manutencao do OpenClaw. Ele:
 - tenta corrigir problemas operacionais simples
 - reinicia o gateway quando necessario
 - confirma o health depois da manutencao
+- verifica drift entre CLI, servico systemd e instalacoes antigas
+- confere comandos nativos essenciais do bot Telegram
+- procura sintomas recentes no journal do gateway
 - grava estado em JSON e logs locais
 - envia relatorio para o Telegram do proprio host, se configurado
 
@@ -74,8 +77,10 @@ Exemplo minimo:
 
 ```bash
 TELEGRAM_TARGET="-100xxxxxxxxxx"
+TELEGRAM_BOT_TOKEN="123456:ABCDEF..."
 REPORT_CHANNEL="telegram"
 AUTO_DETECT_TELEGRAM_TARGET="true"
+REPORT_INSTANCE_LABEL="host-sp-openclaw-01"
 AUTO_UPDATE="true"
 UPDATE_CHANNEL="stable"
 TIMEZONE="America/Sao_Paulo"
@@ -99,6 +104,12 @@ CONFIG_BACKUP_RETENTION="20"
 AUTO_RESTORE_BROKEN_CONFIG="true"
 AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="true"
 PM2_GATEWAY_APP_NAMES="openclaw-gateway openclaw"
+ENABLE_RUNTIME_SANITY="true"
+ENABLE_TELEGRAM_SANITY="true"
+ENABLE_GATEWAY_LOG_SCAN="true"
+EXPECTED_OPENCLAW_MODEL=""
+EXPECTED_TELEGRAM_COMMANDS="new reset"
+GATEWAY_LOG_SINCE="last-run"
 RESTART_MODE="systemd_user"
 SYSTEMD_UNIT_NAME="openclaw-gateway.service"
 RESTART_COMMAND=""
@@ -113,8 +124,23 @@ LOG_RETENTION_MB="200"
 Notas:
 
 - troque `TELEGRAM_TARGET` pelo grupo daquela VPS
+- use `REPORT_INSTANCE_LABEL` para identificar o host no relatorio
 - mantenha o Gateway OpenClaw em `systemd --user`; se existir um app legado `openclaw-gateway` no PM2, o Nurse remove apenas esse app e garante o systemd ativo
 - se nao usa Linuxbrew, remova `EXTRA_PATH`
+
+Remediacao automatica atual:
+
+- limpeza de sessoes com transcripts ausentes
+- arquivamento conservador de transcripts orfaos
+- backup/restauracao de config JSON invalida quando ha backup valido
+- restart limitado do gateway quando o health fica ruim
+
+Sanidade operacional:
+
+- `ENABLE_RUNTIME_SANITY` detecta binarios `openclaw` divergentes, aliases de shell, schema conhecido de config e mismatch entre CLI e `openclaw-gateway.service`
+- `ENABLE_TELEGRAM_SANITY` chama `getMyCommands` no bot configurado do OpenClaw e confirma comandos como `new` e `reset`
+- `ENABLE_GATEWAY_LOG_SCAN` varre o journal desde a ultima execucao e marca sintomas como sessao travada, config invalida, warning de provenance de update e erro de provider com input vazio
+- `EXPECTED_OPENCLAW_MODEL` pode ser preenchido para exigir um modelo especifico; vazio tenta detectar pelo `~/.openclaw/openclaw.json`
 
 ## Validacao minima por VPS
 
@@ -133,7 +159,98 @@ systemctl --user status openclawnurse.timer --no-pager
 jq . ~/.local/state/openclawnurse/doctor-state.json
 ```
 
-## Comandos uteis
+## Leitura rapida de status
+
+- `OK`: rodou bem sem update necessario
+- `UPDATED`: update aplicado com sucesso
+- `UPDATED_WITH_REPAIRS`: update aplicado e doctor fez correcoes
+- `DEGRADED`: o OpenClaw segue de pe, mas o doctor encontrou algo relevante
+- `FAILED`: houve falha operacional local
+- `FAILED_NOTIFICATION_PENDING`: a rodada terminou, mas a entrega remota ficou pendente
+
+## Problemas comuns
+
+### `TELEGRAM_TARGET` vazio
+
+Sintoma:
+
+- a notificacao nao sai
+
+Correcao:
+
+- preencher `TELEGRAM_TARGET` manualmente no arquivo `.env`
+
+### `TELEGRAM_BOT_TOKEN` vazio
+
+Sintoma:
+
+- a notificacao nao sai
+
+Correcao:
+
+- preencher `TELEGRAM_BOT_TOKEN` manualmente no arquivo `.env`
+
+### `systemd --user` nao funciona
+
+Sintoma:
+
+- `./install.sh` cai para `cron` ou falha ao habilitar o timer
+
+Correcao:
+
+- usar `./install.sh --scheduler cron`
+
+### `DEGRADED` no dry-run
+
+Sintoma:
+
+- o script roda, mas o `doctor` encontra pendencias reais do host
+
+Correcao:
+
+- ler `doctor-state.json`
+- revisar `outputs.doctor`
+- decidir se essas pendencias devem ser corrigidas automaticamente ou nao
+
+### Sessoes com transcripts ausentes
+
+Sintoma:
+
+- `doctor` reporta `missing transcripts`
+
+Comportamento atual:
+
+- se `AUTO_REMEDIATE_MISSING_TRANSCRIPTS=true`, o OpenClawNurse tenta limpar automaticamente essas entradas em execucao real
+- em `--dry-run`, ele apenas reporta quantas entradas seriam removidas
+
+### CLI e gateway em versoes diferentes
+
+Sintoma:
+
+- report com `OpenClaw binary version drift` ou `Gateway ExecStart uses OpenClaw package`
+
+Correcao:
+
+- remover aliases antigos de shell
+- reinstalar/recarregar o gateway a partir da instalacao atual do OpenClaw
+- conferir `command -v -a openclaw` e `systemctl --user cat openclaw-gateway.service`
+
+### `/new` ou `/reset` quebrando no Telegram
+
+Sintoma:
+
+- report com `provider empty-input error`
+- ou `Telegram native command menu is missing required commands`
+
+Correcao:
+
+- reiniciar o gateway
+- confirmar que `channels.telegram.commands.native` esta ativo
+- se o erro for do runtime gerando input vazio, corrigir no OpenClaw upstream; o OpenClawNurse reporta o sintoma, mas nao aplica patch em `node_modules`
+
+## Atualizacao do proprio OpenClawNurse
+
+Quando o repositório for atualizado:
 
 ```bash
 ./install.sh

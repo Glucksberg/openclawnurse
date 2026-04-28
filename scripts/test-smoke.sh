@@ -76,6 +76,9 @@ smoke_doctor_without_complete_config() {
 
   HOME="$tmp/home" \
     OPENCLAW_BIN="$tmp/bin/openclaw" \
+    ENABLE_RUNTIME_SANITY="false" \
+    ENABLE_TELEGRAM_SANITY="false" \
+    ENABLE_GATEWAY_LOG_SCAN="false" \
     "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/missing.env" --no-notify --dry-run >/dev/null
 
   [[ -f "$tmp/home/.local/state/openclawnurse/doctor-state.json" ]] || fail "doctor did not write default state"
@@ -95,8 +98,13 @@ smoke_pending_report_after_notification_failure() {
 EXTRA_PATH="$tmp/bin"
 STATE_DIR="$tmp/state"
 TELEGRAM_TARGET="chat"
+TELEGRAM_BOT_TOKEN="fake-token"
+TELEGRAM_API_BASE_URL="http://127.0.0.1:9"
 REPORT_CHANNEL="telegram"
 CONFIG_BACKUP_ENABLED="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
 EOF
 
   HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" >/dev/null

@@ -58,6 +58,22 @@ Depois:
 - em execucao real, pode aplicar `sessions cleanup --enforce --fix-missing`
 - apos remediar, ele reroda o `doctor` para reclassificar o estado
 
+### 6. Falta de visibilidade sobre drift operacional
+
+Antes:
+
+- CLI, servico `openclaw-gateway.service` e instalacoes antigas podiam divergir sem alerta claro
+- erros reais do Telegram/model provider ficavam enterrados no journal
+
+Depois:
+
+- o runtime registra um bloco `sanity` no JSON de estado
+- detecta binarios `openclaw` com versoes diferentes
+- compara versao do CLI com `Description` e `ExecStart` do gateway
+- valida contratos conhecidos de config, como `channels.telegram.streaming`
+- confere comandos nativos esperados no bot Telegram via `getMyCommands`
+- varre o journal desde a ultima execucao para sessoes travadas, config invalida, warnings de provenance de update e erros de provider com input vazio
+
 ## Riscos ainda existentes
 
 ### 1. Parsing do `doctor` ainda e heuristico
@@ -75,6 +91,10 @@ O projeto foi preparado para host Linux com `systemd --user` ou `cron`. Nao foi 
 ### 4. Remediacao automatica continua conservadora
 
 Isso e intencional. O runtime ainda nao executa limpezas agressivas de sessoes ou estado interno do OpenClaw sem uma rodada adicional de implementacao.
+
+### 5. Hotfixes em runtime do OpenClaw nao sao aplicados automaticamente
+
+O OpenClawNurse agora detecta sintomas como provider recebendo input vazio, mas nao patcha `node_modules`. Esse tipo de correcao deve ir para o OpenClaw upstream para nao criar uma manutencao fragil por versao.
 
 ## Conclusao
 

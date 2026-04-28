@@ -6,6 +6,7 @@ OpenClawNurse e um utilitario portavel para manter instancias do OpenClaw saudav
 - diagnostico e reparo nao interativo
 - reinicio controlado do gateway
 - health check apos manutencao
+- checks de sanidade para instalacao duplicada, config, Telegram e logs do gateway
 - relatorio local e via Telegram
 - instalacao repetivel em multiplas maquinas
 
@@ -26,6 +27,14 @@ Multi-host e fleet continuam no repo, mas foram movidos para `docs/future-planni
 3. Ajuste `~/.config/openclawnurse/openclawnurse.env` se quiser alterar target, horario ou comportamento.
 4. Rode um `--self-test`.
 5. Rode um `--dry-run`.
+
+Para usar o mesmo bot/token de Telegram em varias maquinas, com um `openclawnurse` por host, configure no `.env`:
+
+- `TELEGRAM_BOT_TOKEN` com o bot dedicado de alertas
+- `TELEGRAM_TARGET` com o chat/grupo central de alertas
+- `REPORT_INSTANCE_LABEL` com um nome claro do host
+
+O envio de alertas do `openclawnurse` e direto na API do Telegram. Ele nao depende do bot nem da configuracao de canais do OpenClaw.
 
 Por padrao, o instalador:
 

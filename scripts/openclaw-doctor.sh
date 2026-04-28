@@ -123,7 +123,9 @@ OPENCLAW_PROFILE="${OPENCLAW_PROFILE:-}"
 OPENCLAW_STATE_HOME="${OPENCLAW_STATE_HOME:-$HOME/.openclaw}"
 REPORT_CHANNEL="${REPORT_CHANNEL:-telegram}"
 TELEGRAM_TARGET="${TELEGRAM_TARGET:-}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 AUTO_DETECT_TELEGRAM_TARGET="${AUTO_DETECT_TELEGRAM_TARGET:-true}"
+TELEGRAM_API_BASE_URL="${TELEGRAM_API_BASE_URL:-https://api.telegram.org}"
 AUTO_UPDATE="${AUTO_UPDATE:-true}"
 UPDATE_CHANNEL="${UPDATE_CHANNEL:-stable}"
 UPDATE_TAG="${UPDATE_TAG:-}"
@@ -152,6 +154,16 @@ CONFIG_BACKUP_RETENTION="${CONFIG_BACKUP_RETENTION:-20}"
 AUTO_RESTORE_BROKEN_CONFIG="${AUTO_RESTORE_BROKEN_CONFIG:-true}"
 CONFIG_DIFF_MAX_CHARS="${CONFIG_DIFF_MAX_CHARS:-1200}"
 DIAGNOSTIC_LOG_LINES="${DIAGNOSTIC_LOG_LINES:-20}"
+ENABLE_RUNTIME_SANITY="${ENABLE_RUNTIME_SANITY:-true}"
+ENABLE_TELEGRAM_SANITY="${ENABLE_TELEGRAM_SANITY:-true}"
+ENABLE_GATEWAY_LOG_SCAN="${ENABLE_GATEWAY_LOG_SCAN:-true}"
+EXPECTED_OPENCLAW_MODEL="${EXPECTED_OPENCLAW_MODEL:-}"
+EXPECTED_TELEGRAM_COMMANDS="${EXPECTED_TELEGRAM_COMMANDS:-new reset}"
+GATEWAY_LOG_SINCE="${GATEWAY_LOG_SINCE:-last-run}"
+GATEWAY_LOG_FALLBACK_SINCE="${GATEWAY_LOG_FALLBACK_SINCE:-24 hours ago}"
+GATEWAY_LOG_MAX_LINES="${GATEWAY_LOG_MAX_LINES:-4000}"
+OPENCLAW_EXTRA_SCAN_PATHS="${OPENCLAW_EXTRA_SCAN_PATHS:-$HOME/openclaw/node_modules/.bin/openclaw $HOME/.local/share/pnpm/openclaw $HOME/.npm-global/bin/openclaw}"
+CHECK_SHELL_ALIASES="${CHECK_SHELL_ALIASES:-true}"
 RESTART_MODE="${RESTART_MODE:-systemd_user}"
 SYSTEMD_UNIT_NAME="${SYSTEMD_UNIT_NAME:-openclaw-gateway.service}"
 RESTART_COMMAND="${RESTART_COMMAND:-}"
@@ -193,6 +205,7 @@ RUN_ID="$(TZ="$TIMEZONE" date '+%Y%m%d-%H%M%S')"
 RUN_DATE="$(TZ="$TIMEZONE" date '+%Y-%m-%d %H:%M:%S %Z')"
 RUN_ISO="$(TZ="$TIMEZONE" date --iso-8601=seconds)"
 HOST_NAME="$(hostname)"
+REPORT_INSTANCE_LABEL="${REPORT_INSTANCE_LABEL:-$HOST_NAME}"
 RUN_LOG_FILE="$LOG_DIR/doctor-$RUN_ID.log"
 RUN_JSON_FILE="$LOG_DIR/doctor-$RUN_ID.json"
 
@@ -224,6 +237,29 @@ remove_array_value() {
     fi
   done
   ref=("${filtered[@]}")
+}
+
+append_unique_array() {
+  local name="$1"
+  shift
+  local value="$*"
+  local -n ref="$name"
+  local item
+  for item in "${ref[@]:-}"; do
+    [[ "$item" == "$value" ]] && return 0
+  done
+  ref+=("$value")
+}
+
+append_sanity_finding() {
+  SANITY_DEGRADED=1
+  append_array SANITY_FINDINGS "$*"
+}
+
+append_sanity_critical() {
+  SANITY_DEGRADED=1
+  SANITY_CRITICAL=1
+  append_array SANITY_FINDINGS "$*"
 }
 
 command_exists() {
@@ -338,6 +374,55 @@ detect_telegram_target() {
   fi
 }
 
+send_telegram_message() {
+  local message_text="$1"
+  local dry_run="${2:-false}"
+
+  if [[ -z "$TELEGRAM_BOT_TOKEN" ]]; then
+    printf '{"ok":false,"error":"missing TELEGRAM_BOT_TOKEN"}\n'
+    return 1
+  fi
+
+  if [[ -z "$TELEGRAM_TARGET" ]]; then
+    printf '{"ok":false,"error":"missing TELEGRAM_TARGET"}\n'
+    return 1
+  fi
+
+  if [[ "$dry_run" == "true" ]]; then
+    jq -n \
+      --arg channel "telegram" \
+      --arg target "$TELEGRAM_TARGET" \
+      --arg text "$message_text" \
+      '{ok:true,dryRun:true,channel:$channel,target:$target,messageLength:($text|length)}'
+    return 0
+  fi
+
+  local response
+  local http_code
+  response="$(
+    curl -sS \
+      -X POST \
+      --connect-timeout 10 \
+      --max-time 30 \
+      -o /tmp/openclawnurse-telegram-response.$$ \
+      -w '%{http_code}' \
+      --data-urlencode "chat_id=$TELEGRAM_TARGET" \
+      --data-urlencode "text=$message_text" \
+      --data-urlencode "disable_web_page_preview=true" \
+      --data-urlencode "parse_mode=" \
+      "$TELEGRAM_API_BASE_URL/bot$TELEGRAM_BOT_TOKEN/sendMessage"
+  )"
+  http_code="$response"
+
+  if [[ -f /tmp/openclawnurse-telegram-response.$$ ]]; then
+    cat /tmp/openclawnurse-telegram-response.$$
+    rm -f /tmp/openclawnurse-telegram-response.$$
+  fi
+
+  [[ "$http_code" =~ ^2 ]] || return 1
+  return 0
+}
+
 rotate_logs() {
   if [[ -d "$LOG_DIR" ]]; then
     find "$LOG_DIR" -type f -mtime "+$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
@@ -392,14 +477,31 @@ FIXES=()
 ACTIONS=()
 INCIDENT_CODES=()
 REMEDIATIONS=()
+SANITY_FINDINGS=()
 PREVIOUS_PENDING_PRESENT=0
+PREVIOUS_STATE_TIMESTAMP=""
 REMEDIATION_APPLIED=0
 GATEWAY_RESTARTS_TODAY=0
 GATEWAY_RESTARTS_IN_WINDOW=0
+SANITY_ATTEMPTED=0
+SANITY_DEGRADED=0
+SANITY_CRITICAL=0
+OPENCLAW_INSTALLATIONS_SUMMARY=""
+GATEWAY_EXECSTART=""
+GATEWAY_SERVICE_VERSION=""
+GATEWAY_PACKAGE_VERSION=""
+GATEWAY_MODEL_DETECTED=""
+TELEGRAM_COMMANDS_SUMMARY=""
+GATEWAY_LOG_SUMMARY=""
+PROVIDER_EMPTY_INPUT_COUNT=0
+STUCK_SESSION_COUNT=0
+CONFIG_INVALID_COUNT=0
+UPDATE_PROVENANCE_WARNING_COUNT=0
 
 load_previous_state() {
   if [[ -f "$STATE_FILE" ]] && jq empty "$STATE_FILE" >/dev/null 2>&1; then
     CONSECUTIVE_FAILURES="$(jq -r '.consecutiveFailures // 0' "$STATE_FILE" 2>/dev/null)"
+    PREVIOUS_STATE_TIMESTAMP="$(jq -r '.timestamp // empty' "$STATE_FILE" 2>/dev/null)"
   fi
   load_gateway_restart_state
   [[ -f "$PENDING_TEXT_FILE" || -f "$PENDING_JSON_FILE" ]] && PREVIOUS_PENDING_PRESENT=1 || PREVIOUS_PENDING_PRESENT=0
@@ -521,6 +623,14 @@ persist_json() {
     --arg healthError "$HEALTH_ERROR" \
     --arg configHealth "$CONFIG_HEALTH" \
     --arg configRestoreDiff "$CONFIG_RESTORE_DIFF" \
+    --arg openclawInstallations "$OPENCLAW_INSTALLATIONS_SUMMARY" \
+    --arg gatewayExecStart "$GATEWAY_EXECSTART" \
+    --arg gatewayServiceVersion "$GATEWAY_SERVICE_VERSION" \
+    --arg gatewayPackageVersion "$GATEWAY_PACKAGE_VERSION" \
+    --arg gatewayModelDetected "$GATEWAY_MODEL_DETECTED" \
+    --arg expectedOpenclawModel "$EXPECTED_OPENCLAW_MODEL" \
+    --arg telegramCommands "$TELEGRAM_COMMANDS_SUMMARY" \
+    --arg gatewayLogSummary "$GATEWAY_LOG_SUMMARY" \
     --arg reportText "$report_text" \
     --argjson dryRun "$(json_bool "$DRY_RUN")" \
     --argjson updateAttempted "$(json_bool "$UPDATE_ATTEMPTED")" \
@@ -545,6 +655,14 @@ persist_json() {
     --argjson configRestored "$(json_bool "$CONFIG_RESTORED")" \
     --argjson configBackupCreated "$(json_bool "$CONFIG_BACKUP_CREATED")" \
     --argjson diagnostics "$diagnostics_json" \
+    --argjson sanityAttempted "$(json_bool "$SANITY_ATTEMPTED")" \
+    --argjson sanityDegraded "$(json_bool "$SANITY_DEGRADED")" \
+    --argjson sanityCritical "$(json_bool "$SANITY_CRITICAL")" \
+    --argjson providerEmptyInputCount "$PROVIDER_EMPTY_INPUT_COUNT" \
+    --argjson stuckSessionCount "$STUCK_SESSION_COUNT" \
+    --argjson configInvalidCount "$CONFIG_INVALID_COUNT" \
+    --argjson updateProvenanceWarningCount "$UPDATE_PROVENANCE_WARNING_COUNT" \
+    --argjson sanityFindings "$(printf '%s\n' "${SANITY_FINDINGS[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
     '{
       timestamp: $timestamp,
       hostname: $hostname,
@@ -581,6 +699,24 @@ persist_json() {
         restoreDiff: $configRestoreDiff
       },
       diagnostics: $diagnostics,
+      sanity: {
+        attempted: $sanityAttempted,
+        degraded: $sanityDegraded,
+        critical: $sanityCritical,
+        findings: $sanityFindings,
+        openclawInstallations: $openclawInstallations,
+        gatewayExecStart: $gatewayExecStart,
+        gatewayServiceVersion: $gatewayServiceVersion,
+        gatewayPackageVersion: $gatewayPackageVersion,
+        expectedOpenclawModel: $expectedOpenclawModel,
+        gatewayModelDetected: $gatewayModelDetected,
+        telegramCommands: $telegramCommands,
+        gatewayLogSummary: $gatewayLogSummary,
+        providerEmptyInputCount: $providerEmptyInputCount,
+        stuckSessionCount: $stuckSessionCount,
+        configInvalidCount: $configInvalidCount,
+        updateProvenanceWarningCount: $updateProvenanceWarningCount
+      },
       outputs: {
         update: $updateOutput,
         doctor: $doctorOutput,
@@ -620,11 +756,8 @@ retry_pending_report() {
   pending_text="$(trim_report "$pending_text")"
 
   local send_output send_status
-  local cmd
-  build_openclaw_cmd cmd
-  cmd+=(message send --channel "$REPORT_CHANNEL" --target "$TELEGRAM_TARGET" --message "$pending_text" --json)
   run_capture send_output send_status "Retrying pending notification" \
-    "${cmd[@]}"
+    send_telegram_message "$pending_text" false
 
   if [[ "$send_status" -eq 0 ]]; then
     log INFO "Pending notification delivered"
@@ -777,6 +910,250 @@ maybe_restore_broken_config() {
   return 0
 }
 
+extract_openclaw_version() {
+  sed -nE 's/.*([0-9]{4}\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1
+}
+
+resolve_expected_model_from_config() {
+  [[ -n "$EXPECTED_OPENCLAW_MODEL" ]] && return 0
+  local cfg_file="$OPENCLAW_STATE_HOME/openclaw.json"
+  [[ -f "$cfg_file" ]] || return 0
+  EXPECTED_OPENCLAW_MODEL="$(jq -r '.agents.defaults.model.primary // .models.default // .model // empty' "$cfg_file" 2>/dev/null)"
+}
+
+validate_openclaw_config_contracts() {
+  local cfg_file="$OPENCLAW_STATE_HOME/openclaw.json"
+  [[ -f "$cfg_file" ]] || return 0
+
+  if ! jq empty "$cfg_file" >/dev/null 2>&1; then
+    append_sanity_critical "OpenClaw config is not valid JSON: $cfg_file"
+    append_array ERRORS "OpenClaw config is not valid JSON."
+    return 1
+  fi
+
+  local streaming_value
+  streaming_value="$(jq -r '
+    if (.channels.telegram.streaming? | type) == "object" then
+      .channels.telegram.streaming.mode // empty
+    else
+      .channels.telegram.streaming // empty
+    end
+  ' "$cfg_file" 2>/dev/null)"
+
+  case "$streaming_value" in
+    ""|true|false|off|partial|block|progress) ;;
+    *)
+      append_sanity_critical "Invalid OpenClaw config: channels.telegram.streaming=$streaming_value"
+      append_array ERRORS "Invalid OpenClaw config value for channels.telegram.streaming."
+      ;;
+  esac
+
+  local native_value
+  native_value="$(jq -r '.channels.telegram.commands.native // empty' "$cfg_file" 2>/dev/null)"
+  case "$native_value" in
+    ""|true|false|auto) ;;
+    *)
+      append_sanity_critical "Invalid OpenClaw config: channels.telegram.commands.native=$native_value"
+      append_array ERRORS "Invalid OpenClaw config value for channels.telegram.commands.native."
+      ;;
+  esac
+}
+
+scan_shell_openclaw_aliases() {
+  [[ "$CHECK_SHELL_ALIASES" == "true" ]] || return 0
+  local rc_file
+  local hits=""
+  for rc_file in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc"; do
+    [[ -f "$rc_file" ]] || continue
+    local rc_hits
+    rc_hits="$(grep -HnE 'alias[[:space:]]+openclaw=|(^|[[:space:]])openclaw[[:space:]]*\(\)|function[[:space:]]+openclaw' "$rc_file" 2>/dev/null || true)"
+    [[ -n "$rc_hits" ]] && hits="${hits}${hits:+$'\n'}${rc_hits}"
+  done
+
+  if [[ -n "$hits" ]]; then
+    append_sanity_finding "Shell startup files define openclaw aliases/functions; verify they do not shadow the installed CLI."
+    append_array ACTIONS "Inspect shell openclaw aliases/functions if CLI and gateway versions diverge."
+  fi
+}
+
+run_runtime_sanity() {
+  [[ "$ENABLE_RUNTIME_SANITY" == "true" ]] || return 0
+  SANITY_ATTEMPTED=1
+  resolve_expected_model_from_config
+  validate_openclaw_config_contracts || true
+  scan_shell_openclaw_aliases || true
+
+  local current_version
+  current_version="$CURRENT_VERSION_BEFORE"
+  if [[ -z "$current_version" ]]; then
+    current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+  fi
+
+  local paths=()
+  local candidate
+  if [[ "$OPENCLAW_BIN" == */* ]]; then
+    [[ -x "$OPENCLAW_BIN" ]] && append_unique_array paths "$OPENCLAW_BIN"
+  else
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] && append_unique_array paths "$candidate"
+    done < <(type -a -P "$OPENCLAW_BIN" 2>/dev/null || true)
+  fi
+
+  for candidate in $OPENCLAW_EXTRA_SCAN_PATHS; do
+    [[ -x "$candidate" ]] && append_unique_array paths "$candidate"
+  done
+
+  local install_lines=()
+  local versions=()
+  local path version_line version
+  for path in "${paths[@]:-}"; do
+    version_line="$(timeout 5s "$path" --version 2>/dev/null | head -n 1 || true)"
+    version="$(printf '%s' "$version_line" | extract_openclaw_version)"
+    [[ -n "$version" ]] && append_unique_array versions "$version"
+    install_lines+=("$path -> ${version_line:-unknown}")
+    if [[ -n "$current_version" && -n "$version" && "$version" != "$current_version" ]]; then
+      append_sanity_finding "OpenClaw binary version drift: $path reports $version while active CLI reports $current_version."
+      append_array ACTIONS "Remove or update stale OpenClaw installations that can shadow the current CLI."
+    fi
+  done
+  OPENCLAW_INSTALLATIONS_SUMMARY="$(printf '%s\n' "${install_lines[@]:-}" | sed '/^$/d')"
+
+  if ((${#versions[@]} > 1)); then
+    append_sanity_finding "Multiple OpenClaw versions are installed: ${versions[*]}."
+    append_array ACTIONS "Converge OpenClaw binaries to a single version in PATH and service definitions."
+  fi
+
+  if [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] && command_exists systemctl; then
+    local unit_text
+    unit_text="$(systemctl --user cat "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
+    GATEWAY_EXECSTART="$(printf '%s\n' "$unit_text" | sed -n 's/^ExecStart=//p' | head -n 1)"
+    GATEWAY_SERVICE_VERSION="$(printf '%s\n' "$unit_text" | sed -nE 's/^Description=.*\(v([^)]*)\).*/\1/p' | head -n 1)"
+    GATEWAY_PACKAGE_VERSION="$(printf '%s\n' "$GATEWAY_EXECSTART" | sed -nE 's/.*openclaw@([0-9]{4}\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1)"
+
+    if [[ -n "$current_version" && -n "$GATEWAY_SERVICE_VERSION" && "$GATEWAY_SERVICE_VERSION" != "$current_version" ]]; then
+      append_sanity_finding "Gateway service description version is $GATEWAY_SERVICE_VERSION, but CLI reports $current_version."
+      append_array ACTIONS "Reinstall or refresh the gateway service so it points to the current OpenClaw runtime."
+    fi
+
+    if [[ -n "$current_version" && -n "$GATEWAY_PACKAGE_VERSION" && "$GATEWAY_PACKAGE_VERSION" != "$current_version" ]]; then
+      append_sanity_finding "Gateway ExecStart uses OpenClaw package $GATEWAY_PACKAGE_VERSION, but CLI reports $current_version."
+      append_array ACTIONS "Restart/reinstall the OpenClaw gateway from the active OpenClaw installation."
+    fi
+  fi
+}
+
+run_telegram_sanity() {
+  [[ "$ENABLE_TELEGRAM_SANITY" == "true" ]] || return 0
+  SANITY_ATTEMPTED=1
+
+  local cfg_file="$OPENCLAW_STATE_HOME/openclaw.json"
+  [[ -f "$cfg_file" ]] || return 0
+  [[ "$(jq -r '.channels.telegram.enabled // false' "$cfg_file" 2>/dev/null)" == "true" ]] || return 0
+
+  if ! command_exists curl; then
+    append_sanity_finding "Telegram sanity check skipped because curl is missing."
+    return 0
+  fi
+
+  local token
+  token="$(jq -r '.channels.telegram.botToken // empty' "$cfg_file" 2>/dev/null)"
+  if [[ -z "$token" ]]; then
+    append_sanity_finding "Telegram channel is enabled, but channels.telegram.botToken is empty."
+    append_array ACTIONS "Configure the OpenClaw Telegram bot token or disable the Telegram channel."
+    return 0
+  fi
+
+  local response status
+  response="$(curl -sS --connect-timeout 10 --max-time 30 -X POST -H 'content-type: application/json' -d '{}' "$TELEGRAM_API_BASE_URL/bot$token/getMyCommands" 2>&1)"
+  status=$?
+  if [[ "$status" -ne 0 ]] || ! printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+    TELEGRAM_COMMANDS_SUMMARY="getMyCommands failed"
+    append_sanity_finding "Telegram getMyCommands failed for the configured OpenClaw bot."
+    append_array ACTIONS "Check Telegram network connectivity and the OpenClaw bot token."
+    return 0
+  fi
+
+  local commands
+  commands="$(printf '%s' "$response" | jq -r '.result[]?.command' | sort)"
+  local count
+  count="$(printf '%s\n' "$commands" | sed '/^$/d' | wc -l | tr -d ' ')"
+  TELEGRAM_COMMANDS_SUMMARY="count=$count"
+
+  local missing=()
+  local required
+  for required in $EXPECTED_TELEGRAM_COMMANDS; do
+    if ! printf '%s\n' "$commands" | grep -qx "$required"; then
+      missing+=("$required")
+    fi
+  done
+
+  if ((${#missing[@]} > 0)); then
+    TELEGRAM_COMMANDS_SUMMARY="$TELEGRAM_COMMANDS_SUMMARY; missing=${missing[*]}"
+    append_sanity_finding "Telegram native command menu is missing required commands: ${missing[*]}."
+    append_array ACTIONS "Restart the gateway or re-enable native Telegram commands so required slash commands are registered."
+  else
+    TELEGRAM_COMMANDS_SUMMARY="$TELEGRAM_COMMANDS_SUMMARY; required-present=$EXPECTED_TELEGRAM_COMMANDS"
+  fi
+}
+
+run_gateway_log_scan() {
+  [[ "$ENABLE_GATEWAY_LOG_SCAN" == "true" ]] || return 0
+  SANITY_ATTEMPTED=1
+
+  if ! command_exists journalctl; then
+    append_sanity_finding "Gateway log scan skipped because journalctl is missing."
+    return 0
+  fi
+
+  local since="$GATEWAY_LOG_SINCE"
+  if [[ "$since" == "last-run" ]]; then
+    since="${PREVIOUS_STATE_TIMESTAMP:-$GATEWAY_LOG_FALLBACK_SINCE}"
+    [[ -n "$since" ]] || since="$GATEWAY_LOG_FALLBACK_SINCE"
+  fi
+
+  local logs status
+  logs="$(journalctl --user -u "$SYSTEMD_UNIT_NAME" --since "$since" -n "$GATEWAY_LOG_MAX_LINES" --no-pager 2>&1)"
+  status=$?
+  if [[ "$status" -ne 0 ]]; then
+    GATEWAY_LOG_SUMMARY="journalctl failed"
+    append_sanity_finding "Unable to scan gateway logs for recent runtime symptoms."
+    return 0
+  fi
+
+  PROVIDER_EMPTY_INPUT_COUNT="$(printf '%s\n' "$logs" | grep -F 'One of "input" or "previous_response_id"' | wc -l | tr -d ' ')"
+  STUCK_SESSION_COUNT="$(printf '%s\n' "$logs" | grep -F '[diagnostic] stuck session' | wc -l | tr -d ' ')"
+  CONFIG_INVALID_COUNT="$(printf '%s\n' "$logs" | grep -Ei 'Config invalid|Invalid config' | wc -l | tr -d ' ')"
+  UPDATE_PROVENANCE_WARNING_COUNT="$(printf '%s\n' "$logs" | grep -Ei 'not-git-install|Gateway restart update skipped|unknown update provenance' | wc -l | tr -d ' ')"
+  GATEWAY_MODEL_DETECTED="$(printf '%s\n' "$logs" | grep -Eo 'agent model: [^[:space:]]+' | sed 's/^agent model: //' | tail -n 1)"
+  GATEWAY_LOG_SUMMARY="since=$since; emptyInput=$PROVIDER_EMPTY_INPUT_COUNT; stuckSessions=$STUCK_SESSION_COUNT; configInvalid=$CONFIG_INVALID_COUNT; updateProvenanceWarnings=$UPDATE_PROVENANCE_WARNING_COUNT"
+
+  if (( PROVIDER_EMPTY_INPUT_COUNT > 0 )); then
+    append_sanity_finding "Gateway logs contain $PROVIDER_EMPTY_INPUT_COUNT provider empty-input error(s) since $since."
+    append_array ACTIONS "Inspect recent ingress commands; a command may be reaching OpenClaw but producing an empty provider prompt."
+  fi
+
+  if (( STUCK_SESSION_COUNT > 0 )); then
+    append_sanity_finding "Gateway logs contain $STUCK_SESSION_COUNT stuck session diagnostic(s) since $since."
+    append_array ACTIONS "Inspect active Telegram/OpenClaw sessions if stuck session diagnostics continue."
+  fi
+
+  if (( CONFIG_INVALID_COUNT > 0 )); then
+    append_sanity_critical "Gateway logs contain $CONFIG_INVALID_COUNT invalid config error(s) since $since."
+    append_array ERRORS "Gateway logs show invalid OpenClaw config."
+  fi
+
+  if (( UPDATE_PROVENANCE_WARNING_COUNT > 0 )); then
+    append_sanity_finding "Gateway logs contain $UPDATE_PROVENANCE_WARNING_COUNT update provenance warning(s) since $since."
+    append_array ACTIONS "Review OpenClaw install provenance if updates or gateway restarts are skipped."
+  fi
+
+  resolve_expected_model_from_config
+  if [[ -n "$EXPECTED_OPENCLAW_MODEL" && -n "$GATEWAY_MODEL_DETECTED" && "$GATEWAY_MODEL_DETECTED" != "$EXPECTED_OPENCLAW_MODEL" ]]; then
+    append_sanity_finding "Gateway model is $GATEWAY_MODEL_DETECTED, expected $EXPECTED_OPENCLAW_MODEL."
+    append_array ACTIONS "Restart the gateway or update the OpenClaw default model configuration."
+  fi
+}
+
 run_self_test() {
   log INFO "Running self-test"
 
@@ -806,12 +1183,22 @@ run_self_test() {
     return 1
   fi
 
+  run_runtime_sanity || true
+  run_telegram_sanity || true
+  run_gateway_log_scan || true
+
+  if [[ "$SANITY_CRITICAL" -eq 1 ]]; then
+    printf 'SELF_TEST=FAILED\n'
+    printf 'Reason: sanity checks found critical issues\n'
+    printf 'Sanity findings:\n'
+    printf -- '- %s\n' "${SANITY_FINDINGS[@]}"
+    return 1
+  fi
+
   if [[ "$NO_NOTIFY" -eq 0 && -n "$TELEGRAM_TARGET" ]]; then
     local send_output send_status
-    local send_cmd
-    build_openclaw_cmd send_cmd
-    send_cmd+=(message send --channel "$REPORT_CHANNEL" --target "$TELEGRAM_TARGET" --message "OpenClawNurse self-test" --dry-run --json)
-    run_capture send_output send_status "Self-test notification dry-run" "${send_cmd[@]}"
+    run_capture send_output send_status "Self-test notification dry-run" \
+      send_telegram_message "OpenClawNurse self-test" true
     if [[ "$send_status" -ne 0 ]]; then
       printf 'SELF_TEST=FAILED\n'
       printf 'Reason: notification dry-run failed\n'
@@ -824,6 +1211,12 @@ run_self_test() {
   printf 'Available version: %s\n' "${AVAILABLE_VERSION:-unknown}"
   printf 'Channel: %s\n' "${CHANNEL_VALUE:-unknown}"
   printf 'Health: ok\n'
+  if ((${#SANITY_FINDINGS[@]} > 0)); then
+    printf 'Sanity findings:\n'
+    printf -- '- %s\n' "${SANITY_FINDINGS[@]}"
+  else
+    printf 'Sanity: ok\n'
+  fi
   if [[ -n "$TELEGRAM_TARGET" ]]; then
     printf 'Notification dry-run: ok (%s)\n' "$TELEGRAM_TARGET"
   else
@@ -1043,7 +1436,15 @@ run_preflight_checks() {
   local cmd
 
   if [[ "$RESTART_MODE" == "systemd_user" ]]; then
-    required+=(systemctl)
+    append_unique_array required systemctl
+  fi
+
+  if [[ "$NO_NOTIFY" -eq 0 && "$REPORT_CHANNEL" == "telegram" ]]; then
+    append_unique_array required curl
+  fi
+
+  if [[ "$ENABLE_TELEGRAM_SANITY" == "true" ]]; then
+    append_unique_array required curl
   fi
 
   for cmd in "${required[@]}"; do
@@ -1057,6 +1458,11 @@ run_preflight_checks() {
 
   if [[ "$NO_NOTIFY" -eq 0 && "$REPORT_CHANNEL" == "telegram" && -z "$TELEGRAM_TARGET" ]]; then
     append_array ERRORS "TELEGRAM_TARGET is not configured."
+    missing=1
+  fi
+
+  if [[ "$NO_NOTIFY" -eq 0 && "$REPORT_CHANNEL" == "telegram" && -z "$TELEGRAM_BOT_TOKEN" ]]; then
+    append_array ERRORS "TELEGRAM_BOT_TOKEN is not configured."
     missing=1
   fi
 
@@ -1566,6 +1972,7 @@ build_report() {
 OpenClawNurse Daily Report
 Date: $RUN_DATE
 Host: $HOST_NAME
+Instance: $REPORT_INSTANCE_LABEL
 Mode: $mode_text
 Status: $STATUS
 
@@ -1594,8 +2001,23 @@ EOF
     printf '\nConfig restore diff preview:\n%s\n' "$CONFIG_RESTORE_DIFF"
   fi
 
+  if [[ "$SANITY_ATTEMPTED" -eq 1 ]]; then
+    if [[ "$SANITY_CRITICAL" -eq 1 ]]; then
+      printf '\nSanity: critical findings\n'
+    elif [[ "$SANITY_DEGRADED" -eq 1 ]]; then
+      printf '\nSanity: findings need attention\n'
+    else
+      printf '\nSanity: ok\n'
+    fi
+  fi
+
   if [[ -n "$summary_lines" ]]; then
     printf '\nDoctor highlights:\n%s\n' "$summary_lines"
+  fi
+
+  if ((${#SANITY_FINDINGS[@]} > 0)); then
+    printf '\nSanity findings:\n'
+    printf -- '- %s\n' "${SANITY_FINDINGS[@]}"
   fi
 
   if ((${#FIXES[@]} > 0)); then
@@ -1645,12 +2067,8 @@ deliver_report() {
   local send_output send_status
   local trimmed
   trimmed="$(trim_report "$report_text")"
-  local cmd
-  build_openclaw_cmd cmd
-  cmd+=(message send --channel "$REPORT_CHANNEL" --target "$TELEGRAM_TARGET" --message "$trimmed" --json)
-
   run_capture send_output send_status "Delivering report" \
-    "${cmd[@]}"
+    send_telegram_message "$trimmed" false
 
   if [[ "$send_status" -eq 0 ]]; then
     NOTIFICATION_DELIVERED=1
@@ -1680,6 +2098,16 @@ finalize_status() {
   fi
 
   if [[ "$DOCTOR_CLASSIFICATION" == "needs_manual_attention" || "$GATEWAY_HEALTHY" -eq 0 && "$RESTART_ATTEMPTED" -eq 1 ]]; then
+    STATUS="DEGRADED"
+    return
+  fi
+
+  if [[ "$SANITY_CRITICAL" -eq 1 ]]; then
+    STATUS="FAILED"
+    return
+  fi
+
+  if [[ "$SANITY_DEGRADED" -eq 1 ]]; then
     STATUS="DEGRADED"
     return
   fi
@@ -1743,6 +2171,9 @@ main() {
   maybe_migrate_pm2_gateway_to_systemd || true
 
   run_update_status || true
+  run_runtime_sanity || true
+  run_telegram_sanity || true
+  run_gateway_log_scan || true
 
   if should_attempt_update; then
     run_update || true
