@@ -140,7 +140,7 @@ AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS="${AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS:-true}"
 AUTO_REMEDIATE_ALL_AGENTS="${AUTO_REMEDIATE_ALL_AGENTS:-false}"
 AUTO_RESTART_UNHEALTHY_GATEWAY="${AUTO_RESTART_UNHEALTHY_GATEWAY:-true}"
 AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="${AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD:-true}"
-PM2_GATEWAY_APP_NAME="${PM2_GATEWAY_APP_NAME:-openclaw-gateway}"
+PM2_GATEWAY_APP_NAMES="${PM2_GATEWAY_APP_NAMES:-${PM2_GATEWAY_APP_NAME:-openclaw-gateway openclaw}}"
 MAX_GATEWAY_RESTARTS_PER_DAY="${MAX_GATEWAY_RESTARTS_PER_DAY:-1}"
 MAX_GATEWAY_RESTARTS_PER_WINDOW="${MAX_GATEWAY_RESTARTS_PER_WINDOW:-3}"
 GATEWAY_RESTART_WINDOW_SECONDS="${GATEWAY_RESTART_WINDOW_SECONDS:-300}"
@@ -1064,16 +1064,27 @@ run_preflight_checks() {
 }
 
 
-pm2_gateway_app_exists() {
+pm2_gateway_app_names_json() {
+  printf '%s\n' $PM2_GATEWAY_APP_NAMES | jq -Rsc 'split("\n") | map(select(length > 0))'
+}
+
+pm2_gateway_apps_json() {
   command_exists pm2 || return 1
 
-  local output status
+  local output status names_json
+  names_json="$(pm2_gateway_app_names_json)"
   run_capture_allow_fail output status "Inspecting PM2 for legacy OpenClaw gateway app" pm2 jlist
   [[ "$status" -eq 0 ]] || return 1
 
-  printf '%s' "$output" | jq -e --arg name "$PM2_GATEWAY_APP_NAME" '
-    any(.[]?; .name == $name)
-  ' >/dev/null 2>&1
+  printf '%s' "$output" | jq -c --argjson names "$names_json" '
+    [.[]? | select(.name as $name | $names | index($name)) | .name] | unique
+  ' 2>/dev/null
+}
+
+pm2_gateway_app_exists() {
+  local apps_json
+  apps_json="$(pm2_gateway_apps_json 2>/dev/null || printf '[]')"
+  printf '%s' "$apps_json" | jq -e 'length > 0' >/dev/null 2>&1
 }
 
 ensure_systemd_gateway_enabled() {
@@ -1099,9 +1110,12 @@ ensure_systemd_gateway_enabled() {
 maybe_migrate_pm2_gateway_to_systemd() {
   [[ "$AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD" == "true" ]] || return 0
 
-  if ! pm2_gateway_app_exists; then
+  local pm2_apps_json pm2_apps_text pm2_app
+  pm2_apps_json="$(pm2_gateway_apps_json 2>/dev/null || printf '[]')"
+  if ! printf '%s' "$pm2_apps_json" | jq -e 'length > 0' >/dev/null 2>&1; then
     return 0
   fi
+  pm2_apps_text="$(printf '%s' "$pm2_apps_json" | jq -r 'join(", ")')"
 
   add_incident_code "pm2_gateway_legacy"
 
@@ -1112,19 +1126,22 @@ maybe_migrate_pm2_gateway_to_systemd() {
   fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    append_array FIXES "Dry-run: would remove PM2 app '$PM2_GATEWAY_APP_NAME' and ensure systemd user gateway service is enabled/running."
-    record_remediation "pm2_gateway_legacy" "would_apply" "would delete exact PM2 app $PM2_GATEWAY_APP_NAME and start $SYSTEMD_UNIT_NAME"
+    append_array FIXES "Dry-run: would remove PM2 gateway app(s) '$pm2_apps_text' and ensure systemd user gateway service is enabled/running."
+    record_remediation "pm2_gateway_legacy" "would_apply" "would delete exact PM2 app(s) $pm2_apps_text and start $SYSTEMD_UNIT_NAME"
     return 0
   fi
 
   local output status
-  run_capture output status "Removing legacy PM2 gateway app" pm2 delete "$PM2_GATEWAY_APP_NAME"
-  if [[ "$status" -ne 0 ]]; then
-    RESTART_ERROR="$output"
-    append_array ERRORS "Failed to remove legacy PM2 gateway app '$PM2_GATEWAY_APP_NAME'."
-    record_remediation "pm2_gateway_legacy" "apply_failed" "pm2 delete failed for exact app $PM2_GATEWAY_APP_NAME"
-    return 1
-  fi
+  while IFS= read -r pm2_app; do
+    [[ -n "$pm2_app" ]] || continue
+    run_capture output status "Removing legacy PM2 gateway app '$pm2_app'" pm2 delete "$pm2_app"
+    if [[ "$status" -ne 0 ]]; then
+      RESTART_ERROR="$output"
+      append_array ERRORS "Failed to remove legacy PM2 gateway app '$pm2_app'."
+      record_remediation "pm2_gateway_legacy" "apply_failed" "pm2 delete failed for exact app $pm2_app"
+      return 1
+    fi
+  done < <(printf '%s' "$pm2_apps_json" | jq -r '.[]')
 
   if pm2 save >/dev/null 2>&1; then
     append_array FIXES "PM2 process list saved after removing legacy OpenClaw gateway app."
@@ -1138,8 +1155,8 @@ maybe_migrate_pm2_gateway_to_systemd() {
   fi
 
   REMEDIATION_APPLIED=1
-  append_array FIXES "Removed legacy PM2 OpenClaw gateway app and ensured systemd user gateway service is enabled/running."
-  record_remediation "pm2_gateway_legacy" "applied" "deleted exact PM2 app $PM2_GATEWAY_APP_NAME and started $SYSTEMD_UNIT_NAME"
+  append_array FIXES "Removed legacy PM2 OpenClaw gateway app(s) and ensured systemd user gateway service is enabled/running."
+  record_remediation "pm2_gateway_legacy" "applied" "deleted exact PM2 app(s) $pm2_apps_text and started $SYSTEMD_UNIT_NAME"
   return 0
 }
 

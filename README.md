@@ -50,8 +50,9 @@ Para evitar duplicidade em updates, o Gateway OpenClaw deve ficar sob `systemd -
 - `RESTART_MODE="systemd_user"`
 - `SYSTEMD_UNIT_NAME="openclaw-gateway.service"`
 - `AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="true"`
+- `PM2_GATEWAY_APP_NAMES="openclaw-gateway openclaw"`
 
-Se um app legado chamado exatamente `openclaw-gateway` aparecer no PM2, o Nurse pode remover apenas esse app do PM2 e garantir que o `openclaw-gateway.service` esteja habilitado/rodando. Outros apps PM2 nao sao tocados.
+Se um app legado chamado exatamente `openclaw-gateway` ou `openclaw` aparecer no PM2, o Nurse pode remover apenas esse app do PM2 e garantir que o `openclaw-gateway.service` esteja habilitado/rodando. Outros apps PM2 nao sao tocados. A lista pode ser ajustada em `PM2_GATEWAY_APP_NAMES`.
 
 Se o host usar bins fora do PATH padrao do usuario, como Linuxbrew, adicione por config:
 
