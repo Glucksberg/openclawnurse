@@ -210,6 +210,20 @@ append_array() {
   ref+=("$value")
 }
 
+remove_array_value() {
+  local name="$1"
+  local value="$2"
+  local -n ref="$name"
+  local filtered=()
+  local item
+  for item in "${ref[@]:-}"; do
+    if [[ "$item" != "$value" ]]; then
+      filtered+=("$item")
+    fi
+  done
+  ref=("${filtered[@]}")
+}
+
 command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
@@ -857,11 +871,17 @@ classify_doctor() {
   if printf '%s' "$lowered" | grep -Eq 'no channel security warnings detected|doctor complete'; then
     DOCTOR_CLASSIFICATION="healthy"
     DOCTOR_SUMMARY="doctor completed without actionable findings"
+    if [[ "$REMEDIATION_APPLIED" -eq 1 ]]; then
+      remove_array_value ACTIONS "Review the doctor recommendations that remain unresolved."
+    fi
     return
   fi
 
   DOCTOR_CLASSIFICATION="healthy"
   DOCTOR_SUMMARY="doctor did not report actionable problems"
+  if [[ "$REMEDIATION_APPLIED" -eq 1 ]]; then
+    remove_array_value ACTIONS "Review the doctor recommendations that remain unresolved."
+  fi
 }
 
 run_sessions_cleanup_preview() {
