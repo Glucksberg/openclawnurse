@@ -1048,15 +1048,16 @@ run_telegram_sanity() {
 
   local cfg_file="$OPENCLAW_STATE_HOME/openclaw.json"
   [[ -f "$cfg_file" ]] || return 0
-  [[ "$(jq -r '.channels.telegram.enabled // false' "$cfg_file" 2>/dev/null)" == "true" ]] || return 0
+  local telegram_enabled token
+  telegram_enabled="$(jq -r '.channels.telegram.enabled // empty' "$cfg_file" 2>/dev/null)"
+  token="$(jq -r '.channels.telegram.botToken // empty' "$cfg_file" 2>/dev/null)"
+  [[ "$telegram_enabled" != "false" || -n "$token" ]] || return 0
 
   if ! command_exists curl; then
     append_sanity_finding "Telegram sanity check skipped because curl is missing."
     return 0
   fi
 
-  local token
-  token="$(jq -r '.channels.telegram.botToken // empty' "$cfg_file" 2>/dev/null)"
   if [[ -z "$token" ]]; then
     append_sanity_finding "Telegram channel is enabled, but channels.telegram.botToken is empty."
     append_array ACTIONS "Configure the OpenClaw Telegram bot token or disable the Telegram channel."
@@ -1185,7 +1186,10 @@ run_self_test() {
 
   run_runtime_sanity || true
   run_telegram_sanity || true
+  local original_gateway_log_since="$GATEWAY_LOG_SINCE"
+  GATEWAY_LOG_SINCE="10 minutes ago"
   run_gateway_log_scan || true
+  GATEWAY_LOG_SINCE="$original_gateway_log_since"
 
   if [[ "$SANITY_CRITICAL" -eq 1 ]]; then
     printf 'SELF_TEST=FAILED\n'
@@ -2087,6 +2091,16 @@ finalize_status() {
     return
   fi
 
+  if [[ "$SANITY_CRITICAL" -eq 1 ]]; then
+    STATUS="FAILED"
+    return
+  fi
+
+  if [[ "$SANITY_DEGRADED" -eq 1 ]]; then
+    STATUS="DEGRADED"
+    return
+  fi
+
   if [[ "$UPDATE_ATTEMPTED" -eq 1 && "$UPDATE_SUCCEEDED" -eq 1 && "$DOCTOR_CLASSIFICATION" == "repaired" ]]; then
     STATUS="UPDATED_WITH_REPAIRS"
     return
@@ -2098,16 +2112,6 @@ finalize_status() {
   fi
 
   if [[ "$DOCTOR_CLASSIFICATION" == "needs_manual_attention" || "$GATEWAY_HEALTHY" -eq 0 && "$RESTART_ATTEMPTED" -eq 1 ]]; then
-    STATUS="DEGRADED"
-    return
-  fi
-
-  if [[ "$SANITY_CRITICAL" -eq 1 ]]; then
-    STATUS="FAILED"
-    return
-  fi
-
-  if [[ "$SANITY_DEGRADED" -eq 1 ]]; then
     STATUS="DEGRADED"
     return
   fi
