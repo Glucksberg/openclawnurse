@@ -148,6 +148,68 @@ EOF
   pass "report channel none skips direct notification"
 }
 
+smoke_missing_telegram_token_does_not_block_maintenance() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/missing-token.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+TELEGRAM_TARGET="chat"
+REPORT_CHANNEL="telegram"
+AUTO_UPDATE="false"
+CONFIG_BACKUP_ENABLED="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" >/dev/null
+
+  "$JQ_BIN" -e '
+    .status == "FAILED_NOTIFICATION_PENDING"
+    and .doctorAttempted == true
+    and .notificationPending == true
+    and (.errors[] | contains("TELEGRAM_BOT_TOKEN"))
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "missing Telegram token blocked maintenance instead of only notification"
+
+  pass "missing Telegram token does not block maintenance"
+}
+
+smoke_self_test_uses_openclaw_telegram_token() {
+  local tmp output
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/selftest-openclaw-token.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"channels":{"telegram":{"botToken":"fake-token"}}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+TELEGRAM_TARGET="chat"
+REPORT_CHANNEL="telegram"
+AUTO_UPDATE="false"
+CONFIG_BACKUP_ENABLED="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+EOF
+
+  output="$(HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --self-test)"
+
+  printf '%s\n' "$output" | grep -Fq 'SELF_TEST=OK' ||
+    fail "self-test did not use OpenClaw Telegram token"
+  printf '%s\n' "$output" | grep -Fq 'Notification dry-run: ok (chat)' ||
+    fail "self-test notification dry-run did not succeed with OpenClaw Telegram token"
+
+  pass "self-test uses OpenClaw Telegram token when nurse token is empty"
+}
+
 smoke_sanity_overrides_updated_status() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/sanity-status.XXXXXX")"
@@ -348,6 +410,8 @@ main() {
   smoke_doctor_without_complete_config
   smoke_pending_report_after_notification_failure
   smoke_report_channel_none_skips_delivery
+  smoke_missing_telegram_token_does_not_block_maintenance
+  smoke_self_test_uses_openclaw_telegram_token
   smoke_sanity_overrides_updated_status
   smoke_telegram_sanity_uses_implicit_bot_token
   smoke_fleet_export_respects_openclaw_config

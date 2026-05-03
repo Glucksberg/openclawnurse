@@ -141,6 +141,7 @@ AUTO_REMEDIATE_MISSING_TRANSCRIPTS="${AUTO_REMEDIATE_MISSING_TRANSCRIPTS:-true}"
 AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS="${AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS:-true}"
 AUTO_REMEDIATE_ALL_AGENTS="${AUTO_REMEDIATE_ALL_AGENTS:-false}"
 AUTO_RESTART_UNHEALTHY_GATEWAY="${AUTO_RESTART_UNHEALTHY_GATEWAY:-true}"
+AUTO_REFRESH_STALE_GATEWAY_SERVICE="${AUTO_REFRESH_STALE_GATEWAY_SERVICE:-true}"
 AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="${AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD:-true}"
 PM2_GATEWAY_APP_NAMES="${PM2_GATEWAY_APP_NAMES:-${PM2_GATEWAY_APP_NAME:-openclaw-gateway openclaw}}"
 MAX_GATEWAY_RESTARTS_PER_DAY="${MAX_GATEWAY_RESTARTS_PER_DAY:-1}"
@@ -319,6 +320,59 @@ run_capture_allow_fail() {
   fi
 }
 
+run_capture_with_heartbeat() {
+  local output_var="$1"
+  local status_var="$2"
+  local label="$3"
+  local heartbeat_seconds="$4"
+  shift 4
+  local captured_output
+  local captured_status
+  local capture_file
+  local pid
+  local start_epoch
+  local next_heartbeat
+  local elapsed
+  local pid_stat
+
+  capture_file="$(mktemp "$STATE_DIR/capture.XXXXXX")" || {
+    printf -v "$output_var" '%s' "mktemp failed"
+    printf -v "$status_var" '%s' 1
+    log ERROR "$label failed before start: mktemp failed"
+    return 0
+  }
+
+  log INFO "$label"
+  start_epoch="$(date +%s)"
+  next_heartbeat="$heartbeat_seconds"
+  "$@" >"$capture_file" 2>&1 &
+  pid=$!
+
+  while kill -0 "$pid" 2>/dev/null; do
+    pid_stat="$(ps -p "$pid" -o stat= 2>/dev/null || true)"
+    [[ -z "$pid_stat" || "${pid_stat:0:1}" == "Z" ]] && break
+    sleep 1
+    elapsed=$(( $(date +%s) - start_epoch ))
+    if (( elapsed >= next_heartbeat )); then
+      log INFO "$label still running (${elapsed}s elapsed)"
+      next_heartbeat=$((next_heartbeat + heartbeat_seconds))
+    fi
+  done
+
+  wait "$pid"
+  captured_status=$?
+  captured_output="$(cat "$capture_file" 2>/dev/null || true)"
+  rm -f "$capture_file"
+
+  printf -v "$output_var" '%s' "$captured_output"
+  printf -v "$status_var" '%s' "$captured_status"
+  if [[ "$captured_status" -eq 0 ]]; then
+    log INFO "$label succeeded"
+  else
+    log ERROR "$label failed with exit $captured_status"
+  fi
+}
+
 build_openclaw_cmd() {
   local name="$1"
   local -n ref="$name"
@@ -379,9 +433,28 @@ detect_telegram_target() {
   fi
 }
 
+detect_telegram_bot_token() {
+  [[ -z "$TELEGRAM_BOT_TOKEN" ]] || return 0
+  [[ "$REPORT_CHANNEL" == "telegram" ]] || return 0
+  command_exists jq || return 0
+
+  local cfg_file="$OPENCLAW_CONFIG_FILE"
+  [[ -f "$cfg_file" ]] || return 0
+
+  local detected
+  detected="$(jq -r '.channels.telegram.botToken // empty' "$cfg_file" 2>/dev/null || true)"
+  if [[ -n "$detected" && "$detected" != "null" ]]; then
+    TELEGRAM_BOT_TOKEN="$detected"
+    log INFO "Auto-detected TELEGRAM_BOT_TOKEN from $cfg_file"
+  fi
+}
+
 send_telegram_message() {
   local message_text="$1"
   local dry_run="${2:-false}"
+
+  detect_telegram_bot_token
+  detect_telegram_target
 
   if [[ -z "$TELEGRAM_BOT_TOKEN" ]]; then
     printf '{"ok":false,"error":"missing TELEGRAM_BOT_TOKEN"}\n'
@@ -598,20 +671,21 @@ persist_json() {
   local report_text="$1"
   local report_json_tmp="$RUN_JSON_FILE.tmp"
   local state_json_tmp="$STATE_FILE.tmp"
-  local errors_json fixes_json actions_json incident_codes_json remediations_json diagnostics_json
+  local errors_json fixes_json actions_json incident_codes_json remediations_json diagnostics_json sanity_findings_json
 
   errors_json="$(json_array_from_name ERRORS)"
   fixes_json="$(json_array_from_name FIXES)"
   actions_json="$(json_array_from_name ACTIONS)"
   incident_codes_json="$(json_array_from_name INCIDENT_CODES)"
   remediations_json="$(json_remediations_from_name REMEDIATIONS)"
+  sanity_findings_json="$(printf '%s\n' "${SANITY_FINDINGS[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))' 2>/dev/null || printf '[]')"
   if printf '%s' "$DIAGNOSTICS_JSON" | jq empty >/dev/null 2>&1; then
     diagnostics_json="$DIAGNOSTICS_JSON"
   else
     diagnostics_json="{}"
   fi
 
-  jq -n \
+  if ! jq -n \
     --arg timestamp "$RUN_ISO" \
     --arg hostname "$HOST_NAME" \
     --arg status "$STATUS" \
@@ -663,11 +737,11 @@ persist_json() {
     --argjson sanityAttempted "$(json_bool "$SANITY_ATTEMPTED")" \
     --argjson sanityDegraded "$(json_bool "$SANITY_DEGRADED")" \
     --argjson sanityCritical "$(json_bool "$SANITY_CRITICAL")" \
-    --argjson providerEmptyInputCount "$PROVIDER_EMPTY_INPUT_COUNT" \
-    --argjson stuckSessionCount "$STUCK_SESSION_COUNT" \
-    --argjson configInvalidCount "$CONFIG_INVALID_COUNT" \
-    --argjson updateProvenanceWarningCount "$UPDATE_PROVENANCE_WARNING_COUNT" \
-    --argjson sanityFindings "$(printf '%s\n' "${SANITY_FINDINGS[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    --argjson providerEmptyInputCount "$(json_int "$PROVIDER_EMPTY_INPUT_COUNT")" \
+    --argjson stuckSessionCount "$(json_int "$STUCK_SESSION_COUNT")" \
+    --argjson configInvalidCount "$(json_int "$CONFIG_INVALID_COUNT")" \
+    --argjson updateProvenanceWarningCount "$(json_int "$UPDATE_PROVENANCE_WARNING_COUNT")" \
+    --argjson sanityFindings "$sanity_findings_json" \
     '{
       timestamp: $timestamp,
       hostname: $hostname,
@@ -733,7 +807,17 @@ persist_json() {
         health: $healthError
       },
       reportText: $reportText
-    }' >"$report_json_tmp"
+    }' >"$report_json_tmp"; then
+    rm -f "$report_json_tmp" "$state_json_tmp"
+    log ERROR "Failed to persist run JSON; keeping previous state file intact"
+    return 1
+  fi
+
+  if ! jq empty "$report_json_tmp" >/dev/null 2>&1; then
+    rm -f "$report_json_tmp" "$state_json_tmp"
+    log ERROR "Generated run JSON is invalid; keeping previous state file intact"
+    return 1
+  fi
 
   mv "$report_json_tmp" "$RUN_JSON_FILE"
   cp "$RUN_JSON_FILE" "$state_json_tmp"
@@ -1291,8 +1375,15 @@ run_gateway_log_scan() {
   fi
 
   if (( CONFIG_INVALID_COUNT > 0 )); then
-    append_sanity_critical "Gateway logs contain $CONFIG_INVALID_COUNT invalid config error(s) since $since."
-    append_array ERRORS "Gateway logs show invalid OpenClaw config."
+    local latest_invalid_line latest_ready_line
+    latest_invalid_line="$(printf '%s\n' "$logs" | awk 'BEGIN { IGNORECASE=1 } /Config invalid|Invalid config/ { n=NR } END { print n + 0 }')"
+    latest_ready_line="$(printf '%s\n' "$logs" | awk '/\\[gateway\\] ready|http server listening/ { n=NR } END { print n + 0 }')"
+    if (( latest_ready_line > latest_invalid_line )); then
+      append_sanity_finding "Gateway logs contain $CONFIG_INVALID_COUNT invalid config error(s) since $since, but the gateway became ready afterward."
+    else
+      append_sanity_critical "Gateway logs contain $CONFIG_INVALID_COUNT invalid config error(s) since $since."
+      append_array ERRORS "Gateway logs show invalid OpenClaw config."
+    fi
   fi
 
   if (( UPDATE_PROVENANCE_WARNING_COUNT > 0 )); then
@@ -1326,9 +1417,24 @@ run_self_test() {
 
   local health_output health_status
   local health_cmd
+  local deadline attempt
   build_openclaw_cmd health_cmd
   health_cmd+=(health --json --timeout "$HEALTH_TIMEOUT_MS")
-  run_capture health_output health_status "Self-test health check" "${health_cmd[@]}"
+  deadline=$(( $(date +%s) + GATEWAY_WAIT_TIMEOUT ))
+  attempt=1
+
+  while (( $(date +%s) <= deadline )); do
+    log INFO "Self-test health check"
+    health_output="$("${health_cmd[@]}" 2>&1)"
+    health_status=$?
+    if [[ "$health_status" -eq 0 ]] && printf '%s' "$health_output" | jq -e '.ok == true' >/dev/null 2>&1; then
+      log INFO "Self-test health check succeeded"
+      break
+    fi
+    log INFO "Self-test health not ready yet (attempt $attempt); retrying in ${GATEWAY_WAIT_INTERVAL}s"
+    attempt=$((attempt + 1))
+    sleep "$GATEWAY_WAIT_INTERVAL"
+  done
 
   if [[ "$health_status" -ne 0 ]] || ! printf '%s' "$health_output" | jq -e '.ok == true' >/dev/null 2>&1; then
     printf 'SELF_TEST=FAILED\n'
@@ -1591,11 +1697,16 @@ run_preflight_checks() {
   local required=(jq flock timeout "$OPENCLAW_BIN")
   local cmd
 
+  if command_exists jq; then
+    detect_telegram_target
+    detect_telegram_bot_token
+  fi
+
   if [[ "$RESTART_MODE" == "systemd_user" ]]; then
     append_unique_array required systemctl
   fi
 
-  if [[ "$NO_NOTIFY" -eq 0 && "$REPORT_CHANNEL" == "telegram" ]]; then
+  if [[ "$NO_NOTIFY" -eq 0 && "$REPORT_CHANNEL" == "telegram" && -n "$TELEGRAM_TARGET" && -n "$TELEGRAM_BOT_TOKEN" ]]; then
     append_unique_array required curl
   fi
 
@@ -1610,16 +1721,12 @@ run_preflight_checks() {
     fi
   done
 
-  detect_telegram_target
-
   if [[ "$NO_NOTIFY" -eq 0 && "$REPORT_CHANNEL" == "telegram" && -z "$TELEGRAM_TARGET" ]]; then
-    append_array ERRORS "TELEGRAM_TARGET is not configured."
-    missing=1
+    append_unique_array ACTIONS "Configure TELEGRAM_TARGET so OpenClawNurse can deliver reports."
   fi
 
   if [[ "$NO_NOTIFY" -eq 0 && "$REPORT_CHANNEL" == "telegram" && -z "$TELEGRAM_BOT_TOKEN" ]]; then
-    append_array ERRORS "TELEGRAM_BOT_TOKEN is not configured."
-    missing=1
+    append_unique_array ACTIONS "Configure TELEGRAM_BOT_TOKEN so OpenClawNurse can deliver reports."
   fi
 
   return "$missing"
@@ -1824,7 +1931,7 @@ run_update() {
   fi
 
   local output status
-  run_capture output status "Applying update" "${cmd[@]}"
+  run_capture_with_heartbeat output status "Applying update" 30 "${cmd[@]}"
   UPDATE_OUTPUT="$output"
 
   if [[ "$status" -eq 0 ]]; then
@@ -1842,14 +1949,14 @@ run_update() {
   local repair_cmd
   build_openclaw_cmd repair_cmd
   repair_cmd+=(doctor --repair --non-interactive)
-  run_capture doctor_repair_output doctor_repair_status "Running doctor repair before retry" \
+  run_capture_with_heartbeat doctor_repair_output doctor_repair_status "Running doctor repair before retry" 30 \
     "${repair_cmd[@]}"
 
   if [[ "$doctor_repair_status" -eq 0 ]]; then
     append_array FIXES "Doctor repair completed before the update retry."
   fi
 
-  run_capture output status "Retrying update after repair" "${cmd[@]}"
+  run_capture_with_heartbeat output status "Retrying update after repair" 30 "${cmd[@]}"
   UPDATE_OUTPUT="${UPDATE_OUTPUT}"$'\n\n--- retry ---\n'"${output}"
 
   if [[ "$status" -eq 0 ]]; then
@@ -1867,6 +1974,38 @@ run_update() {
   return 1
 }
 
+refresh_stale_gateway_service() {
+  [[ "$AUTO_REFRESH_STALE_GATEWAY_SERVICE" == "true" ]] || return 0
+  [[ "$DRY_RUN" -eq 0 ]] || return 0
+  [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] || return 0
+  command_exists systemctl || return 0
+
+  local active_version="$CURRENT_VERSION_AFTER"
+  [[ -n "$active_version" ]] || active_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+  [[ -n "$active_version" ]] || return 0
+
+  local unit_text service_version output status
+  unit_text="$(systemctl --user cat "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
+  service_version="$(printf '%s\n' "$unit_text" | sed -nE 's/^Description=.*\(v([^)]*)\).*/\1/p' | head -n 1)"
+
+  [[ -n "$service_version" && "$service_version" != "$active_version" ]] || return 0
+
+  local cmd
+  build_openclaw_cmd cmd
+  cmd+=(gateway install --force --json)
+  run_capture output status "Refreshing stale gateway service metadata" "${cmd[@]}"
+
+  if [[ "$status" -eq 0 ]]; then
+    append_array FIXES "Refreshed gateway systemd service metadata from version $service_version to $active_version."
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  append_array ERRORS "Could not refresh stale gateway service metadata."
+  append_array ACTIONS "Run openclaw gateway install --force and restart $SYSTEMD_UNIT_NAME."
+  return 1
+}
+
 run_doctor_phase() {
   DOCTOR_ATTEMPTED=1
   local output status
@@ -1875,13 +2014,13 @@ run_doctor_phase() {
     local cmd
     build_openclaw_cmd cmd
     cmd+=(doctor --non-interactive)
-    run_capture output status "Running doctor in dry-run mode" \
+    run_capture_with_heartbeat output status "Running doctor in dry-run mode" 30 \
       timeout "${DOCTOR_TIMEOUT}s" "${cmd[@]}"
   else
     local cmd
     build_openclaw_cmd cmd
     cmd+=(doctor --repair --non-interactive)
-    run_capture output status "Running doctor repair" \
+    run_capture_with_heartbeat output status "Running doctor repair" 30 \
       timeout "${DOCTOR_TIMEOUT}s" "${cmd[@]}"
   fi
 
@@ -1925,19 +2064,24 @@ wait_for_gateway_health() {
   local deadline=$(( $(date +%s) + GATEWAY_WAIT_TIMEOUT ))
   local output status
   local cmd
+  local attempt=1
   build_openclaw_cmd cmd
   cmd+=(health --json --timeout "$HEALTH_TIMEOUT_MS")
 
   while (( $(date +%s) <= deadline )); do
-    run_capture output status "Checking gateway health" \
-      "${cmd[@]}"
+    log INFO "Checking gateway health"
+    output="$("${cmd[@]}" 2>&1)"
+    status=$?
     HEALTH_OUTPUT="$output"
 
     if [[ "$status" -eq 0 ]] && printf '%s' "$output" | jq -e '.ok == true' >/dev/null 2>&1; then
       GATEWAY_HEALTHY=1
+      log INFO "Checking gateway health succeeded"
       return 0
     fi
 
+    log INFO "Gateway health not ready yet after restart (attempt $attempt); retrying in ${GATEWAY_WAIT_INTERVAL}s"
+    attempt=$((attempt + 1))
     sleep "$GATEWAY_WAIT_INTERVAL"
   done
 
@@ -2214,13 +2358,20 @@ deliver_report() {
     return 0
   fi
 
-  if [[ "$REPORT_CHANNEL" == "telegram" && -z "$TELEGRAM_TARGET" ]]; then
+  if [[ "$REPORT_CHANNEL" != "telegram" ]]; then
+    append_array ERRORS "Notification skipped because REPORT_CHANNEL=$REPORT_CHANNEL is unsupported."
+    NOTIFICATION_PENDING=1
+    return 1
+  fi
+
+  if [[ -z "$TELEGRAM_TARGET" ]]; then
     append_array ERRORS "Notification skipped because TELEGRAM_TARGET is empty."
     NOTIFICATION_PENDING=1
     return 1
   fi
-  if [[ "$REPORT_CHANNEL" != "telegram" ]]; then
-    append_array ERRORS "Unsupported REPORT_CHANNEL=$REPORT_CHANNEL."
+
+  if [[ -z "$TELEGRAM_BOT_TOKEN" ]]; then
+    append_array ERRORS "Notification skipped because TELEGRAM_BOT_TOKEN is empty."
     NOTIFICATION_PENDING=1
     return 1
   fi
@@ -2345,6 +2496,7 @@ main() {
   if should_attempt_update; then
     run_update || true
   fi
+  refresh_stale_gateway_service || true
 
   run_doctor_phase
   maybe_auto_archive_orphan_transcripts || true

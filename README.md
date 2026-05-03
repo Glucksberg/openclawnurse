@@ -34,6 +34,8 @@ Para usar o mesmo bot/token de Telegram em varias maquinas, com um `openclawnurs
 - `TELEGRAM_TARGET` com o chat/grupo central de alertas
 - `REPORT_INSTANCE_LABEL` com um nome claro do host
 
+Se `TELEGRAM_BOT_TOKEN` ficar vazio, o `openclawnurse` tenta reutilizar `channels.telegram.botToken` do `~/.openclaw/openclaw.json`. Isso cobre hosts onde o OpenClaw ja esta respondendo pelo bot do Telegram e evita duplicar o token no `.env` do Nurse.
+
 Esse modo legado envia alertas direto pela API do Telegram e nao depende do OpenClaw. Para instancias OpenClaw comuns, prefira o modo "Alertas pelo proprio OpenClaw" abaixo, que reutiliza o bot/canal ja configurado.
 
 Por padrao, o instalador:
@@ -127,6 +129,7 @@ Para evitar duplicidade em updates, o Gateway OpenClaw deve ficar sob `systemd -
 
 - `RESTART_MODE="systemd_user"`
 - `SYSTEMD_UNIT_NAME="openclaw-gateway.service"`
+- `AUTO_REFRESH_STALE_GATEWAY_SERVICE="true"`
 - `AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="true"`
 - `PM2_GATEWAY_APP_NAMES="openclaw-gateway openclaw"`
 
