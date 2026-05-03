@@ -81,7 +81,7 @@ Config relevante:
 - `OPENCLAW_ALERT_TARGET="-1001234567890"`
 - `OPENCLAW_ALERT_THREAD_ID=""`
 - `OPENCLAW_ALERT_AGENT_ID="main"`
-- `OPENCLAW_ALERT_EVERY="30m"`
+- `OPENCLAW_ALERT_EVERY=""`
 - `OPENCLAW_ALERT_CRON=""`
 - `OPENCLAW_ALERT_TZ=""`
 - `OPENCLAW_ALERT_JOB_NAME="openclawnurse-alert"`
@@ -94,7 +94,7 @@ O instalador deixa essa parte quase plug and play. Em um terminal interativo, `.
 - id do grupo/chat Telegram
 - id do topico/forum thread, ou vazio para o grupo principal
 - agente que executa o cronjob de alerta
-- intervalo do cronjob
+- intervalo do cronjob, quando nao usar cron expression
 
 Para instalacoes automatizadas, passe tudo por flags/env:
 
@@ -105,7 +105,7 @@ Para instalacoes automatizadas, passe tudo por flags/env:
   --openclaw-alert-target "-1001234567890" \
   --openclaw-alert-thread-id "251" \
   --openclaw-alert-agent "automacoes" \
-  --openclaw-alert-every "30m"
+  --openclaw-alert-every "12h"
 ```
 
 Para agenda fixa em UTC, use cron expression no lugar do intervalo:
@@ -118,6 +118,8 @@ Para agenda fixa em UTC, use cron expression no lugar do intervalo:
 ```
 
 Se o CLI local do OpenClaw ainda nao tiver escopo para gerenciar cron, o instalador nao falha: ele configura o `.env` e informa que voce deve aprovar/reparar os escopos e rodar o instalador de novo.
+
+Se `OPENCLAW_ALERT_CRON` e `OPENCLAW_ALERT_EVERY` estiverem vazios, o instalador assume `OPENCLAW_ALERT_EVERY="12h"` como comportamento padrao.
 
 Quando `OPENCLAW_ALERT_THREAD_ID` estiver preenchido, o instalador tambem aponta o failure alert nativo do cron para o topico usando a sintaxe documentada pelo OpenClaw: `<chatId>:topic:<threadId>`. A entrega normal do job continua usando `delivery.threadId`.
 

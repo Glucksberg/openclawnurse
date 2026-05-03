@@ -20,7 +20,7 @@ OPENCLAW_BIN="${OPENCLAW_BIN:-openclaw}"
 OPENCLAW_ALERT_TARGET="${OPENCLAW_ALERT_TARGET:-}"
 OPENCLAW_ALERT_THREAD_ID="${OPENCLAW_ALERT_THREAD_ID:-}"
 OPENCLAW_ALERT_AGENT_ID="${OPENCLAW_ALERT_AGENT_ID:-}"
-OPENCLAW_ALERT_EVERY="${OPENCLAW_ALERT_EVERY:-30m}"
+OPENCLAW_ALERT_EVERY="${OPENCLAW_ALERT_EVERY:-}"
 OPENCLAW_ALERT_CRON="${OPENCLAW_ALERT_CRON:-}"
 OPENCLAW_ALERT_TZ="${OPENCLAW_ALERT_TZ:-}"
 OPENCLAW_ALERT_JOB_NAME="${OPENCLAW_ALERT_JOB_NAME:-openclawnurse-alert}"
@@ -66,7 +66,7 @@ Options:
   --openclaw-alert-agent <id>
                          Agent id used by the OpenClaw cron job.
   --openclaw-alert-every <duration>
-                         Alert cron interval, e.g. 30m.
+                         Alert cron interval, e.g. 12h.
   --openclaw-alert-cron <expr>
                          Alert cron expression, e.g. "0 11,21 * * *".
   --openclaw-alert-tz <iana>
@@ -444,6 +444,8 @@ configure_openclaw_alert_env() {
   OPENCLAW_ALERT_TZ="$cron_tz"
   if [[ -n "$OPENCLAW_ALERT_CRON" ]]; then
     OPENCLAW_ALERT_EVERY=""
+  elif [[ -z "$OPENCLAW_ALERT_EVERY" ]]; then
+    OPENCLAW_ALERT_EVERY="12h"
   fi
 
   set_env_value OPENCLAW_BIN "$OPENCLAW_BIN"
@@ -478,7 +480,7 @@ ensure_openclaw_alert_cron_job() {
   [[ -n "${OPENCLAW_ALERT_TARGET:-}" ]] || return 0
   [[ -n "${OPENCLAW_ALERT_AGENT_ID:-}" ]] || OPENCLAW_ALERT_AGENT_ID="main"
   if [[ -z "${OPENCLAW_ALERT_CRON:-}" && -z "${OPENCLAW_ALERT_EVERY:-}" ]]; then
-    OPENCLAW_ALERT_EVERY="30m"
+    OPENCLAW_ALERT_EVERY="12h"
   fi
 
   local openclaw_cmd=("$OPENCLAW_BIN")
