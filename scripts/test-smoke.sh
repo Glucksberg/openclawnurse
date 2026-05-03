@@ -34,12 +34,12 @@ fi
 
 case "${1:-}" in
   --version)
-    printf 'openclaw 1.0.0\n'
+    printf 'OpenClaw 2026.1.0\n'
     ;;
   update)
     case "${2:-}" in
       status)
-        printf '{"availability":{"latestVersion":"1.0.0"},"channel":{"value":"stable"}}\n'
+        printf '{"availability":{"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
         ;;
       *)
         printf '{"ok":true}\n'
@@ -121,6 +121,33 @@ EOF
   pass "pending report is rebuilt after notification failure"
 }
 
+smoke_report_channel_none_skips_delivery() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/report-none.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+CONFIG_BACKUP_ENABLED="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" >/dev/null
+
+  "$JQ_BIN" -e '.status == "OK" and .notificationPending == false and .notificationDelivered == false' \
+    "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "REPORT_CHANNEL=none did not skip direct notification cleanly"
+  [[ ! -e "$tmp/state/pending-report.txt" ]] ||
+    fail "REPORT_CHANNEL=none left a pending report"
+
+  pass "report channel none skips direct notification"
+}
+
 smoke_sanity_overrides_updated_status() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/sanity-status.XXXXXX")"
@@ -131,12 +158,12 @@ smoke_sanity_overrides_updated_status() {
 
 case "${1:-}" in
   --version)
-    printf 'openclaw 0.9.0\n'
+    printf 'OpenClaw 2026.0.9\n'
     ;;
   update)
     case "${2:-}" in
       status)
-        printf '{"availability":{"latestVersion":"1.0.0"},"channel":{"value":"stable"}}\n'
+        printf '{"availability":{"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
         ;;
       *)
         printf '{"ok":true}\n'
@@ -160,7 +187,7 @@ EOF
   chmod +x "$tmp/bin/openclaw"
   cat >"$tmp/bin/stale-openclaw" <<'EOF'
 #!/usr/bin/env bash
-printf 'openclaw 0.8.0\n'
+printf 'OpenClaw 2026.0.8\n'
 EOF
   chmod +x "$tmp/bin/stale-openclaw"
   cat >"$tmp/cfg/openclawnurse.env" <<EOF
@@ -261,15 +288,71 @@ EOF
   pass "dashboard filters unsafe links and escapes attributes"
 }
 
+smoke_remediates_openclaw_installation_drift() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/install-drift.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.npm-global/bin" "$tmp/home/.npm-global/lib/node_modules" "$tmp/home/.local/share/pnpm"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/home/.npm-global/bin/openclaw" <<'EOF'
+#!/usr/bin/env bash
+printf 'OpenClaw 2026.0.8\n'
+EOF
+  chmod +x "$tmp/home/.npm-global/bin/openclaw"
+  mkdir -p "$tmp/home/.npm-global/lib/node_modules/openclaw"
+  cat >"$tmp/home/.local/share/pnpm/openclaw" <<'EOF'
+#!/usr/bin/env bash
+exit 127
+EOF
+  chmod +x "$tmp/home/.local/share/pnpm/openclaw"
+  cat >"$tmp/home/.bashrc" <<'EOF'
+alias openclaw="/old/openclaw"
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+OPENCLAW_EXTRA_SCAN_PATHS="$tmp/home/.npm-global/bin/openclaw $tmp/home/.local/share/pnpm/openclaw"
+AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS="true"
+OPENCLAW_REMEDIABLE_INSTALL_PATHS="$tmp/home/.npm-global/bin/openclaw $tmp/home/.npm-global/lib/node_modules/openclaw"
+AUTO_REPAIR_OPENCLAW_LAUNCHER="true"
+OPENCLAW_LAUNCHER_PATH="$tmp/home/.local/share/pnpm/openclaw"
+AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="true"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  [[ ! -e "$tmp/home/.npm-global/bin/openclaw" ]] ||
+    fail "stale OpenClaw bin was not quarantined"
+  [[ ! -e "$tmp/home/.npm-global/lib/node_modules/openclaw" ]] ||
+    fail "stale OpenClaw package dir was not quarantined"
+  "$tmp/home/.local/share/pnpm/openclaw" --version | grep -Fq 'OpenClaw 2026.1.0' ||
+    fail "OpenClaw launcher was not repaired"
+  grep -Fq '# openclawnurse disabled shell shadowing:' "$tmp/home/.bashrc" ||
+    fail "OpenClaw shell alias was not disabled"
+  "$JQ_BIN" -e '(.status == "OK") and any(.fixes[]; contains("Remediated OpenClaw stale installation"))' \
+    "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "installation drift remediation was not recorded as an OK run"
+
+  pass "openclaw installation drift is remediated"
+}
+
 main() {
   require_cmd "$JQ_BIN"
 
   smoke_doctor_without_complete_config
   smoke_pending_report_after_notification_failure
+  smoke_report_channel_none_skips_delivery
   smoke_sanity_overrides_updated_status
   smoke_telegram_sanity_uses_implicit_bot_token
   smoke_fleet_export_respects_openclaw_config
   smoke_dashboard_link_safety
+  smoke_remediates_openclaw_installation_drift
 }
 
 main "$@"

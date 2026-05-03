@@ -34,7 +34,7 @@ Para usar o mesmo bot/token de Telegram em varias maquinas, com um `openclawnurs
 - `TELEGRAM_TARGET` com o chat/grupo central de alertas
 - `REPORT_INSTANCE_LABEL` com um nome claro do host
 
-O envio de alertas do `openclawnurse` e direto na API do Telegram. Ele nao depende do bot nem da configuracao de canais do OpenClaw.
+Esse modo legado envia alertas direto pela API do Telegram e nao depende do OpenClaw. Para instancias OpenClaw comuns, prefira o modo "Alertas pelo proprio OpenClaw" abaixo, que reutiliza o bot/canal ja configurado.
 
 Por padrao, o instalador:
 
@@ -53,6 +53,73 @@ Por padrao, ele tenta remediar automaticamente dois tipos de sujeira operacional
 - entradas de sessao com transcripts ausentes
 - arquivos `*.trajectory.jsonl` orfaos apontados pelo `openclaw doctor`
 - config `openclaw.json` invalida, restaurando o ultimo backup JSON valido quando existir
+
+Em hosts com politica de uma unica instalacao do OpenClaw, escolha explicitamente o binario canonico e habilite a remediacao de deriva:
+
+- `OPENCLAW_BIN="$HOME/openclaw/node_modules/.bin/openclaw"`
+- `AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS="true"`
+- `OPENCLAW_REMEDIABLE_INSTALL_PATHS="$HOME/.npm-global/bin/openclaw $HOME/.npm-global/lib/node_modules/openclaw $HOME/.local/share/pnpm/global/5/node_modules/openclaw"`
+- `AUTO_REPAIR_OPENCLAW_LAUNCHER="true"`
+- `OPENCLAW_LAUNCHER_PATH="$HOME/.local/share/pnpm/openclaw"`
+- `AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="true"`
+
+Essa remediacao nao apaga os caminhos divergentes: ela move os artefatos para `~/.local/state/openclawnurse/quarantine/` e deixa o report registrar o que foi feito.
+
+## Alertas pelo proprio OpenClaw
+
+Quando o Gateway esta saudavel, o alerta pode ser enviado pelo proprio bot/canal do OpenClaw, sem um token dedicado do Nurse. O padrao recomendado e:
+
+- o `openclawnurse.timer` continua executando reparos locais e gravando `doctor-state.json`
+- um cronjob do OpenClaw chama um agente leve
+- o agente executa `openclawnurse-openclaw-alert.sh`
+- o script envia mensagem para o grupo/topico configurado quando o estado esta diferente de `OK` ou quando houve atividade relevante: update aplicado, config restaurada, gateway reiniciado ou remediacao aplicada
+- quando havia incidente anterior, ele envia uma recuperacao quando volta a `OK`
+
+Config relevante:
+
+- `OPENCLAW_ALERT_CHANNEL="telegram"`
+- `OPENCLAW_ALERT_TARGET="-1001234567890"`
+- `OPENCLAW_ALERT_THREAD_ID=""`
+- `OPENCLAW_ALERT_AGENT_ID="main"`
+- `OPENCLAW_ALERT_EVERY="30m"`
+- `OPENCLAW_ALERT_CRON=""`
+- `OPENCLAW_ALERT_TZ=""`
+- `OPENCLAW_ALERT_JOB_NAME="openclawnurse-alert"`
+- `OPENCLAW_ALERT_MIN_INTERVAL_SECONDS="21600"`
+- `OPENCLAW_ALERT_RECOVERY="true"`
+
+O instalador deixa essa parte quase plug and play. Em um terminal interativo, `./install.sh` tenta detectar o primeiro grupo Telegram configurado no OpenClaw, sugere um topico de automacoes quando existir e pergunta:
+
+- caminho do binario `openclaw`
+- id do grupo/chat Telegram
+- id do topico/forum thread, ou vazio para o grupo principal
+- agente que executa o cronjob de alerta
+- intervalo do cronjob
+
+Para instalacoes automatizadas, passe tudo por flags/env:
+
+```bash
+./install.sh \
+  --configure-openclaw-alert \
+  --openclaw-bin "$HOME/openclaw/node_modules/.bin/openclaw" \
+  --openclaw-alert-target "-1001234567890" \
+  --openclaw-alert-thread-id "251" \
+  --openclaw-alert-agent "automacoes" \
+  --openclaw-alert-every "30m"
+```
+
+Para agenda fixa em UTC, use cron expression no lugar do intervalo:
+
+```bash
+./install.sh \
+  --configure-openclaw-alert \
+  --openclaw-alert-cron "0 11,21 * * *" \
+  --openclaw-alert-tz "UTC"
+```
+
+Se o CLI local do OpenClaw ainda nao tiver escopo para gerenciar cron, o instalador nao falha: ele configura o `.env` e informa que voce deve aprovar/reparar os escopos e rodar o instalador de novo.
+
+Quando `OPENCLAW_ALERT_THREAD_ID` estiver preenchido, o instalador tambem aponta o failure alert nativo do cron para o topico usando a sintaxe documentada pelo OpenClaw: `<chatId>:topic:<threadId>`. A entrega normal do job continua usando `delivery.threadId`.
 
 Para evitar duplicidade em updates, o Gateway OpenClaw deve ficar sob `systemd --user`:
 

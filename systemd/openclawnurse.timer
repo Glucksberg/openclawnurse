@@ -1,5 +1,5 @@
 [Unit]
-Description=Run OpenClawNurse daily
+Description=Run OpenClawNurse on schedule
 
 [Timer]
 OnCalendar=__ON_CALENDAR__

@@ -164,6 +164,11 @@ GATEWAY_LOG_FALLBACK_SINCE="${GATEWAY_LOG_FALLBACK_SINCE:-24 hours ago}"
 GATEWAY_LOG_MAX_LINES="${GATEWAY_LOG_MAX_LINES:-4000}"
 OPENCLAW_EXTRA_SCAN_PATHS="${OPENCLAW_EXTRA_SCAN_PATHS:-$HOME/openclaw/node_modules/.bin/openclaw $HOME/.local/share/pnpm/openclaw $HOME/.npm-global/bin/openclaw}"
 CHECK_SHELL_ALIASES="${CHECK_SHELL_ALIASES:-true}"
+AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS="${AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS:-false}"
+OPENCLAW_REMEDIABLE_INSTALL_PATHS="${OPENCLAW_REMEDIABLE_INSTALL_PATHS:-$HOME/.npm-global/bin/openclaw $HOME/.npm-global/lib/node_modules/openclaw $HOME/.local/share/pnpm/global/5/node_modules/openclaw}"
+AUTO_REPAIR_OPENCLAW_LAUNCHER="${AUTO_REPAIR_OPENCLAW_LAUNCHER:-false}"
+OPENCLAW_LAUNCHER_PATH="${OPENCLAW_LAUNCHER_PATH:-$HOME/.local/share/pnpm/openclaw}"
+AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="${AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING:-false}"
 RESTART_MODE="${RESTART_MODE:-systemd_user}"
 SYSTEMD_UNIT_NAME="${SYSTEMD_UNIT_NAME:-openclaw-gateway.service}"
 RESTART_COMMAND="${RESTART_COMMAND:-}"
@@ -748,7 +753,9 @@ clear_pending_report() {
 
 retry_pending_report() {
   [[ "$NO_NOTIFY" -eq 1 ]] && return 0
+  [[ "$REPORT_CHANNEL" == "none" || "$REPORT_CHANNEL" == "off" || "$REPORT_CHANNEL" == "disabled" ]] && return 0
   [[ "$REPORT_CHANNEL" == "telegram" && -z "$TELEGRAM_TARGET" ]] && return 0
+  [[ "$REPORT_CHANNEL" == "telegram" ]] || return 0
   [[ -f "$PENDING_TEXT_FILE" ]] || return 0
 
   local pending_text
@@ -966,13 +973,158 @@ scan_shell_openclaw_aliases() {
   for rc_file in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc"; do
     [[ -f "$rc_file" ]] || continue
     local rc_hits
-    rc_hits="$(grep -HnE 'alias[[:space:]]+openclaw=|(^|[[:space:]])openclaw[[:space:]]*\(\)|function[[:space:]]+openclaw' "$rc_file" 2>/dev/null || true)"
+    rc_hits="$(grep -HnE '^[[:space:]]*(alias[[:space:]]+openclaw=|openclaw[[:space:]]*\(\)|function[[:space:]]+openclaw)' "$rc_file" 2>/dev/null || true)"
     [[ -n "$rc_hits" ]] && hits="${hits}${hits:+$'\n'}${rc_hits}"
   done
 
   if [[ -n "$hits" ]]; then
     append_sanity_finding "Shell startup files define openclaw aliases/functions; verify they do not shadow the installed CLI."
     append_array ACTIONS "Inspect shell openclaw aliases/functions if CLI and gateway versions diverge."
+  fi
+}
+
+is_configured_remediable_openclaw_path() {
+  local path="$1"
+  local remediable
+  for remediable in $OPENCLAW_REMEDIABLE_INSTALL_PATHS; do
+    [[ "$path" == "$remediable" ]] && return 0
+  done
+  return 1
+}
+
+quarantine_openclaw_path() {
+  local path="$1"
+  local quarantine_root="$STATE_DIR/quarantine/openclaw-installations/$RUN_ID"
+  local dest="$quarantine_root${path}"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would quarantine stale OpenClaw path $path."
+    return 0
+  fi
+  [[ -e "$path" || -L "$path" ]] || return 0
+  mkdir -p "$(dirname "$dest")"
+  mv "$path" "$dest"
+  append_array FIXES "Quarantined stale OpenClaw path $path."
+}
+
+write_openclaw_launcher() {
+  [[ "$AUTO_REPAIR_OPENCLAW_LAUNCHER" == "true" ]] || return 0
+  [[ "$OPENCLAW_BIN" == */* ]] || return 0
+  [[ -x "$OPENCLAW_BIN" ]] || return 0
+
+  local output status
+  if [[ -x "$OPENCLAW_LAUNCHER_PATH" ]]; then
+    run_capture_allow_fail output status "Checking OpenClaw launcher" "$OPENCLAW_LAUNCHER_PATH" --version
+    [[ "$status" -eq 0 ]] && return 0
+  fi
+
+  add_incident_code "openclaw_launcher_broken"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would repair OpenClaw launcher $OPENCLAW_LAUNCHER_PATH to exec $OPENCLAW_BIN."
+    record_remediation "openclaw_launcher_broken" "would_apply" "would write launcher $OPENCLAW_LAUNCHER_PATH"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$OPENCLAW_LAUNCHER_PATH")"
+  if [[ -e "$OPENCLAW_LAUNCHER_PATH" || -L "$OPENCLAW_LAUNCHER_PATH" ]]; then
+    quarantine_openclaw_path "$OPENCLAW_LAUNCHER_PATH"
+  fi
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'exec %q "$@"\n' "$OPENCLAW_BIN"
+  } >"$OPENCLAW_LAUNCHER_PATH"
+  chmod 0755 "$OPENCLAW_LAUNCHER_PATH"
+  REMEDIATION_APPLIED=1
+  append_array FIXES "Repaired OpenClaw launcher $OPENCLAW_LAUNCHER_PATH."
+  record_remediation "openclaw_launcher_broken" "applied" "wrote launcher $OPENCLAW_LAUNCHER_PATH"
+}
+
+maybe_auto_remediate_openclaw_installations() {
+  [[ "$AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS" == "true" ]] || return 0
+
+  local current_version="$CURRENT_VERSION_BEFORE"
+  if [[ -z "$current_version" && -x "$OPENCLAW_BIN" ]]; then
+    current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+  fi
+  [[ -n "$current_version" ]] || return 0
+
+  local candidates=()
+  local candidate
+  if [[ "$OPENCLAW_BIN" != */* ]]; then
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] && append_unique_array candidates "$candidate"
+    done < <(type -a -P "$OPENCLAW_BIN" 2>/dev/null || true)
+  fi
+  for candidate in $OPENCLAW_EXTRA_SCAN_PATHS $OPENCLAW_REMEDIABLE_INSTALL_PATHS; do
+    [[ -e "$candidate" || -L "$candidate" ]] && append_unique_array candidates "$candidate"
+  done
+
+  local path version_line version stale_found=0
+  for path in "${candidates[@]:-}"; do
+    is_configured_remediable_openclaw_path "$path" || continue
+
+    if [[ -x "$path" ]]; then
+      version_line="$(timeout 5s "$path" --version 2>/dev/null | head -n 1 || true)"
+      version="$(printf '%s' "$version_line" | extract_openclaw_version)"
+      if [[ -n "$version" && "$version" == "$current_version" ]]; then
+        continue
+      fi
+      [[ -z "$version" ]] && version="unknown"
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        append_sanity_finding "OpenClaw stale installation would be remediated: $path reports $version while active CLI reports $current_version."
+      else
+        append_array FIXES "Remediated OpenClaw stale installation: $path reported $version while active CLI reports $current_version."
+      fi
+    else
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        append_sanity_finding "OpenClaw stale installation path would be remediated: $path is present but is not the active CLI."
+      else
+        append_array FIXES "Remediated OpenClaw stale installation path: $path was present but was not the active CLI."
+      fi
+    fi
+
+    stale_found=1
+    add_incident_code "openclaw_installation_drift"
+    quarantine_openclaw_path "$path"
+  done
+
+  if [[ "$stale_found" -eq 1 ]]; then
+    REMEDIATION_APPLIED=1
+    record_remediation "openclaw_installation_drift" "$([[ "$DRY_RUN" -eq 1 ]] && printf would_apply || printf applied)" "quarantined configured stale OpenClaw install paths"
+  fi
+
+  write_openclaw_launcher
+}
+
+maybe_auto_remediate_shell_openclaw_shadowing() {
+  [[ "$CHECK_SHELL_ALIASES" == "true" ]] || return 0
+  [[ "$AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING" == "true" ]] || return 0
+
+  local rc_file changed=0
+  for rc_file in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc"; do
+    [[ -f "$rc_file" ]] || continue
+    grep -Eq '^[[:space:]]*alias[[:space:]]+openclaw=' "$rc_file" || continue
+    add_incident_code "openclaw_shell_shadowing"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      append_array FIXES "Dry-run: would disable OpenClaw shell alias in $rc_file."
+      record_remediation "openclaw_shell_shadowing" "would_apply" "would comment alias in $rc_file"
+      continue
+    fi
+    cp "$rc_file" "$rc_file.openclawnurse-$RUN_ID.bak"
+    awk '
+      /^[[:space:]]*alias[[:space:]]+openclaw=/ {
+        print "# openclawnurse disabled shell shadowing: " $0
+        next
+      }
+      { print }
+    ' "$rc_file" >"$rc_file.tmp.$RUN_ID"
+    mv "$rc_file.tmp.$RUN_ID" "$rc_file"
+    changed=1
+    append_array FIXES "Disabled OpenClaw shell alias in $rc_file."
+  done
+
+  if [[ "$changed" -eq 1 ]]; then
+    REMEDIATION_APPLIED=1
+    record_remediation "openclaw_shell_shadowing" "applied" "commented openclaw alias in shell startup files"
   fi
 }
 
@@ -2057,9 +2209,18 @@ EOF
 deliver_report() {
   local report_text="$1"
   [[ "$NO_NOTIFY" -eq 1 ]] && return 0
+  if [[ "$REPORT_CHANNEL" == "none" || "$REPORT_CHANNEL" == "off" || "$REPORT_CHANNEL" == "disabled" ]]; then
+    clear_pending_report
+    return 0
+  fi
 
   if [[ "$REPORT_CHANNEL" == "telegram" && -z "$TELEGRAM_TARGET" ]]; then
     append_array ERRORS "Notification skipped because TELEGRAM_TARGET is empty."
+    NOTIFICATION_PENDING=1
+    return 1
+  fi
+  if [[ "$REPORT_CHANNEL" != "telegram" ]]; then
+    append_array ERRORS "Unsupported REPORT_CHANNEL=$REPORT_CHANNEL."
     NOTIFICATION_PENDING=1
     return 1
   fi
@@ -2175,6 +2336,8 @@ main() {
   maybe_migrate_pm2_gateway_to_systemd || true
 
   run_update_status || true
+  maybe_auto_remediate_openclaw_installations || true
+  maybe_auto_remediate_shell_openclaw_shadowing || true
   run_runtime_sanity || true
   run_telegram_sanity || true
   run_gateway_log_scan || true
