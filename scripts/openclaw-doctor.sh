@@ -170,6 +170,8 @@ OPENCLAW_REMEDIABLE_INSTALL_PATHS="${OPENCLAW_REMEDIABLE_INSTALL_PATHS:-$HOME/.n
 AUTO_REPAIR_OPENCLAW_LAUNCHER="${AUTO_REPAIR_OPENCLAW_LAUNCHER:-false}"
 OPENCLAW_LAUNCHER_PATH="${OPENCLAW_LAUNCHER_PATH:-$HOME/.local/share/pnpm/openclaw}"
 AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="${AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING:-false}"
+AUTO_REMEDIATE_CONFIG_VERSION_DRIFT="${AUTO_REMEDIATE_CONFIG_VERSION_DRIFT:-true}"
+AUTO_REFRESH_GATEWAY_SERVICE_AFTER_UPDATE="${AUTO_REFRESH_GATEWAY_SERVICE_AFTER_UPDATE:-true}"
 RESTART_MODE="${RESTART_MODE:-systemd_user}"
 SYSTEMD_UNIT_NAME="${SYSTEMD_UNIT_NAME:-openclaw-gateway.service}"
 RESTART_COMMAND="${RESTART_COMMAND:-}"
@@ -523,6 +525,7 @@ rotate_logs() {
 CURRENT_VERSION_BEFORE=""
 CURRENT_VERSION_AFTER=""
 AVAILABLE_VERSION=""
+UPDATE_AVAILABLE=0
 CHANNEL_VALUE=""
 UPDATE_ATTEMPTED=0
 UPDATE_SUCCEEDED=0
@@ -575,6 +578,10 @@ PROVIDER_EMPTY_INPUT_COUNT=0
 STUCK_SESSION_COUNT=0
 CONFIG_INVALID_COUNT=0
 UPDATE_PROVENANCE_WARNING_COUNT=0
+CONFIG_LAST_TOUCHED_VERSION=""
+CONFIG_VERSION_DRIFT=0
+CONFIG_VERSION_DRIFT_FINDING=""
+CONFIG_VERSION_DRIFT_ACTION=""
 
 load_previous_state() {
   if [[ -f "$STATE_FILE" ]] && jq empty "$STATE_FILE" >/dev/null 2>&1; then
@@ -701,6 +708,7 @@ persist_json() {
     --arg restartError "$RESTART_ERROR" \
     --arg healthError "$HEALTH_ERROR" \
     --arg configHealth "$CONFIG_HEALTH" \
+    --arg configLastTouchedVersion "$CONFIG_LAST_TOUCHED_VERSION" \
     --arg configRestoreDiff "$CONFIG_RESTORE_DIFF" \
     --arg openclawInstallations "$OPENCLAW_INSTALLATIONS_SUMMARY" \
     --arg gatewayExecStart "$GATEWAY_EXECSTART" \
@@ -713,6 +721,7 @@ persist_json() {
     --arg reportText "$report_text" \
     --argjson dryRun "$(json_bool "$DRY_RUN")" \
     --argjson updateAttempted "$(json_bool "$UPDATE_ATTEMPTED")" \
+    --argjson updateAvailable "$(json_bool "$UPDATE_AVAILABLE")" \
     --argjson updateSucceeded "$(json_bool "$UPDATE_SUCCEEDED")" \
     --argjson doctorAttempted "$(json_bool "$DOCTOR_ATTEMPTED")" \
     --argjson restartAttempted "$(json_bool "$RESTART_ATTEMPTED")" \
@@ -733,6 +742,7 @@ persist_json() {
     --argjson gatewayRestartsInWindow "$(json_int "$GATEWAY_RESTARTS_IN_WINDOW")" \
     --argjson configRestored "$(json_bool "$CONFIG_RESTORED")" \
     --argjson configBackupCreated "$(json_bool "$CONFIG_BACKUP_CREATED")" \
+    --argjson configVersionDrift "$(json_bool "$CONFIG_VERSION_DRIFT")" \
     --argjson diagnostics "$diagnostics_json" \
     --argjson sanityAttempted "$(json_bool "$SANITY_ATTEMPTED")" \
     --argjson sanityDegraded "$(json_bool "$SANITY_DEGRADED")" \
@@ -749,6 +759,7 @@ persist_json() {
       currentVersionBefore: $currentVersionBefore,
       currentVersionAfter: $currentVersionAfter,
       availableVersion: $availableVersion,
+      updateAvailable: $updateAvailable,
       channel: $channel,
       dryRun: $dryRun,
       updateAttempted: $updateAttempted,
@@ -773,6 +784,8 @@ persist_json() {
       gatewayRestartsInWindow: $gatewayRestartsInWindow,
       config: {
         health: $configHealth,
+        lastTouchedVersion: $configLastTouchedVersion,
+        versionDrift: $configVersionDrift,
         restored: $configRestored,
         backupCreated: $configBackupCreated,
         restoreDiff: $configRestoreDiff
@@ -1005,6 +1018,84 @@ extract_openclaw_version() {
   sed -nE 's/.*([0-9]{4}\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1
 }
 
+detect_openclaw_path_version() {
+  local path="$1"
+  local version_line=""
+
+  if [[ -x "$path" && ! -d "$path" ]]; then
+    version_line="$(timeout 5s "$path" --version 2>/dev/null | head -n 1 || true)"
+  elif [[ -f "$path/package.json" ]]; then
+    version_line="$(jq -r '.version // empty' "$path/package.json" 2>/dev/null)"
+  elif [[ -x "$path/openclaw.mjs" ]]; then
+    version_line="$(timeout 5s "$path/openclaw.mjs" --version 2>/dev/null | head -n 1 || true)"
+  fi
+
+  printf '%s' "$version_line" | extract_openclaw_version
+}
+
+version_less() {
+  local left="$1"
+  local right="$2"
+  [[ -n "$left" && -n "$right" && "$left" != "$right" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$left" "$right" | sort -V | head -n 1)" == "$left" ]]
+}
+
+read_config_last_touched_version() {
+  CONFIG_LAST_TOUCHED_VERSION=""
+  [[ -f "$OPENCLAW_CONFIG_FILE" ]] || return 0
+  jq empty "$OPENCLAW_CONFIG_FILE" >/dev/null 2>&1 || return 0
+
+  local raw
+  raw="$(jq -r '.meta.lastTouchedVersion // .wizard.lastRunVersion // empty' "$OPENCLAW_CONFIG_FILE" 2>/dev/null)"
+  CONFIG_LAST_TOUCHED_VERSION="$(printf '%s' "$raw" | extract_openclaw_version)"
+}
+
+detect_config_version_drift() {
+  read_config_last_touched_version
+  CONFIG_VERSION_DRIFT=0
+  [[ -n "$CONFIG_LAST_TOUCHED_VERSION" ]] || return 0
+
+  local current_version="$CURRENT_VERSION_BEFORE"
+  if [[ -z "$current_version" ]]; then
+    current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+  fi
+  [[ -n "$current_version" ]] || return 0
+
+  if version_less "$current_version" "$CONFIG_LAST_TOUCHED_VERSION"; then
+    CONFIG_VERSION_DRIFT=1
+    add_incident_code "openclaw_config_version_drift"
+    CONFIG_VERSION_DRIFT_FINDING="OpenClaw config was last written by $CONFIG_LAST_TOUCHED_VERSION, but active CLI reports $current_version."
+    if [[ "$AUTO_REMEDIATE_CONFIG_VERSION_DRIFT" == "true" ]]; then
+      CONFIG_VERSION_DRIFT_ACTION="Update the canonical OpenClaw runtime and refresh the gateway service before starting the gateway."
+      append_sanity_finding "$CONFIG_VERSION_DRIFT_FINDING"
+      append_array ACTIONS "$CONFIG_VERSION_DRIFT_ACTION"
+    else
+      append_sanity_critical "$CONFIG_VERSION_DRIFT_FINDING"
+      append_array ACTIONS "AUTO_REMEDIATE_CONFIG_VERSION_DRIFT is disabled; update the canonical OpenClaw runtime manually."
+      record_remediation "openclaw_config_version_drift" "blocked_by_policy" "auto remediation disabled"
+    fi
+  fi
+}
+
+mark_config_version_drift_remediated_if_current() {
+  [[ "$CONFIG_VERSION_DRIFT" -eq 1 ]] || return 0
+  [[ -n "$CONFIG_LAST_TOUCHED_VERSION" ]] || return 0
+
+  local current_version="$CURRENT_VERSION_AFTER"
+  if [[ -z "$current_version" ]]; then
+    current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+  fi
+  [[ -n "$current_version" ]] || return 0
+  version_less "$current_version" "$CONFIG_LAST_TOUCHED_VERSION" && return 0
+
+  CONFIG_VERSION_DRIFT=0
+  [[ -n "$CONFIG_VERSION_DRIFT_FINDING" ]] && remove_array_value SANITY_FINDINGS "$CONFIG_VERSION_DRIFT_FINDING"
+  [[ -n "$CONFIG_VERSION_DRIFT_ACTION" ]] && remove_array_value ACTIONS "$CONFIG_VERSION_DRIFT_ACTION"
+  if ((${#SANITY_FINDINGS[@]} == 0)); then
+    SANITY_DEGRADED=0
+  fi
+}
+
 resolve_expected_model_from_config() {
   [[ -n "$EXPECTED_OPENCLAW_MODEL" ]] && return 0
   local cfg_file="$OPENCLAW_STATE_HOME/openclaw.json"
@@ -1146,9 +1237,8 @@ maybe_auto_remediate_openclaw_installations() {
   for path in "${candidates[@]:-}"; do
     is_configured_remediable_openclaw_path "$path" || continue
 
-    if [[ -x "$path" ]]; then
-      version_line="$(timeout 5s "$path" --version 2>/dev/null | head -n 1 || true)"
-      version="$(printf '%s' "$version_line" | extract_openclaw_version)"
+    if [[ -e "$path" || -L "$path" ]]; then
+      version="$(detect_openclaw_path_version "$path")"
       if [[ -n "$version" && "$version" == "$current_version" ]]; then
         continue
       fi
@@ -1215,6 +1305,7 @@ maybe_auto_remediate_shell_openclaw_shadowing() {
 run_runtime_sanity() {
   [[ "$ENABLE_RUNTIME_SANITY" == "true" ]] || return 0
   SANITY_ATTEMPTED=1
+  detect_config_version_drift || true
   resolve_expected_model_from_config
   validate_openclaw_config_contracts || true
   scan_shell_openclaw_aliases || true
@@ -1851,7 +1942,13 @@ run_update_status() {
 
   CURRENT_VERSION_BEFORE="$("$OPENCLAW_BIN" --version 2>/dev/null | sed -E 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/' | head -n 1)"
   CURRENT_VERSION_AFTER="$CURRENT_VERSION_BEFORE"
-  AVAILABLE_VERSION="$(printf '%s' "$output" | jq -r '.availability.latestVersion // .update.registry.latestVersion // empty')"
+  UPDATE_AVAILABLE=0
+  if printf '%s' "$output" | jq -e '.availability.available == true' >/dev/null 2>&1; then
+    UPDATE_AVAILABLE=1
+    AVAILABLE_VERSION="$(printf '%s' "$output" | jq -r '.availability.latestVersion // .update.registry.latestVersion // empty')"
+  else
+    AVAILABLE_VERSION="$(printf '%s' "$output" | jq -r '.availability.latestVersion // empty')"
+  fi
   CHANNEL_VALUE="$(printf '%s' "$output" | jq -r '.channel.value // empty')"
   return 0
 }
@@ -1859,9 +1956,15 @@ run_update_status() {
 should_attempt_update() {
   [[ "$AUTO_UPDATE" == "true" ]] || return 1
   [[ "$CONFIG_HEALTH" != "invalid" ]] || return 1
+  (( CONSECUTIVE_FAILURES < MAX_CONSECUTIVE_UPDATE_FAILURES )) || return 1
+
+  if [[ "$CONFIG_VERSION_DRIFT" -eq 1 && "$AUTO_REMEDIATE_CONFIG_VERSION_DRIFT" == "true" ]]; then
+    return 0
+  fi
+
+  [[ "$UPDATE_AVAILABLE" -eq 1 ]] || return 1
   [[ -n "$AVAILABLE_VERSION" ]] || return 1
   [[ "$CURRENT_VERSION_BEFORE" != "$AVAILABLE_VERSION" ]] || return 1
-  (( CONSECUTIVE_FAILURES < MAX_CONSECUTIVE_UPDATE_FAILURES )) || return 1
   return 0
 }
 
@@ -1937,8 +2040,13 @@ run_update() {
   if [[ "$status" -eq 0 ]]; then
     UPDATE_SUCCEEDED=1
     CONSECUTIVE_FAILURES=0
-    CURRENT_VERSION_AFTER="$AVAILABLE_VERSION"
+    CURRENT_VERSION_AFTER="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+    [[ -n "$CURRENT_VERSION_AFTER" ]] || CURRENT_VERSION_AFTER="${AVAILABLE_VERSION:-$CONFIG_LAST_TOUCHED_VERSION}"
     append_array FIXES "OpenClaw update completed successfully."
+    if [[ "$CONFIG_VERSION_DRIFT" -eq 1 ]]; then
+      record_remediation "openclaw_config_version_drift" "applied" "updated canonical OpenClaw runtime after config version drift"
+      mark_config_version_drift_remediated_if_current
+    fi
     return 0
   fi
 
@@ -1962,8 +2070,13 @@ run_update() {
   if [[ "$status" -eq 0 ]]; then
     UPDATE_SUCCEEDED=1
     CONSECUTIVE_FAILURES=0
-    CURRENT_VERSION_AFTER="$AVAILABLE_VERSION"
+    CURRENT_VERSION_AFTER="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+    [[ -n "$CURRENT_VERSION_AFTER" ]] || CURRENT_VERSION_AFTER="${AVAILABLE_VERSION:-$CONFIG_LAST_TOUCHED_VERSION}"
     append_array FIXES "OpenClaw update succeeded on the retry."
+    if [[ "$CONFIG_VERSION_DRIFT" -eq 1 ]]; then
+      record_remediation "openclaw_config_version_drift" "applied" "updated canonical OpenClaw runtime after config version drift"
+      mark_config_version_drift_remediated_if_current
+    fi
     return 0
   fi
 
@@ -2027,6 +2140,40 @@ run_doctor_phase() {
   DOCTOR_OUTPUT="$output"
   DOCTOR_EXIT_CODE="$status"
   classify_doctor "$output" "$status"
+}
+
+refresh_gateway_service_after_update() {
+  [[ "$AUTO_REFRESH_GATEWAY_SERVICE_AFTER_UPDATE" == "true" ]] || return 0
+  [[ "$RESTART_MODE" == "systemd_user" ]] || return 0
+  command_exists systemctl || return 0
+
+  local port
+  port="$(jq -r '.gateway.port // empty' "$OPENCLAW_CONFIG_FILE" 2>/dev/null)"
+  [[ "$port" =~ ^[0-9]+$ ]] || port="${OPENCLAW_GATEWAY_PORT:-18789}"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would refresh OpenClaw gateway service install on port $port."
+    record_remediation "gateway_service_refresh" "would_apply" "would run gateway install --force"
+    return 0
+  fi
+
+  local output status
+  local cmd
+  build_openclaw_cmd cmd
+  cmd+=(gateway install --force --port "$port" --json)
+  run_capture output status "Refreshing gateway service install" "${cmd[@]}"
+
+  if [[ "$status" -eq 0 ]]; then
+    REMEDIATION_APPLIED=1
+    append_array FIXES "Refreshed OpenClaw gateway service install after update."
+    record_remediation "gateway_service_refresh" "applied" "ran gateway install --force on port $port"
+    return 0
+  fi
+
+  append_array ERRORS "Failed to refresh OpenClaw gateway service install after update."
+  append_array ACTIONS "Run openclaw gateway install --force --port $port manually and restart $SYSTEMD_UNIT_NAME."
+  record_remediation "gateway_service_refresh" "apply_failed" "$output"
+  return 1
 }
 
 restart_gateway() {
@@ -2408,6 +2555,11 @@ finalize_status() {
     return
   fi
 
+  if ((${#ERRORS[@]} > 0)); then
+    STATUS="FAILED"
+    return
+  fi
+
   if [[ "$SANITY_DEGRADED" -eq 1 ]]; then
     STATUS="DEGRADED"
     return
@@ -2425,11 +2577,6 @@ finalize_status() {
 
   if [[ "$DOCTOR_CLASSIFICATION" == "needs_manual_attention" || "$GATEWAY_HEALTHY" -eq 0 && "$RESTART_ATTEMPTED" -eq 1 ]]; then
     STATUS="DEGRADED"
-    return
-  fi
-
-  if ((${#ERRORS[@]} > 0)); then
-    STATUS="FAILED"
     return
   fi
 
@@ -2496,7 +2643,11 @@ main() {
   if should_attempt_update; then
     run_update || true
   fi
-  refresh_stale_gateway_service || true
+  if [[ "$UPDATE_SUCCEEDED" -eq 1 ]]; then
+    refresh_gateway_service_after_update || true
+  else
+    refresh_stale_gateway_service || true
+  fi
 
   run_doctor_phase
   maybe_auto_archive_orphan_transcripts || true

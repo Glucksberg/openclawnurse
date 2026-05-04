@@ -39,7 +39,7 @@ case "${1:-}" in
   update)
     case "${2:-}" in
       status)
-        printf '{"availability":{"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
+        printf '{"availability":{"available":true,"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
         ;;
       *)
         printf '{"ok":true}\n'
@@ -225,7 +225,7 @@ case "${1:-}" in
   update)
     case "${2:-}" in
       status)
-        printf '{"availability":{"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
+        printf '{"availability":{"available":true,"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
         ;;
       *)
         printf '{"ok":true}\n'
@@ -300,6 +300,149 @@ EOF
     fail "telegram sanity did not run when bot token was present without enabled=true"
 
   pass "telegram sanity runs for implicit bot token configs"
+}
+
+smoke_config_version_drift_forces_update() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/config-version-drift.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw"
+  printf '2026.0.9\n' >"$tmp/version"
+  cat >"$tmp/bin/openclaw" <<EOF
+#!/usr/bin/env bash
+
+if [[ "\${1:-}" == "--version" ]]; then
+  printf 'OpenClaw %s\n' "\$(cat "$tmp/version")"
+  exit 0
+fi
+
+case "\${1:-}" in
+  update)
+    case "\${2:-}" in
+      status)
+        printf '{"availability":{"available":false,"latestVersion":null},"update":{"registry":{"latestVersion":"2026.1.0"}},"channel":{"value":"stable"}}\n'
+        ;;
+      *)
+        printf '2026.1.0\n' >"$tmp/version"
+        printf '{"ok":true}\n'
+        ;;
+    esac
+    ;;
+  doctor)
+    printf 'doctor complete\n'
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  status)
+    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"meta":{"lastTouchedVersion":"2026.1.0"},"gateway":{"port":18789}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="true"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+RESTART_COMMAND="true"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e '
+    .status == "UPDATED"
+    and .updateAttempted == true
+    and .updateSucceeded == true
+    and .updateAvailable == false
+    and .config.lastTouchedVersion == "2026.1.0"
+    and .config.versionDrift == false
+    and (.sanity.findings | length) == 0
+    and any(.remediations[]; .code == "openclaw_config_version_drift" and .result == "applied")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "config version drift did not force and clear update remediation"
+
+  pass "config version drift forces update and clears after remediation"
+}
+
+smoke_config_version_drift_update_failure_is_failed() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/config-version-drift-failure.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw"
+  cat >"$tmp/bin/openclaw" <<'EOF'
+#!/usr/bin/env bash
+
+if [[ "${1:-}" == "--version" ]]; then
+  printf 'OpenClaw 2026.0.9\n'
+  exit 0
+fi
+
+case "${1:-}" in
+  update)
+    case "${2:-}" in
+      status)
+        printf '{"availability":{"available":false,"latestVersion":null},"channel":{"value":"stable"}}\n'
+        ;;
+      *)
+        printf 'update failed\n' >&2
+        exit 42
+        ;;
+    esac
+    ;;
+  doctor)
+    printf 'doctor complete\n'
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  status)
+    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"meta":{"lastTouchedVersion":"2026.1.0"}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="true"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+RESTART_COMMAND="true"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e '
+    .status == "FAILED"
+    and .updateAttempted == true
+    and .updateSucceeded == false
+    and .config.versionDrift == true
+    and (.errors | length) > 0
+    and any(.incidentCodes[]; . == "openclaw_config_version_drift")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "config version drift update failure did not fail the run"
+
+  pass "config version drift update failure is failed"
 }
 
 smoke_fleet_export_respects_openclaw_config() {
@@ -414,6 +557,8 @@ main() {
   smoke_self_test_uses_openclaw_telegram_token
   smoke_sanity_overrides_updated_status
   smoke_telegram_sanity_uses_implicit_bot_token
+  smoke_config_version_drift_forces_update
+  smoke_config_version_drift_update_failure_is_failed
   smoke_fleet_export_respects_openclaw_config
   smoke_dashboard_link_safety
   smoke_remediates_openclaw_installation_drift
