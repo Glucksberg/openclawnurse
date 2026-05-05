@@ -106,7 +106,7 @@ Quarantine is used instead of deletion so that changes remain reversible.
 - `systemd/`: `systemd --user` service/timer templates
 - `config/openclaw-doctor.env.example`: example config
 - `docs/`: setup and operator notes
-- `legacy/fleet/`: archived fleet/multihost experiment, not part of the active program
+- `legacy/openclawnurse-fleet-multihost-legacy-2026-05-05.tar.gz`: archived fleet/multihost experiment, not part of the active program
 
 ## Validation
 
@@ -115,7 +115,7 @@ Before publishing changes, run:
 ```bash
 bash -n install.sh
 for script in scripts/*.sh; do bash -n "$script"; done
-find config legacy -name '*.json' -print0 | xargs -0 -r -n1 jq empty
+find config -name '*.json' -print0 | xargs -0 -r -n1 jq empty
 scripts/test-smoke.sh
 ```
 
@@ -123,4 +123,4 @@ The GitHub Actions workflow runs the same validation. `shellcheck` is run as a n
 
 ## Legacy
 
-Older fleet and multihost experiments are preserved under `legacy/fleet/` for reference. They are no longer installed, scheduled, tested or described as part of OpenClawNurse's main runtime.
+Older fleet and multihost experiments are preserved as `legacy/openclawnurse-fleet-multihost-legacy-2026-05-05.tar.gz` for reference. They are no longer installed, scheduled, tested or described as part of OpenClawNurse's main runtime.

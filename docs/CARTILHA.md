@@ -4,7 +4,7 @@
 
 Esta cartilha resume a operacao padrao do OpenClawNurse em qualquer host com OpenClaw instalado. O objetivo e manter a instalacao local saudavel, com manutencao agendada, reparos seguros e relatorios auditaveis.
 
-A implementacao antiga de fleet/multihost foi arquivada em `legacy/fleet/` e nao faz parte do fluxo principal.
+A implementacao antiga de fleet/multihost foi compactada em `legacy/openclawnurse-fleet-multihost-legacy-2026-05-05.tar.gz` e nao faz parte do fluxo principal.
 
 ## Arquivos que importam agora
 
