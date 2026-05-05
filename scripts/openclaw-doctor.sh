@@ -160,16 +160,17 @@ ENABLE_TELEGRAM_SANITY="${ENABLE_TELEGRAM_SANITY:-true}"
 ENABLE_GATEWAY_LOG_SCAN="${ENABLE_GATEWAY_LOG_SCAN:-true}"
 EXPECTED_OPENCLAW_MODEL="${EXPECTED_OPENCLAW_MODEL:-}"
 EXPECTED_TELEGRAM_COMMANDS="${EXPECTED_TELEGRAM_COMMANDS:-new reset}"
+AUTO_REMEDIATE_TELEGRAM_COMMANDS="${AUTO_REMEDIATE_TELEGRAM_COMMANDS:-true}"
 GATEWAY_LOG_SINCE="${GATEWAY_LOG_SINCE:-last-run}"
 GATEWAY_LOG_FALLBACK_SINCE="${GATEWAY_LOG_FALLBACK_SINCE:-24 hours ago}"
 GATEWAY_LOG_MAX_LINES="${GATEWAY_LOG_MAX_LINES:-4000}"
 OPENCLAW_EXTRA_SCAN_PATHS="${OPENCLAW_EXTRA_SCAN_PATHS:-$HOME/openclaw/node_modules/.bin/openclaw $HOME/.local/share/pnpm/openclaw $HOME/.npm-global/bin/openclaw}"
 CHECK_SHELL_ALIASES="${CHECK_SHELL_ALIASES:-true}"
-AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS="${AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS:-false}"
-OPENCLAW_REMEDIABLE_INSTALL_PATHS="${OPENCLAW_REMEDIABLE_INSTALL_PATHS:-$HOME/.npm-global/bin/openclaw $HOME/.npm-global/lib/node_modules/openclaw $HOME/.local/share/pnpm/global/5/node_modules/openclaw}"
-AUTO_REPAIR_OPENCLAW_LAUNCHER="${AUTO_REPAIR_OPENCLAW_LAUNCHER:-false}"
+AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS="${AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS:-true}"
+OPENCLAW_REMEDIABLE_INSTALL_PATHS="${OPENCLAW_REMEDIABLE_INSTALL_PATHS:-$HOME/openclaw/node_modules/.bin/openclaw $HOME/.npm-global/bin/openclaw $HOME/.npm-global/lib/node_modules/openclaw $HOME/.local/share/pnpm/global/5/node_modules/openclaw}"
+AUTO_REPAIR_OPENCLAW_LAUNCHER="${AUTO_REPAIR_OPENCLAW_LAUNCHER:-true}"
 OPENCLAW_LAUNCHER_PATH="${OPENCLAW_LAUNCHER_PATH:-$HOME/.local/share/pnpm/openclaw}"
-AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="${AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING:-false}"
+AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="${AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING:-true}"
 AUTO_REMEDIATE_CONFIG_VERSION_DRIFT="${AUTO_REMEDIATE_CONFIG_VERSION_DRIFT:-true}"
 AUTO_REFRESH_GATEWAY_SERVICE_AFTER_UPDATE="${AUTO_REFRESH_GATEWAY_SERVICE_AFTER_UPDATE:-true}"
 RESTART_MODE="${RESTART_MODE:-systemd_user}"
@@ -229,6 +230,7 @@ append_array() {
   local name="$1"
   shift
   local value="$*"
+  [[ -n "$value" ]] || return 0
   local -n ref="$name"
   ref+=("$value")
 }
@@ -251,6 +253,7 @@ append_unique_array() {
   local name="$1"
   shift
   local value="$*"
+  [[ -n "$value" ]] || return 0
   local -n ref="$name"
   local item
   for item in "${ref[@]:-}"; do
@@ -268,6 +271,26 @@ append_sanity_critical() {
   SANITY_DEGRADED=1
   SANITY_CRITICAL=1
   append_array SANITY_FINDINGS "$*"
+}
+
+print_bullets_from_array() {
+  local name="$1"
+  local -n ref="$name"
+  local item
+  for item in "${ref[@]:-}"; do
+    [[ -n "$item" ]] || continue
+    printf -- '- %s\n' "$item"
+  done
+}
+
+array_has_nonempty() {
+  local name="$1"
+  local -n ref="$name"
+  local item
+  for item in "${ref[@]:-}"; do
+    [[ -n "$item" ]] && return 0
+  done
+  return 1
 }
 
 command_exists() {
@@ -1015,7 +1038,7 @@ maybe_restore_broken_config() {
 }
 
 extract_openclaw_version() {
-  sed -nE 's/.*([0-9]{4}\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1
+  sed -nE 's/.*([0-9]{4}\.[0-9]+\.[0-9]+([-+][0-9A-Za-z._-]+)?).*/\1/p' | head -n 1
 }
 
 detect_openclaw_path_version() {
@@ -1040,6 +1063,103 @@ version_less() {
   [[ "$(printf '%s\n%s\n' "$left" "$right" | sort -V | head -n 1)" == "$left" ]]
 }
 
+canonical_path() {
+  local path="$1"
+  if [[ -e "$path" || -L "$path" ]]; then
+    readlink -f "$path" 2>/dev/null || printf '%s\n' "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+path_is_same_or_inside() {
+  local path="$1"
+  local root="$2"
+  [[ -n "$path" && -n "$root" ]] || return 1
+  [[ "$path" == "$root" || "$path" == "$root"/* ]]
+}
+
+openclaw_package_root_from_path() {
+  local path="$1"
+  local real
+  real="$(canonical_path "$path")"
+
+  if [[ -d "$real" && -f "$real/package.json" ]]; then
+    if [[ "$(jq -r '.name // empty' "$real/package.json" 2>/dev/null)" == "openclaw" ]]; then
+      printf '%s\n' "$real"
+      return 0
+    fi
+  fi
+
+  case "$real" in
+    */node_modules/openclaw/*)
+      printf '%s\n' "${real%/node_modules/openclaw/*}/node_modules/openclaw"
+      return 0
+      ;;
+    */node_modules/openclaw)
+      printf '%s\n' "$real"
+      return 0
+      ;;
+  esac
+
+  if [[ -f "$real" ]]; then
+    local embedded
+    embedded="$(grep -oE '/[^"]*/node_modules/\.pnpm/openclaw@[^"]*/node_modules/openclaw/openclaw\.mjs' "$real" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$embedded" ]]; then
+      printf '%s\n' "${embedded%/openclaw.mjs}"
+      return 0
+    fi
+  fi
+}
+
+collect_protected_openclaw_paths() {
+  local -n protected_ref="$1"
+  local path real root unit_text exec_start entrypoint
+
+  if [[ "$OPENCLAW_BIN" == */* ]]; then
+    path="$OPENCLAW_BIN"
+  else
+    path="$(command -v "$OPENCLAW_BIN" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$path" ]]; then
+    real="$(canonical_path "$path")"
+    append_unique_array protected_ref "$path"
+    append_unique_array protected_ref "$real"
+    root="$(openclaw_package_root_from_path "$path")"
+    append_unique_array protected_ref "$root"
+  fi
+
+  if [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] && command_exists systemctl; then
+    unit_text="$(systemctl --user cat "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
+    exec_start="$(printf '%s\n' "$unit_text" | sed -n 's/^ExecStart=//p' | head -n 1)"
+    if [[ -n "$exec_start" ]]; then
+      entrypoint="$(printf '%s\n' "$exec_start" | awk '{for (i=1; i<=NF; i++) if (index($i, "openclaw/dist/") > 0) {print $i; exit}}')"
+      if [[ -n "$entrypoint" ]]; then
+        real="$(canonical_path "$entrypoint")"
+        append_unique_array protected_ref "$entrypoint"
+        append_unique_array protected_ref "$real"
+        root="$(openclaw_package_root_from_path "$entrypoint")"
+        append_unique_array protected_ref "$root"
+      fi
+    fi
+  fi
+}
+
+path_is_protected_openclaw() {
+  local path="$1"
+  shift
+  local real protected protected_real
+  real="$(canonical_path "$path")"
+  for protected in "$@"; do
+    [[ -n "$protected" ]] || continue
+    protected_real="$(canonical_path "$protected")"
+    path_is_same_or_inside "$real" "$protected_real" && return 0
+    path_is_same_or_inside "$protected_real" "$real" && return 0
+  done
+  return 1
+}
+
 read_config_last_touched_version() {
   CONFIG_LAST_TOUCHED_VERSION=""
   [[ -f "$OPENCLAW_CONFIG_FILE" ]] || return 0
@@ -1055,7 +1175,8 @@ detect_config_version_drift() {
   CONFIG_VERSION_DRIFT=0
   [[ -n "$CONFIG_LAST_TOUCHED_VERSION" ]] || return 0
 
-  local current_version="$CURRENT_VERSION_BEFORE"
+  local current_version="$CURRENT_VERSION_AFTER"
+  [[ -n "$current_version" ]] || current_version="$CURRENT_VERSION_BEFORE"
   if [[ -z "$current_version" ]]; then
     current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
   fi
@@ -1148,14 +1269,61 @@ scan_shell_openclaw_aliases() {
   for rc_file in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc"; do
     [[ -f "$rc_file" ]] || continue
     local rc_hits
-    rc_hits="$(grep -HnE '^[[:space:]]*(alias[[:space:]]+openclaw=|openclaw[[:space:]]*\(\)|function[[:space:]]+openclaw)' "$rc_file" 2>/dev/null || true)"
+    rc_hits="$(grep -HnE '^[[:space:]]*alias[[:space:]]+openclaw=' "$rc_file" 2>/dev/null || true)"
+    if ! grep -Fq 'openclawnurse disabled shell function shadowing: openclaw' "$rc_file"; then
+      local fn_hits
+      fn_hits="$(grep -HnE '^[[:space:]]*(openclaw[[:space:]]*\(\)|function[[:space:]]+openclaw)' "$rc_file" 2>/dev/null || true)"
+      [[ -n "$fn_hits" ]] && rc_hits="${rc_hits}${rc_hits:+$'\n'}${fn_hits}"
+    fi
     [[ -n "$rc_hits" ]] && hits="${hits}${hits:+$'\n'}${rc_hits}"
   done
 
   if [[ -n "$hits" ]]; then
-    append_sanity_finding "Shell startup files define openclaw aliases/functions; verify they do not shadow the installed CLI."
-    append_array ACTIONS "Inspect shell openclaw aliases/functions if CLI and gateway versions diverge."
+    if [[ "$AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING" == "true" ]]; then
+      append_sanity_finding "Shell startup files still define openclaw aliases/functions after automatic remediation."
+      append_array ACTIONS "Inspect shell openclaw aliases/functions if CLI and gateway versions diverge."
+    else
+      append_sanity_finding "Shell startup files define openclaw aliases/functions; verify they do not shadow the installed CLI."
+      append_array ACTIONS "Inspect shell openclaw aliases/functions if CLI and gateway versions diverge."
+    fi
   fi
+}
+
+reset_sanity_state_for_final_pass() {
+  SANITY_FINDINGS=()
+  SANITY_DEGRADED=0
+  SANITY_CRITICAL=0
+  OPENCLAW_INSTALLATIONS_SUMMARY=""
+  GATEWAY_EXECSTART=""
+  GATEWAY_SERVICE_VERSION=""
+  GATEWAY_PACKAGE_VERSION=""
+  GATEWAY_MODEL_DETECTED=""
+  TELEGRAM_COMMANDS_SUMMARY=""
+  GATEWAY_LOG_SUMMARY=""
+  PROVIDER_EMPTY_INPUT_COUNT=0
+  STUCK_SESSION_COUNT=0
+  CONFIG_INVALID_COUNT=0
+  UPDATE_PROVENANCE_WARNING_COUNT=0
+
+  remove_array_value ACTIONS "Inspect shell openclaw aliases/functions if CLI and gateway versions diverge."
+  remove_array_value ACTIONS "Remove or update stale OpenClaw installations that can shadow the current CLI."
+  remove_array_value ACTIONS "Converge OpenClaw binaries to a single version in PATH and service definitions."
+  remove_array_value ACTIONS "Reinstall or refresh the gateway service so it points to the current OpenClaw runtime."
+  remove_array_value ACTIONS "Restart/reinstall the OpenClaw gateway from the active OpenClaw installation."
+  remove_array_value ACTIONS "Configure the OpenClaw Telegram bot token or disable the Telegram channel."
+  remove_array_value ACTIONS "Check Telegram network connectivity and the OpenClaw bot token."
+  remove_array_value ACTIONS "Restart the gateway or re-enable native Telegram commands so required slash commands are registered."
+  remove_array_value ACTIONS "Inspect recent ingress commands; a command may be reaching OpenClaw but producing an empty provider prompt."
+  remove_array_value ACTIONS "Inspect active Telegram/OpenClaw sessions if stuck session diagnostics continue."
+  remove_array_value ACTIONS "Review OpenClaw install provenance if updates or gateway restarts are skipped."
+  remove_array_value ACTIONS "Restart the gateway or update the OpenClaw default model configuration."
+}
+
+run_final_sanity_pass() {
+  reset_sanity_state_for_final_pass
+  run_runtime_sanity || true
+  run_telegram_sanity || true
+  run_gateway_log_scan || true
 }
 
 is_configured_remediable_openclaw_path() {
@@ -1177,6 +1345,9 @@ quarantine_openclaw_path() {
   fi
   [[ -e "$path" || -L "$path" ]] || return 0
   mkdir -p "$(dirname "$dest")"
+  if [[ -e "$dest" || -L "$dest" ]]; then
+    dest="${dest}.$(date +%s)"
+  fi
   mv "$path" "$dest"
   append_array FIXES "Quarantined stale OpenClaw path $path."
 }
@@ -1216,11 +1387,15 @@ write_openclaw_launcher() {
 maybe_auto_remediate_openclaw_installations() {
   [[ "$AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS" == "true" ]] || return 0
 
-  local current_version="$CURRENT_VERSION_BEFORE"
+  local current_version="$CURRENT_VERSION_AFTER"
+  [[ -n "$current_version" ]] || current_version="$CURRENT_VERSION_BEFORE"
   if [[ -z "$current_version" && -x "$OPENCLAW_BIN" ]]; then
     current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
   fi
   [[ -n "$current_version" ]] || return 0
+
+  local protected_paths=()
+  collect_protected_openclaw_paths protected_paths
 
   local candidates=()
   local candidate
@@ -1233,9 +1408,10 @@ maybe_auto_remediate_openclaw_installations() {
     [[ -e "$candidate" || -L "$candidate" ]] && append_unique_array candidates "$candidate"
   done
 
-  local path version_line version stale_found=0
+  local path version package_root quarantine_targets=() target stale_found=0 remediated_count=0
   for path in "${candidates[@]:-}"; do
     is_configured_remediable_openclaw_path "$path" || continue
+    path_is_protected_openclaw "$path" "${protected_paths[@]:-}" && continue
 
     if [[ -e "$path" || -L "$path" ]]; then
       version="$(detect_openclaw_path_version "$path")"
@@ -1243,6 +1419,12 @@ maybe_auto_remediate_openclaw_installations() {
         continue
       fi
       [[ -z "$version" ]] && version="unknown"
+      quarantine_targets=("$path")
+      package_root="$(openclaw_package_root_from_path "$path")"
+      if [[ -n "$package_root" && "$package_root" != "$path" ]]; then
+        append_unique_array quarantine_targets "$package_root"
+      fi
+
       if [[ "$DRY_RUN" -eq 1 ]]; then
         append_sanity_finding "OpenClaw stale installation would be remediated: $path reports $version while active CLI reports $current_version."
       else
@@ -1254,16 +1436,24 @@ maybe_auto_remediate_openclaw_installations() {
       else
         append_array FIXES "Remediated OpenClaw stale installation path: $path was present but was not the active CLI."
       fi
+      quarantine_targets=("$path")
     fi
 
     stale_found=1
     add_incident_code "openclaw_installation_drift"
-    quarantine_openclaw_path "$path"
+    for target in "${quarantine_targets[@]:-}"; do
+      [[ -n "$target" ]] || continue
+      path_is_protected_openclaw "$target" "${protected_paths[@]:-}" && continue
+      if [[ -e "$target" || -L "$target" ]]; then
+        quarantine_openclaw_path "$target"
+        remediated_count=$((remediated_count + 1))
+      fi
+    done
   done
 
   if [[ "$stale_found" -eq 1 ]]; then
-    REMEDIATION_APPLIED=1
-    record_remediation "openclaw_installation_drift" "$([[ "$DRY_RUN" -eq 1 ]] && printf would_apply || printf applied)" "quarantined configured stale OpenClaw install paths"
+    [[ "$DRY_RUN" -eq 1 || "$remediated_count" -gt 0 ]] && REMEDIATION_APPLIED=1
+    record_remediation "openclaw_installation_drift" "$([[ "$DRY_RUN" -eq 1 ]] && printf would_apply || printf applied)" "quarantined $remediated_count configured stale OpenClaw install path(s)"
   fi
 
   write_openclaw_launcher
@@ -1276,29 +1466,44 @@ maybe_auto_remediate_shell_openclaw_shadowing() {
   local rc_file changed=0
   for rc_file in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile" "$HOME/.zshrc"; do
     [[ -f "$rc_file" ]] || continue
-    grep -Eq '^[[:space:]]*alias[[:space:]]+openclaw=' "$rc_file" || continue
+    local has_alias=0 has_function=0
+    grep -Eq '^[[:space:]]*alias[[:space:]]+openclaw=' "$rc_file" && has_alias=1
+    if ! grep -Fq 'openclawnurse disabled shell function shadowing: openclaw' "$rc_file" &&
+      grep -Eq '^[[:space:]]*(openclaw[[:space:]]*\(\)|function[[:space:]]+openclaw)' "$rc_file"; then
+      has_function=1
+    fi
+    [[ "$has_alias" -eq 1 || "$has_function" -eq 1 ]] || continue
+
     add_incident_code "openclaw_shell_shadowing"
     if [[ "$DRY_RUN" -eq 1 ]]; then
-      append_array FIXES "Dry-run: would disable OpenClaw shell alias in $rc_file."
-      record_remediation "openclaw_shell_shadowing" "would_apply" "would comment alias in $rc_file"
+      append_array FIXES "Dry-run: would disable OpenClaw shell shadowing in $rc_file."
+      record_remediation "openclaw_shell_shadowing" "would_apply" "would neutralize openclaw alias/function in $rc_file"
       continue
     fi
     cp "$rc_file" "$rc_file.openclawnurse-$RUN_ID.bak"
-    awk '
-      /^[[:space:]]*alias[[:space:]]+openclaw=/ {
-        print "# openclawnurse disabled shell shadowing: " $0
-        next
-      }
-      { print }
-    ' "$rc_file" >"$rc_file.tmp.$RUN_ID"
-    mv "$rc_file.tmp.$RUN_ID" "$rc_file"
+    if [[ "$has_alias" -eq 1 ]]; then
+      awk '
+        /^[[:space:]]*alias[[:space:]]+openclaw=/ {
+          print "# openclawnurse disabled shell alias shadowing: " $0
+          next
+        }
+        { print }
+      ' "$rc_file" >"$rc_file.tmp.$RUN_ID"
+      mv "$rc_file.tmp.$RUN_ID" "$rc_file"
+    fi
+    if [[ "$has_function" -eq 1 ]]; then
+      {
+        printf '\n# openclawnurse disabled shell function shadowing: openclaw\n'
+        printf 'unset -f openclaw 2>/dev/null || true\n'
+      } >>"$rc_file"
+    fi
     changed=1
-    append_array FIXES "Disabled OpenClaw shell alias in $rc_file."
+    append_array FIXES "Disabled OpenClaw shell shadowing in $rc_file."
   done
 
   if [[ "$changed" -eq 1 ]]; then
     REMEDIATION_APPLIED=1
-    record_remediation "openclaw_shell_shadowing" "applied" "commented openclaw alias in shell startup files"
+    record_remediation "openclaw_shell_shadowing" "applied" "neutralized openclaw alias/function in shell startup files"
   fi
 }
 
@@ -1311,7 +1516,8 @@ run_runtime_sanity() {
   scan_shell_openclaw_aliases || true
 
   local current_version
-  current_version="$CURRENT_VERSION_BEFORE"
+  current_version="$CURRENT_VERSION_AFTER"
+  [[ -n "$current_version" ]] || current_version="$CURRENT_VERSION_BEFORE"
   if [[ -z "$current_version" ]]; then
     current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
   fi
@@ -1355,7 +1561,7 @@ run_runtime_sanity() {
     unit_text="$(systemctl --user cat "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
     GATEWAY_EXECSTART="$(printf '%s\n' "$unit_text" | sed -n 's/^ExecStart=//p' | head -n 1)"
     GATEWAY_SERVICE_VERSION="$(printf '%s\n' "$unit_text" | sed -nE 's/^Description=.*\(v([^)]*)\).*/\1/p' | head -n 1)"
-    GATEWAY_PACKAGE_VERSION="$(printf '%s\n' "$GATEWAY_EXECSTART" | sed -nE 's/.*openclaw@([0-9]{4}\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1)"
+    GATEWAY_PACKAGE_VERSION="$(printf '%s\n' "$GATEWAY_EXECSTART" | sed -nE 's/.*openclaw@([0-9]{4}\.[0-9]+\.[0-9]+([-+][0-9A-Za-z._-]+)?).*/\1/p' | head -n 1)"
 
     if [[ -n "$current_version" && -n "$GATEWAY_SERVICE_VERSION" && "$GATEWAY_SERVICE_VERSION" != "$current_version" ]]; then
       append_sanity_finding "Gateway service description version is $GATEWAY_SERVICE_VERSION, but CLI reports $current_version."
@@ -1417,6 +1623,44 @@ run_telegram_sanity() {
 
   if ((${#missing[@]} > 0)); then
     TELEGRAM_COMMANDS_SUMMARY="$TELEGRAM_COMMANDS_SUMMARY; missing=${missing[*]}"
+    if [[ "$AUTO_REMEDIATE_TELEGRAM_COMMANDS" == "true" ]]; then
+      local desired_commands set_payload set_response set_status
+      desired_commands="$(printf '%s' "$response" | jq -c --arg required "$EXPECTED_TELEGRAM_COMMANDS" '
+        def desc($command):
+          if $command == "new" then "Start a new OpenClaw conversation"
+          elif $command == "reset" then "Reset the current OpenClaw conversation"
+          else "Run OpenClaw " + $command
+          end;
+        (.result // []) as $existing
+        | ($required | split(" ") | map(select(length > 0))) as $requiredCommands
+        | reduce $requiredCommands[] as $command
+            ($existing | map({command, description: (.description // desc(.command))});
+             if any(.[]; .command == $command) then .
+             else . + [{command: $command, description: desc($command)}]
+             end)
+      ' 2>/dev/null || printf '[]')"
+      set_payload="$(jq -cn --argjson commands "$desired_commands" '{commands: $commands}' 2>/dev/null || printf '')"
+
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        append_array FIXES "Dry-run: would register Telegram native commands: ${missing[*]}."
+        record_remediation "telegram_native_commands" "would_apply" "would call setMyCommands for ${missing[*]}"
+        return 0
+      fi
+
+      if [[ -n "$set_payload" ]]; then
+        set_response="$(curl -sS --connect-timeout 10 --max-time 30 -X POST -H 'content-type: application/json' -d "$set_payload" "$TELEGRAM_API_BASE_URL/bot$token/setMyCommands" 2>&1)"
+        set_status=$?
+        if [[ "$set_status" -eq 0 ]] && printf '%s' "$set_response" | jq -e '.ok == true' >/dev/null 2>&1; then
+          REMEDIATION_APPLIED=1
+          append_array FIXES "Registered Telegram native commands: ${missing[*]}."
+          record_remediation "telegram_native_commands" "applied" "setMyCommands registered ${missing[*]}"
+          TELEGRAM_COMMANDS_SUMMARY="$TELEGRAM_COMMANDS_SUMMARY; remediated=${missing[*]}"
+          return 0
+        fi
+      fi
+
+      record_remediation "telegram_native_commands" "apply_failed" "setMyCommands failed"
+    fi
     append_sanity_finding "Telegram native command menu is missing required commands: ${missing[*]}."
     append_array ACTIONS "Restart the gateway or re-enable native Telegram commands so required slash commands are registered."
   else
@@ -2051,7 +2295,6 @@ run_update() {
   fi
 
   UPDATE_ERROR="$output"
-  append_array ERRORS "OpenClaw update failed on the first attempt."
 
   local doctor_repair_output doctor_repair_status
   local repair_cmd
@@ -2070,9 +2313,10 @@ run_update() {
   if [[ "$status" -eq 0 ]]; then
     UPDATE_SUCCEEDED=1
     CONSECUTIVE_FAILURES=0
+    UPDATE_ERROR=""
     CURRENT_VERSION_AFTER="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
     [[ -n "$CURRENT_VERSION_AFTER" ]] || CURRENT_VERSION_AFTER="${AVAILABLE_VERSION:-$CONFIG_LAST_TOUCHED_VERSION}"
-    append_array FIXES "OpenClaw update succeeded on the retry."
+    append_array FIXES "OpenClaw update failed on the first attempt, then succeeded after doctor repair."
     if [[ "$CONFIG_VERSION_DRIFT" -eq 1 ]]; then
       record_remediation "openclaw_config_version_drift" "applied" "updated canonical OpenClaw runtime after config version drift"
       mark_config_version_drift_remediated_if_current
@@ -2462,19 +2706,19 @@ EOF
     printf '\nDoctor highlights:\n%s\n' "$summary_lines"
   fi
 
-  if ((${#SANITY_FINDINGS[@]} > 0)); then
+  if array_has_nonempty SANITY_FINDINGS; then
     printf '\nSanity findings:\n'
-    printf -- '- %s\n' "${SANITY_FINDINGS[@]}"
+    print_bullets_from_array SANITY_FINDINGS
   fi
 
-  if ((${#FIXES[@]} > 0)); then
+  if array_has_nonempty FIXES; then
     printf '\nActions applied:\n'
-    printf -- '- %s\n' "${FIXES[@]}"
+    print_bullets_from_array FIXES
   fi
 
-  if ((${#INCIDENT_CODES[@]} > 0)); then
+  if array_has_nonempty INCIDENT_CODES; then
     printf '\nIncident codes:\n'
-    printf -- '- %s\n' "${INCIDENT_CODES[@]}"
+    print_bullets_from_array INCIDENT_CODES
   fi
 
   if ((${#REMEDIATIONS[@]} > 0)); then
@@ -2486,14 +2730,14 @@ EOF
     done
   fi
 
-  if ((${#ERRORS[@]} > 0)); then
+  if array_has_nonempty ERRORS; then
     printf '\nErrors:\n'
-    printf -- '- %s\n' "${ERRORS[@]}"
+    print_bullets_from_array ERRORS
   fi
 
-  if ((${#ACTIONS[@]} > 0)); then
+  if array_has_nonempty ACTIONS; then
     printf '\nManual follow-up:\n'
-    printf -- '- %s\n' "${ACTIONS[@]}"
+    print_bullets_from_array ACTIONS
   fi
 }
 
@@ -2663,6 +2907,7 @@ main() {
     maybe_auto_restart_unhealthy_gateway || true
   fi
 
+  run_final_sanity_pass
   collect_diagnostics
   finalize_status
 

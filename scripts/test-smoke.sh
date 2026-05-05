@@ -302,6 +302,83 @@ EOF
   pass "telegram sanity runs for implicit bot token configs"
 }
 
+smoke_telegram_commands_are_remediated() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/telegram-commands.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/bin/curl" <<EOF
+#!/usr/bin/env bash
+payload=""
+url=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    -d)
+      payload="\${2:-}"
+      shift 2
+      ;;
+    http*)
+      url="\$1"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+if [[ "\$url" == *getMyCommands ]]; then
+  if [[ -f "$tmp/commands-set" ]]; then
+    printf '{"ok":true,"result":[{"command":"new","description":"Start a new OpenClaw conversation"},{"command":"reset","description":"Reset the current OpenClaw conversation"}]}\n'
+  else
+    printf '{"ok":true,"result":[]}\n'
+  fi
+  exit 0
+fi
+
+if [[ "\$url" == *setMyCommands ]]; then
+  printf '%s\n' "\$payload" >"$tmp/set-payload.json"
+  touch "$tmp/commands-set"
+  printf '{"ok":true,"result":true}\n'
+  exit 0
+fi
+
+printf '{"ok":false}\n'
+exit 1
+EOF
+  chmod +x "$tmp/bin/curl"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"channels":{"telegram":{"botToken":"fake-token"}}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="true"
+ENABLE_GATEWAY_LOG_SCAN="false"
+TELEGRAM_API_BASE_URL="http://telegram.test"
+CONFIG_BACKUP_ENABLED="false"
+EOF
+
+  PATH="$tmp/bin:$PATH" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e '
+    .status == "OK"
+    and (.sanity.findings | length) == 0
+    and any(.fixes[]; contains("Registered Telegram native commands"))
+    and any(.remediations[]; .code == "telegram_native_commands" and .result == "applied")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "telegram native commands were not remediated"
+  "$JQ_BIN" -e '[.commands[].command] as $commands | ($commands | index("new")) and ($commands | index("reset"))' \
+    "$tmp/set-payload.json" >/dev/null ||
+    fail "setMyCommands payload did not include required commands"
+
+  pass "telegram native commands are remediated"
+}
+
 smoke_config_version_drift_forces_update() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/config-version-drift.XXXXXX")"
@@ -445,6 +522,87 @@ EOF
   pass "config version drift update failure is failed"
 }
 
+smoke_update_retry_success_is_not_failed() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/update-retry.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw"
+  printf '2026.1.0\n' >"$tmp/version"
+  printf '0\n' >"$tmp/update-attempts"
+  cat >"$tmp/bin/openclaw" <<EOF
+#!/usr/bin/env bash
+
+if [[ "\${1:-}" == "--version" ]]; then
+  printf 'OpenClaw %s\n' "\$(cat "$tmp/version")"
+  exit 0
+fi
+
+case "\${1:-}" in
+  update)
+    case "\${2:-}" in
+      status)
+        printf '{"availability":{"available":true,"latestVersion":"2026.1.1-1"},"channel":{"value":"stable"}}\n'
+        ;;
+      *)
+        attempts="\$(cat "$tmp/update-attempts")"
+        attempts=\$((attempts + 1))
+        printf '%s\n' "\$attempts" >"$tmp/update-attempts"
+        if [[ "\$attempts" -eq 1 ]]; then
+          printf 'transient registry failure\n' >&2
+          exit 1
+        fi
+        printf '2026.1.1-1\n' >"$tmp/version"
+        printf '{"ok":true}\n'
+        ;;
+    esac
+    ;;
+  doctor)
+    printf 'doctor complete\n'
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  status)
+    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"gateway":{"port":18789}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="true"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+RESTART_COMMAND="true"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e '
+    .status == "UPDATED"
+    and .updateAttempted == true
+    and .updateSucceeded == true
+    and .currentVersionAfter == "2026.1.1-1"
+    and (.errors | length) == 0
+    and .errorsByPhase.update == ""
+    and any(.fixes[]; contains("failed on the first attempt, then succeeded"))
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "successful update retry was still reported as failed"
+
+  pass "successful update retry is not reported as failed"
+}
+
 smoke_fleet_export_respects_openclaw_config() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/fleet-export.XXXXXX")"
@@ -538,13 +696,78 @@ EOF
     fail "stale OpenClaw package dir was not quarantined"
   "$tmp/home/.local/share/pnpm/openclaw" --version | grep -Fq 'OpenClaw 2026.1.0' ||
     fail "OpenClaw launcher was not repaired"
-  grep -Fq '# openclawnurse disabled shell shadowing:' "$tmp/home/.bashrc" ||
+  grep -Fq '# openclawnurse disabled shell alias shadowing:' "$tmp/home/.bashrc" ||
     fail "OpenClaw shell alias was not disabled"
   "$JQ_BIN" -e '(.status == "OK") and any(.fixes[]; contains("Remediated OpenClaw stale installation"))' \
     "$tmp/state/doctor-state.json" >/dev/null ||
     fail "installation drift remediation was not recorded as an OK run"
 
   pass "openclaw installation drift is remediated"
+}
+
+smoke_default_deduplicates_local_openclaw_shim() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/local-shim-drift.XXXXXX")"
+
+  mkdir -p \
+    "$tmp/home/.npm-global/bin" \
+    "$tmp/home/openclaw/node_modules/.bin" \
+    "$tmp/home/openclaw/node_modules/.pnpm/openclaw@2026.0.8/node_modules/openclaw/dist" \
+    "$tmp/state" \
+    "$tmp/cfg"
+
+  make_fake_openclaw "$tmp/home/.npm-global/bin/openclaw"
+  cat >"$tmp/home/openclaw/node_modules/.pnpm/openclaw@2026.0.8/node_modules/openclaw/package.json" <<'EOF'
+{"name":"openclaw","version":"2026.0.8"}
+EOF
+  cat >"$tmp/home/openclaw/node_modules/.pnpm/openclaw@2026.0.8/node_modules/openclaw/dist/entry.js" <<'EOF'
+#!/usr/bin/env bash
+printf 'OpenClaw 2026.0.8\n'
+EOF
+  chmod +x "$tmp/home/openclaw/node_modules/.pnpm/openclaw@2026.0.8/node_modules/openclaw/dist/entry.js"
+  cat >"$tmp/home/openclaw/node_modules/.bin/openclaw" <<EOF
+#!/usr/bin/env bash
+exec node "$tmp/home/openclaw/node_modules/.pnpm/openclaw@2026.0.8/node_modules/openclaw/openclaw.mjs" "\$@"
+EOF
+  chmod +x "$tmp/home/openclaw/node_modules/.bin/openclaw"
+  cat >"$tmp/home/openclaw/node_modules/.pnpm/openclaw@2026.0.8/node_modules/openclaw/openclaw.mjs" <<'EOF'
+#!/usr/bin/env bash
+printf 'OpenClaw 2026.0.8\n'
+EOF
+  chmod +x "$tmp/home/openclaw/node_modules/.pnpm/openclaw@2026.0.8/node_modules/openclaw/openclaw.mjs"
+  cat >"$tmp/home/.bashrc" <<'EOF'
+openclaw() {
+  "$HOME/openclaw/node_modules/.bin/openclaw" "$@"
+}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/home/.npm-global/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  [[ ! -e "$tmp/home/openclaw/node_modules/.bin/openclaw" ]] ||
+    fail "stale local OpenClaw shim was not quarantined by default"
+  [[ ! -e "$tmp/home/openclaw/node_modules/.pnpm/openclaw@2026.0.8/node_modules/openclaw" ]] ||
+    fail "stale local OpenClaw package root was not quarantined by default"
+  grep -Fq 'openclawnurse disabled shell function shadowing: openclaw' "$tmp/home/.bashrc" ||
+    fail "OpenClaw shell function was not neutralized"
+  "$JQ_BIN" -e '
+    .status == "OK"
+    and (.sanity.findings | length) == 0
+    and any(.remediations[]; .code == "openclaw_installation_drift" and .result == "applied")
+    and any(.remediations[]; .code == "openclaw_shell_shadowing" and .result == "applied")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "default local shim deduplication did not produce a clean OK run"
+
+  pass "default deduplicates local OpenClaw shim and shell function"
 }
 
 main() {
@@ -557,11 +780,14 @@ main() {
   smoke_self_test_uses_openclaw_telegram_token
   smoke_sanity_overrides_updated_status
   smoke_telegram_sanity_uses_implicit_bot_token
+  smoke_telegram_commands_are_remediated
   smoke_config_version_drift_forces_update
   smoke_config_version_drift_update_failure_is_failed
+  smoke_update_retry_success_is_not_failed
   smoke_fleet_export_respects_openclaw_config
   smoke_dashboard_link_safety
   smoke_remediates_openclaw_installation_drift
+  smoke_default_deduplicates_local_openclaw_shim
 }
 
 main "$@"

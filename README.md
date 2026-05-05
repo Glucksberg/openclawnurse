@@ -56,16 +56,16 @@ Por padrao, ele tenta remediar automaticamente dois tipos de sujeira operacional
 - arquivos `*.trajectory.jsonl` orfaos apontados pelo `openclaw doctor`
 - config `openclaw.json` invalida, restaurando o ultimo backup JSON valido quando existir
 
-Em hosts com politica de uma unica instalacao do OpenClaw, escolha explicitamente o binario canonico e habilite a remediacao de deriva:
+Em hosts com politica de uma unica instalacao do OpenClaw, o Nurse deduplica instalacoes divergentes por padrao. Ele protege automaticamente o `OPENCLAW_BIN` ativo e o runtime usado pelo `openclaw-gateway.service`; caminhos antigos configurados como remediaveis sao movidos para quarentena:
 
-- `OPENCLAW_BIN="$HOME/openclaw/node_modules/.bin/openclaw"`
+- `OPENCLAW_BIN="$HOME/.npm-global/bin/openclaw"`
 - `AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS="true"`
-- `OPENCLAW_REMEDIABLE_INSTALL_PATHS="$HOME/.npm-global/bin/openclaw $HOME/.npm-global/lib/node_modules/openclaw $HOME/.local/share/pnpm/global/5/node_modules/openclaw"`
+- `OPENCLAW_REMEDIABLE_INSTALL_PATHS="$HOME/openclaw/node_modules/.bin/openclaw $HOME/.npm-global/bin/openclaw $HOME/.npm-global/lib/node_modules/openclaw $HOME/.local/share/pnpm/global/5/node_modules/openclaw"`
 - `AUTO_REPAIR_OPENCLAW_LAUNCHER="true"`
 - `OPENCLAW_LAUNCHER_PATH="$HOME/.local/share/pnpm/openclaw"`
 - `AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="true"`
 
-Essa remediacao nao apaga os caminhos divergentes: ela move os artefatos para `~/.local/state/openclawnurse/quarantine/` e deixa o report registrar o que foi feito.
+Essa remediacao nao apaga os caminhos divergentes: ela move os artefatos para `~/.local/state/openclawnurse/quarantine/` e deixa o report registrar o que foi feito. Aliases antigos sao comentados com backup do arquivo de shell; funcoes `openclaw` recebem um `unset -f openclaw` marcado pelo Nurse para evitar shadowing.
 
 ## Alertas pelo proprio OpenClaw
 
