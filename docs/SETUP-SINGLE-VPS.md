@@ -1,6 +1,6 @@
-# Setup Rapido: VPS Isolada
+# Setup Rapido: Host OpenClaw
 
-Use este guia quando a VPS vai operar sozinha, sem fleet e sem host central.
+Use este guia para instalar o OpenClawNurse em um host que ja roda OpenClaw.
 
 ## 1. Baixar e instalar
 

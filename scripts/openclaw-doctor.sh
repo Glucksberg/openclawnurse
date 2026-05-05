@@ -90,7 +90,9 @@ prepend_path() {
 
 bootstrap_path() {
   local extra_dir
+  local default_pnpm_home="$HOME/.local/share/pnpm"
   local candidates=(
+    "$default_pnpm_home"
     "$HOME/.npm-global/bin"
     "$HOME/.local/bin"
     "$HOME/bin"
@@ -113,6 +115,10 @@ bootstrap_path() {
   for dir in "${candidates[@]}"; do
     prepend_path "$dir"
   done
+  if [[ -z "${PNPM_HOME:-}" && -d "$default_pnpm_home" ]]; then
+    PNPM_HOME="$default_pnpm_home"
+    export PNPM_HOME
+  fi
   export PATH
 }
 
@@ -1038,7 +1044,7 @@ maybe_restore_broken_config() {
 }
 
 extract_openclaw_version() {
-  sed -nE 's/.*([0-9]{4}\.[0-9]+\.[0-9]+([-+][0-9A-Za-z._-]+)?).*/\1/p' | head -n 1
+  sed -nE 's/.*([0-9]{4}\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?).*/\1/p' | head -n 1
 }
 
 detect_openclaw_path_version() {
@@ -1561,7 +1567,7 @@ run_runtime_sanity() {
     unit_text="$(systemctl --user cat "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
     GATEWAY_EXECSTART="$(printf '%s\n' "$unit_text" | sed -n 's/^ExecStart=//p' | head -n 1)"
     GATEWAY_SERVICE_VERSION="$(printf '%s\n' "$unit_text" | sed -nE 's/^Description=.*\(v([^)]*)\).*/\1/p' | head -n 1)"
-    GATEWAY_PACKAGE_VERSION="$(printf '%s\n' "$GATEWAY_EXECSTART" | sed -nE 's/.*openclaw@([0-9]{4}\.[0-9]+\.[0-9]+([-+][0-9A-Za-z._-]+)?).*/\1/p' | head -n 1)"
+    GATEWAY_PACKAGE_VERSION="$(printf '%s\n' "$GATEWAY_EXECSTART" | sed -nE 's/.*openclaw@([0-9]{4}\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?).*/\1/p' | head -n 1)"
 
     if [[ -n "$current_version" && -n "$GATEWAY_SERVICE_VERSION" && "$GATEWAY_SERVICE_VERSION" != "$current_version" ]]; then
       append_sanity_finding "Gateway service description version is $GATEWAY_SERVICE_VERSION, but CLI reports $current_version."

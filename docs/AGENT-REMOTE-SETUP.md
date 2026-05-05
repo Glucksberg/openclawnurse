@@ -1,24 +1,23 @@
-# Prompt Pronto Para Enviar ao Agente OpenClaw da VPS
+# Prompt Pronto Para Enviar ao Agente OpenClaw do Host
 
-Copie e cole a mensagem abaixo para o agente OpenClaw da instancia remota.
+Copie e cole a mensagem abaixo para o agente OpenClaw do host remoto.
 
 ```text
-Voce esta nesta VPS para instalar e configurar o OpenClawNurse desta instancia.
+Voce esta neste host para instalar e configurar o OpenClawNurse desta instancia.
 
 Objetivo:
-1. instalar o openclawnurse nesta VPS
-2. configurar o nurse corretamente para esta instancia isolada
+1. instalar o openclawnurse neste host
+2. configurar o nurse corretamente para esta instancia
 3. validar o setup
 4. me devolver um relatorio final objetivo
 5. se algum passo depender de mim, me dizer exatamente qual comando eu preciso rodar ou qual valor eu preciso fornecer
 
 Contexto operacional:
-- esta VPS e independente
-- esta VPS tem seu proprio OpenClaw
-- esta VPS manda relatorio para seu proprio grupo de Telegram
-- nao quero configurar fleet, host central ou integracao entre servidores agora
-- se existir documentacao de fleet no repo, ignore por enquanto
-- foque apenas na instalacao e operacao isolada do nurse nesta VPS
+- este host tem uma instalacao local do OpenClaw
+- o Nurse deve cuidar da manutencao local desta instalacao
+- se notificacoes estiverem habilitadas, configure o destino correto de relatorio
+- documentacao ou codigo legado de fleet fica fora do fluxo principal
+- foque apenas na instalacao e operacao local do Nurse
 
 Repositorio esperado:
 - ~/openclawnurse

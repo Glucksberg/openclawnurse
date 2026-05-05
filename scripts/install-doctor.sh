@@ -32,10 +32,6 @@ CLI_OPENCLAW_ALERT_AGENT_ID=""
 CLI_OPENCLAW_ALERT_EVERY=""
 CLI_OPENCLAW_ALERT_CRON=""
 CLI_OPENCLAW_ALERT_TZ=""
-FLEET_EXPORT_ON_CALENDAR="${FLEET_EXPORT_ON_CALENDAR:-*-*-* *:00/5:00}"
-FLEET_DASHBOARD_ON_CALENDAR="${FLEET_DASHBOARD_ON_CALENDAR:-*-*-* *:02/5:00}"
-FLEET_EXPORT_CRON_SCHEDULE="${FLEET_EXPORT_CRON_SCHEDULE:-*/5 * * * *}"
-FLEET_DASHBOARD_CRON_SCHEDULE="${FLEET_DASHBOARD_CRON_SCHEDULE:-2-59/5 * * * *}"
 
 usage() {
   cat <<'EOF'
@@ -48,10 +44,6 @@ Options:
   --scheduler <mode>     auto, systemd or cron.
   --on-calendar <expr>   systemd timer expression.
   --cron-schedule <expr> cron expression used in cron fallback mode.
-  --fleet-export-on-calendar <expr>
-                         systemd timer expression for node feed export.
-  --fleet-dashboard-on-calendar <expr>
-                         systemd timer expression for fleet aggregation.
   --skip-enable          Do not enable the timer or install cron.
   --skip-dry-run         Do not execute the post-install dry run.
   --configure-openclaw-alert
@@ -99,14 +91,6 @@ while (($# > 0)); do
       ;;
     --cron-schedule)
       CRON_SCHEDULE="${2:?missing value for --cron-schedule}"
-      shift 2
-      ;;
-    --fleet-export-on-calendar)
-      FLEET_EXPORT_ON_CALENDAR="${2:?missing value for --fleet-export-on-calendar}"
-      shift 2
-      ;;
-    --fleet-dashboard-on-calendar)
-      FLEET_DASHBOARD_ON_CALENDAR="${2:?missing value for --fleet-dashboard-on-calendar}"
       shift 2
       ;;
     --skip-enable)
@@ -318,10 +302,6 @@ apply_cli_overrides() {
   return 0
 }
 
-is_true() {
-  [[ "${1:-false}" == "true" ]]
-}
-
 detect_scheduler() {
   if [[ "$SCHEDULER" != "auto" ]]; then
     printf '%s' "$SCHEDULER"
@@ -363,21 +343,9 @@ ensure_config_file() {
 
 install_runtime_files() {
   install -m 0755 "$REPO_ROOT/scripts/openclaw-doctor.sh" "$INSTALL_DIR/bin/openclaw-doctor.sh"
-  install -m 0755 "$REPO_ROOT/scripts/openclaw-fleet-export.sh" "$INSTALL_DIR/bin/openclaw-fleet-export.sh"
-  install -m 0755 "$REPO_ROOT/scripts/openclaw-fleet-export-run.sh" "$INSTALL_DIR/bin/openclaw-fleet-export-run.sh"
-  install -m 0755 "$REPO_ROOT/scripts/openclaw-fleet-dashboard.sh" "$INSTALL_DIR/bin/openclaw-fleet-dashboard.sh"
-  install -m 0755 "$REPO_ROOT/scripts/openclaw-fleet-dashboard-run.sh" "$INSTALL_DIR/bin/openclaw-fleet-dashboard-run.sh"
-  install -m 0755 "$REPO_ROOT/scripts/openclaw-fleet-remediation-plan.sh" "$INSTALL_DIR/bin/openclaw-fleet-remediation-plan.sh"
-  install -m 0755 "$REPO_ROOT/scripts/openclaw-fleet-remediation-exec.sh" "$INSTALL_DIR/bin/openclaw-fleet-remediation-exec.sh"
   install -m 0755 "$REPO_ROOT/scripts/openclawnurse-openclaw-alert.sh" "$INSTALL_DIR/bin/openclawnurse-openclaw-alert.sh"
-  install -m 0644 "$REPO_ROOT/config/fleet-nodes.example.json" "$INSTALL_DIR/config-examples/fleet-nodes.example.json"
-  install -m 0644 "$REPO_ROOT/config/fleet-remediation-policy.example.json" "$INSTALL_DIR/config-examples/fleet-remediation-policy.example.json"
   install -m 0644 "$REPO_ROOT/systemd/openclawnurse.service" "$INSTALL_DIR/systemd/openclawnurse.service.template"
   install -m 0644 "$REPO_ROOT/systemd/openclawnurse.timer" "$INSTALL_DIR/systemd/openclawnurse.timer.template"
-  install -m 0644 "$REPO_ROOT/systemd/openclaw-fleet-export.service" "$INSTALL_DIR/systemd/openclaw-fleet-export.service.template"
-  install -m 0644 "$REPO_ROOT/systemd/openclaw-fleet-export.timer" "$INSTALL_DIR/systemd/openclaw-fleet-export.timer.template"
-  install -m 0644 "$REPO_ROOT/systemd/openclaw-fleet-dashboard.service" "$INSTALL_DIR/systemd/openclaw-fleet-dashboard.service.template"
-  install -m 0644 "$REPO_ROOT/systemd/openclaw-fleet-dashboard.timer" "$INSTALL_DIR/systemd/openclaw-fleet-dashboard.timer.template"
 }
 
 should_configure_openclaw_alert() {
@@ -557,24 +525,6 @@ render_systemd_units() {
   sed \
     -e "s|__ON_CALENDAR__|$ON_CALENDAR|g" \
     "$REPO_ROOT/systemd/openclawnurse.timer" >"$SYSTEMD_USER_DIR/openclawnurse.timer"
-
-  sed \
-    -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
-    -e "s|__CONFIG_FILE__|$CONFIG_FILE|g" \
-    "$REPO_ROOT/systemd/openclaw-fleet-export.service" >"$SYSTEMD_USER_DIR/openclaw-fleet-export.service"
-
-  sed \
-    -e "s|__ON_CALENDAR__|$FLEET_EXPORT_ON_CALENDAR|g" \
-    "$REPO_ROOT/systemd/openclaw-fleet-export.timer" >"$SYSTEMD_USER_DIR/openclaw-fleet-export.timer"
-
-  sed \
-    -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
-    -e "s|__CONFIG_FILE__|$CONFIG_FILE|g" \
-    "$REPO_ROOT/systemd/openclaw-fleet-dashboard.service" >"$SYSTEMD_USER_DIR/openclaw-fleet-dashboard.service"
-
-  sed \
-    -e "s|__ON_CALENDAR__|$FLEET_DASHBOARD_ON_CALENDAR|g" \
-    "$REPO_ROOT/systemd/openclaw-fleet-dashboard.timer" >"$SYSTEMD_USER_DIR/openclaw-fleet-dashboard.timer"
 }
 
 enable_systemd_timer() {
@@ -582,14 +532,6 @@ enable_systemd_timer() {
   if [[ "$ENABLE_TIMER" == "true" ]]; then
     systemctl --user enable --now openclawnurse.timer
     log "Enabled systemd timer openclawnurse.timer"
-    if is_true "${FLEET_EXPORT_ENABLED:-false}"; then
-      systemctl --user enable --now openclaw-fleet-export.timer
-      log "Enabled systemd timer openclaw-fleet-export.timer"
-    fi
-    if is_true "${FLEET_DASHBOARD_ENABLED:-false}"; then
-      systemctl --user enable --now openclaw-fleet-dashboard.timer
-      log "Enabled systemd timer openclaw-fleet-dashboard.timer"
-    fi
   else
     log "Skipped enabling systemd timer"
   fi
@@ -601,9 +543,6 @@ install_cron_job() {
   config_path="$(shell_quote "$CONFIG_FILE")"
   cron_log="$(shell_quote "$STATE_DIR/logs/cron.log")"
   local cron_line="$CRON_SCHEDULE $script_path --config $config_path >> $cron_log 2>&1"
-  local export_line dashboard_line
-  export_line="$FLEET_EXPORT_CRON_SCHEDULE $(shell_quote "$INSTALL_DIR/bin/openclaw-fleet-export-run.sh") --config $config_path >> $(shell_quote "$STATE_DIR/logs/fleet-export-cron.log") 2>&1"
-  dashboard_line="$FLEET_DASHBOARD_CRON_SCHEDULE $(shell_quote "$INSTALL_DIR/bin/openclaw-fleet-dashboard-run.sh") --config $config_path >> $(shell_quote "$STATE_DIR/logs/fleet-dashboard-cron.log") 2>&1"
   mkdir -p "$STATE_DIR/logs"
   local current
   current="$(crontab -l 2>/dev/null || true)"
@@ -615,22 +554,6 @@ install_cron_job() {
     log "Installed cron entry"
   else
     log "Cron entry already present"
-  fi
-  current="$(crontab -l 2>/dev/null || true)"
-  if is_true "${FLEET_EXPORT_ENABLED:-false}" && ! printf '%s\n' "$current" | grep -Fq "$INSTALL_DIR/bin/openclaw-fleet-export-run.sh"; then
-    {
-      printf '%s\n' "$current"
-      printf '%s\n' "$export_line"
-    } | crontab -
-    log "Installed cron entry for openclaw-fleet-export"
-    current="$(crontab -l 2>/dev/null || true)"
-  fi
-  if is_true "${FLEET_DASHBOARD_ENABLED:-false}" && ! printf '%s\n' "$current" | grep -Fq "$INSTALL_DIR/bin/openclaw-fleet-dashboard-run.sh"; then
-    {
-      printf '%s\n' "$current"
-      printf '%s\n' "$dashboard_line"
-    } | crontab -
-    log "Installed cron entry for openclaw-fleet-dashboard"
   fi
 }
 

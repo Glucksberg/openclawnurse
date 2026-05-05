@@ -2,23 +2,14 @@
 
 ## Objetivo
 
-Esta cartilha e para o fluxo que voce vai usar agora:
+Esta cartilha resume a operacao padrao do OpenClawNurse em qualquer host com OpenClaw instalado. O objetivo e manter a instalacao local saudavel, com manutencao agendada, reparos seguros e relatorios auditaveis.
 
-- uma VPS por instancia
-- um OpenClaw por VPS
-- um `openclawnurse` por VPS
-- um grupo de Telegram separado por VPS
-- sem dashboard central
-- sem fleet entre hosts
-
-Se voce quiser retomar a parte multi-host no futuro, veja:
-
-- [future-planning/FLEET.md](/home/dev/projects/openclawnurse/docs/future-planning/FLEET.md)
+A implementacao antiga de fleet/multihost foi arquivada em `legacy/fleet/` e nao faz parte do fluxo principal.
 
 ## Arquivos que importam agora
 
 - [AGENT-REMOTE-SETUP.md](/home/dev/projects/openclawnurse/docs/AGENT-REMOTE-SETUP.md): mensagem pronta para enviar ao agente OpenClaw da VPS remota
-- [SETUP-SINGLE-VPS.md](/home/dev/projects/openclawnurse/docs/SETUP-SINGLE-VPS.md): guia manual para instalar e validar uma VPS isolada
+- [SETUP-SINGLE-VPS.md](/home/dev/projects/openclawnurse/docs/SETUP-SINGLE-VPS.md): guia manual para instalar e validar um host
 
 ## O que o OpenClawNurse faz
 
@@ -55,9 +46,9 @@ Antes de instalar em outra VPS:
 - se `systemd --user` nao funcionar, o instalador cai para `cron`
 - se o gateway OpenClaw for gerenciado por `pm2`, o restart deve ser configurado como `custom`
 
-## Fluxo recomendado por VPS
+## Fluxo recomendado
 
-Para cada VPS separada:
+Para cada host:
 
 1. clonar o repo
 2. rodar `./install.sh`
@@ -65,9 +56,9 @@ Para cada VPS separada:
 4. validar com `--self-test`
 5. validar com `--dry-run --no-notify`
 6. conferir `openclawnurse.timer`
-7. confirmar que o report vai para o grupo de Telegram correto daquela VPS
+7. confirmar que o report vai para o destino correto, quando notificacoes estiverem habilitadas
 
-## Configuracao minima por VPS
+## Configuracao minima
 
 Arquivo:
 

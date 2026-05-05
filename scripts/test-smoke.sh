@@ -603,54 +603,6 @@ EOF
   pass "successful update retry is not reported as failed"
 }
 
-smoke_fleet_export_respects_openclaw_config() {
-  local tmp
-  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/fleet-export.XXXXXX")"
-
-  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home"
-  make_fake_openclaw "$tmp/bin/fake-openclaw"
-  cat >"$tmp/cfg/openclawnurse.env" <<EOF
-OPENCLAW_BIN="$tmp/bin/fake-openclaw"
-OPENCLAW_PROFILE="ci"
-STATE_DIR="$tmp/state"
-EOF
-  cat >"$tmp/state/doctor-state.json" <<'EOF'
-{"timestamp":"now","hostname":"host","status":"OK","currentVersionAfter":"1.0.0","availableVersion":"1.0.0","gatewayHealthy":true,"notificationPending":false,"doctorSummary":"ok","outputs":{"doctor":""}}
-EOF
-
-  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-fleet-export.sh" \
-    --config "$tmp/cfg/openclawnurse.env" \
-    --state-file "$tmp/state/doctor-state.json" >"$tmp/feed.json"
-
-  "$JQ_BIN" -e '.openclaw.statusFetchOk == true and .openclaw.snapshot.runtimeVersion == "fake"' "$tmp/feed.json" >/dev/null ||
-    fail "fleet export did not use OPENCLAW_BIN/OPENCLAW_PROFILE"
-
-  pass "fleet export uses configured openclaw command"
-}
-
-smoke_dashboard_link_safety() {
-  local tmp
-  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/dashboard.XXXXXX")"
-
-  mkdir -p "$tmp/out"
-  cat >"$tmp/fleet-unsafe.json" <<'EOF'
-{"fleetName":"Test","nodes":[{"id":"n1","name":"Node","feedUrl":"/missing","dashboardUrl":"javascript:alert(1)\" onclick=\"alert(2)","tags":[]}]}
-EOF
-  "$ROOT_DIR/scripts/openclaw-fleet-dashboard.sh" --config "$tmp/fleet-unsafe.json" --output-dir "$tmp/out" >/dev/null
-  if grep -Fq 'href=' "$tmp/out/index.html"; then
-    fail "dashboard rendered href for unsafe URL"
-  fi
-
-  cat >"$tmp/fleet-safe.json" <<'EOF'
-{"fleetName":"Test","nodes":[{"id":"n1","name":"Node","feedUrl":"/missing","dashboardUrl":"https://example.com/?q=\"x\"&a='b'","tags":[]}]}
-EOF
-  "$ROOT_DIR/scripts/openclaw-fleet-dashboard.sh" --config "$tmp/fleet-safe.json" --output-dir "$tmp/out" >/dev/null
-  grep -Fq 'href="https://example.com/?q=&quot;x&quot;&amp;a=&#39;b&#39;"' "$tmp/out/index.html" ||
-    fail "dashboard did not escape safe URL attributes"
-
-  pass "dashboard filters unsafe links and escapes attributes"
-}
-
 smoke_remediates_openclaw_installation_drift() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/install-drift.XXXXXX")"
@@ -784,8 +736,6 @@ main() {
   smoke_config_version_drift_forces_update
   smoke_config_version_drift_update_failure_is_failed
   smoke_update_retry_success_is_not_failed
-  smoke_fleet_export_respects_openclaw_config
-  smoke_dashboard_link_safety
   smoke_remediates_openclaw_installation_drift
   smoke_default_deduplicates_local_openclaw_shim
 }

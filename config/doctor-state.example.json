@@ -1,0 +1,13 @@
+{
+  "timestamp": "2026-01-01T00:00:00Z",
+  "hostname": "example-host",
+  "status": "OK",
+  "currentVersionAfter": "2026.1.1",
+  "gatewayHealthy": true,
+  "notificationPending": false,
+  "sanity": {
+    "degraded": false,
+    "critical": false,
+    "findings": []
+  }
+}

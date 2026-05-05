@@ -1,189 +1,126 @@
 # OpenClawNurse
 
-OpenClawNurse e um utilitario portavel para manter instancias do OpenClaw saudaveis com:
+OpenClawNurse is a portable maintenance helper for OpenClaw installations. It runs periodic checks, applies safe local remediations, keeps the gateway healthy, and leaves an auditable state/report trail.
 
-- verificacao automatica de update
-- diagnostico e reparo nao interativo
-- reinicio controlado do gateway
-- health check apos manutencao
-- checks de sanidade para instalacao duplicada, config, Telegram e logs do gateway
-- relatorio local e via Telegram
-- instalacao repetivel em multiplas maquinas
+It is designed to be installed next to an OpenClaw runtime and run unattended from `systemd --user` or `cron`.
 
-O fluxo principal deste repo, hoje, e:
+## Capabilities
 
-- uma VPS por instancia
-- um OpenClaw por VPS
-- um openclawnurse por VPS
-- um grupo de Telegram por VPS
-- sem dependencia de host central
+- checks whether an OpenClaw update is available
+- applies OpenClaw updates through the local CLI
+- runs `openclaw doctor` and captures the result
+- repairs common local state issues without interactive prompts
+- backs up and restores `openclaw.json` when the config is invalid
+- deduplicates stale OpenClaw installations that can shadow the active CLI
+- repairs local launcher/path drift for common npm/pnpm installs
+- restarts the OpenClaw gateway when maintenance requires it
+- waits for gateway health after maintenance
+- scans runtime, Telegram, config and gateway logs for actionable issues
+- writes state, logs and reports under the user's local state directory
+- can report directly through Telegram or through an OpenClaw cron alert job
 
-Multi-host e fleet continuam no repo, mas foram movidos para `docs/future-planning/`.
+## Install
 
-## Como instalar
+```bash
+git clone https://github.com/Glucksberg/openclawnurse.git
+cd openclawnurse
+./install.sh
+```
 
-1. Clone o repositorio em qualquer diretorio.
-2. Rode `./install.sh`.
-3. Ajuste `~/.config/openclawnurse/openclawnurse.env` se quiser alterar target, horario ou comportamento.
-4. Rode um `--self-test`.
-5. Rode um `--dry-run`.
+By default, the installer:
 
-Para usar o mesmo bot/token de Telegram em varias maquinas, com um `openclawnurse` por host, configure no `.env`:
+- copies runtime files to `~/.local/share/openclawnurse`
+- creates config at `~/.config/openclawnurse/openclawnurse.env`
+- writes state and logs to `~/.local/state/openclawnurse`
+- installs a `systemd --user` timer, with `cron` fallback
+- runs a post-install self-test and dry-run
 
-- `TELEGRAM_BOT_TOKEN` com o bot dedicado de alertas
-- `TELEGRAM_TARGET` com o chat/grupo central de alertas
-- `REPORT_INSTANCE_LABEL` com um nome claro do host
+Useful commands:
 
-Se `TELEGRAM_BOT_TOKEN` ficar vazio, o `openclawnurse` tenta reutilizar `channels.telegram.botToken` do `~/.openclaw/openclaw.json`. Isso cobre hosts onde o OpenClaw ja esta respondendo pelo bot do Telegram e evita duplicar o token no `.env` do Nurse.
+```bash
+~/.local/share/openclawnurse/bin/openclaw-doctor.sh --self-test
+~/.local/share/openclawnurse/bin/openclaw-doctor.sh --dry-run
+systemctl --user status openclawnurse.timer
+journalctl --user -u openclawnurse.service -n 200 --no-pager
+```
 
-Esse modo legado envia alertas direto pela API do Telegram e nao depende do OpenClaw. Para instancias OpenClaw comuns, prefira o modo "Alertas pelo proprio OpenClaw" abaixo, que reutiliza o bot/canal ja configurado.
+## Configuration
 
-Por padrao, o instalador:
+The main config file is:
 
-- copia o runtime para `~/.local/share/openclawnurse`
-- cria configuracao em `~/.config/openclawnurse/openclawnurse.env`
-- grava estado e logs em `~/.local/state/openclawnurse`
-- instala `systemd --user` com fallback para `crontab`
-- executa um `--dry-run` ao final
+```bash
+~/.config/openclawnurse/openclawnurse.env
+```
 
-## Supervisao do gateway
+Common settings:
 
-O `openclawnurse` nao e um daemon de longa duracao. Ele foi desenhado para rodar como job agendado (`systemd timer` ou `cron`), nao como processo permanente no `pm2`.
+- `OPENCLAW_BIN`: OpenClaw CLI path. Defaults to `openclaw`.
+- `AUTO_UPDATE`: whether the Nurse should apply available updates.
+- `RESTART_MODE`: gateway restart strategy, usually `systemd_user`.
+- `SYSTEMD_UNIT_NAME`: gateway service name, usually `openclaw-gateway.service`.
+- `REPORT_CHANNEL`: report channel, for example `telegram` or `none`.
+- `TELEGRAM_TARGET`: chat/group id for direct reports.
+- `TELEGRAM_BOT_TOKEN`: optional dedicated token. If empty, the Nurse can reuse the OpenClaw Telegram token from `~/.openclaw/openclaw.json`.
+- `EXTRA_PATH`: extra executable paths for environments such as Linuxbrew or custom package managers.
 
-Por padrao, ele tenta remediar automaticamente dois tipos de sujeira operacional comuns:
+See `config/openclaw-doctor.env.example` for the complete set of runtime options.
 
-- entradas de sessao com transcripts ausentes
-- arquivos `*.trajectory.jsonl` orfaos apontados pelo `openclaw doctor`
-- config `openclaw.json` invalida, restaurando o ultimo backup JSON valido quando existir
+## Alerts
 
-Em hosts com politica de uma unica instalacao do OpenClaw, o Nurse deduplica instalacoes divergentes por padrao. Ele protege automaticamente o `OPENCLAW_BIN` ativo e o runtime usado pelo `openclaw-gateway.service`; caminhos antigos configurados como remediaveis sao movidos para quarentena:
+OpenClawNurse can deliver reports directly through Telegram, or it can write local state and let OpenClaw send alerts from its own configured bot/channel.
 
-- `OPENCLAW_BIN="$HOME/.npm-global/bin/openclaw"`
-- `AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS="true"`
-- `OPENCLAW_REMEDIABLE_INSTALL_PATHS="$HOME/openclaw/node_modules/.bin/openclaw $HOME/.npm-global/bin/openclaw $HOME/.npm-global/lib/node_modules/openclaw $HOME/.local/share/pnpm/global/5/node_modules/openclaw"`
-- `AUTO_REPAIR_OPENCLAW_LAUNCHER="true"`
-- `OPENCLAW_LAUNCHER_PATH="$HOME/.local/share/pnpm/openclaw"`
-- `AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="true"`
-
-Essa remediacao nao apaga os caminhos divergentes: ela move os artefatos para `~/.local/state/openclawnurse/quarantine/` e deixa o report registrar o que foi feito. Aliases antigos sao comentados com backup do arquivo de shell; funcoes `openclaw` recebem um `unset -f openclaw` marcado pelo Nurse para evitar shadowing.
-
-## Alertas pelo proprio OpenClaw
-
-Quando o Gateway esta saudavel, o alerta pode ser enviado pelo proprio bot/canal do OpenClaw, sem um token dedicado do Nurse. O padrao recomendado e:
-
-- o `openclawnurse.timer` continua executando reparos locais e gravando `doctor-state.json`
-- um cronjob do OpenClaw chama um agente leve
-- o agente executa `openclawnurse-openclaw-alert.sh`
-- o script envia mensagem para o grupo/topico configurado quando o estado esta diferente de `OK` ou quando houve atividade relevante: update aplicado, config restaurada, gateway reiniciado ou remediacao aplicada
-- quando havia incidente anterior, ele envia uma recuperacao quando volta a `OK`
-
-Config relevante:
-
-- `OPENCLAW_ALERT_CHANNEL="telegram"`
-- `OPENCLAW_ALERT_TARGET="-1001234567890"`
-- `OPENCLAW_ALERT_THREAD_ID=""`
-- `OPENCLAW_ALERT_AGENT_ID="main"`
-- `OPENCLAW_ALERT_EVERY=""`
-- `OPENCLAW_ALERT_CRON=""`
-- `OPENCLAW_ALERT_TZ=""`
-- `OPENCLAW_ALERT_JOB_NAME="openclawnurse-alert"`
-- `OPENCLAW_ALERT_MIN_INTERVAL_SECONDS="21600"`
-- `OPENCLAW_ALERT_RECOVERY="true"`
-
-O instalador deixa essa parte quase plug and play. Em um terminal interativo, `./install.sh` tenta detectar o primeiro grupo Telegram configurado no OpenClaw, sugere um topico de automacoes quando existir e pergunta:
-
-- caminho do binario `openclaw`
-- id do grupo/chat Telegram
-- id do topico/forum thread, ou vazio para o grupo principal
-- agente que executa o cronjob de alerta
-- intervalo do cronjob, quando nao usar cron expression
-
-Para instalacoes automatizadas, passe tudo por flags/env:
+For OpenClaw-managed alerts, run the installer with:
 
 ```bash
 ./install.sh \
   --configure-openclaw-alert \
-  --openclaw-bin "$HOME/openclaw/node_modules/.bin/openclaw" \
   --openclaw-alert-target "-1001234567890" \
-  --openclaw-alert-thread-id "251" \
-  --openclaw-alert-agent "automacoes" \
+  --openclaw-alert-agent "main" \
   --openclaw-alert-every "12h"
 ```
 
-Para agenda fixa em UTC, use cron expression no lugar do intervalo:
+The alert helper reads `doctor-state.json` and sends only relevant incident or recovery messages.
 
-```bash
-./install.sh \
-  --configure-openclaw-alert \
-  --openclaw-alert-cron "0 11,21 * * *" \
-  --openclaw-alert-tz "UTC"
-```
+## Runtime Behavior
 
-Se o CLI local do OpenClaw ainda nao tiver escopo para gerenciar cron, o instalador nao falha: ele configura o `.env` e informa que voce deve aprovar/reparar os escopos e rodar o instalador de novo.
+OpenClawNurse is not a long-running daemon. It runs as a scheduled job, performs one maintenance pass, writes state, and exits.
 
-Se `OPENCLAW_ALERT_CRON` e `OPENCLAW_ALERT_EVERY` estiverem vazios, o instalador assume `OPENCLAW_ALERT_EVERY="12h"` como comportamento padrao.
+During a live run it can:
 
-Quando `OPENCLAW_ALERT_THREAD_ID` estiver preenchido, o instalador tambem aponta o failure alert nativo do cron para o topico usando a sintaxe documentada pelo OpenClaw: `<chatId>:topic:<threadId>`. A entrega normal do job continua usando `delivery.threadId`.
+- create a config backup
+- update OpenClaw
+- run doctor repair
+- quarantine stale OpenClaw paths under `~/.local/state/openclawnurse/quarantine/`
+- clean missing or orphaned session transcript references
+- refresh or restart the gateway service
+- verify health after restart
 
-Para evitar duplicidade em updates, o Gateway OpenClaw deve ficar sob `systemd --user`:
+Quarantine is used instead of deletion so that changes remain reversible.
 
-- `RESTART_MODE="systemd_user"`
-- `SYSTEMD_UNIT_NAME="openclaw-gateway.service"`
-- `AUTO_REFRESH_STALE_GATEWAY_SERVICE="true"`
-- `AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="true"`
-- `PM2_GATEWAY_APP_NAMES="openclaw-gateway openclaw"`
+## Repository Layout
 
-Se um app legado chamado exatamente `openclaw-gateway` ou `openclaw` aparecer no PM2, o Nurse pode remover apenas esse app do PM2 e garantir que o `openclaw-gateway.service` esteja habilitado/rodando. Outros apps PM2 nao sao tocados. A lista pode ser ajustada em `PM2_GATEWAY_APP_NAMES`.
+- `install.sh`: top-level installer entrypoint
+- `scripts/install-doctor.sh`: idempotent installer implementation
+- `scripts/openclaw-doctor.sh`: main runtime
+- `scripts/openclawnurse-openclaw-alert.sh`: OpenClaw cron alert helper
+- `systemd/`: `systemd --user` service/timer templates
+- `config/openclaw-doctor.env.example`: example config
+- `docs/`: setup and operator notes
+- `legacy/fleet/`: archived fleet/multihost experiment, not part of the active program
 
-Se o host usar bins fora do PATH padrao do usuario, como Linuxbrew, adicione por config:
+## Validation
 
-- `EXTRA_PATH="/home/linuxbrew/.linuxbrew/bin"`
-
-## Arquivos principais
-
-- `scripts/openclaw-doctor.sh` runtime principal
-- `scripts/install-doctor.sh` instalador idempotente
-- `systemd/` templates de `systemd --user`
-- `config/openclaw-doctor.env.example` exemplo de configuracao
-- `docs/PLAN.md` plano v2
-- `docs/CARTILHA.md` cartilha principal para VPS isolada
-- `docs/SETUP-SINGLE-VPS.md` guia rapido de setup manual
-- `docs/AGENT-REMOTE-SETUP.md` prompt pronto para enviar ao agente remoto
-- `docs/future-planning/` documentacao de fleet e host central
-- `docs/REVIEW.md` revisao tecnica da ferramenta
-
-## Comandos uteis
-
-- `./install.sh`
-- `~/.local/share/openclawnurse/bin/openclaw-doctor.sh --self-test`
-- `~/.local/share/openclawnurse/bin/openclaw-doctor.sh --dry-run`
-- `systemctl --user status openclawnurse.timer`
-- `journalctl --user -u openclawnurse.service -n 200 --no-pager`
-
-## Validacao local
-
-Antes de publicar mudancas, rode:
+Before publishing changes, run:
 
 ```bash
 bash -n install.sh
 for script in scripts/*.sh; do bash -n "$script"; done
-jq empty config/*.json
+find config legacy -name '*.json' -print0 | xargs -0 -r -n1 jq empty
 scripts/test-smoke.sh
 ```
 
-O CI do GitHub Actions executa essas mesmas validacoes. Ele tambem roda `shellcheck` como aviso nao bloqueante.
+The GitHub Actions workflow runs the same validation. `shellcheck` is run as a non-blocking warning check.
 
-## Planejamento futuro
+## Legacy
 
-Os scripts e configuracoes de multi-host continuam disponiveis no repo:
-
-- `scripts/openclaw-fleet-export.sh`
-- `scripts/openclaw-fleet-dashboard.sh`
-- `scripts/openclaw-fleet-remediation-plan.sh`
-- `scripts/openclaw-fleet-remediation-exec.sh`
-- `config/fleet-nodes.example.json`
-- `config/fleet-remediation-policy.example.json`
-
-Mas a documentacao correspondente foi movida para:
-
-- `docs/future-planning/`
+Older fleet and multihost experiments are preserved under `legacy/fleet/` for reference. They are no longer installed, scheduled, tested or described as part of OpenClawNurse's main runtime.
