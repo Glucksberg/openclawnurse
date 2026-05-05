@@ -522,6 +522,71 @@ EOF
   pass "config version drift update failure is failed"
 }
 
+smoke_json_preamble_is_accepted() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/json-preamble.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  cat >"$tmp/bin/openclaw" <<'EOF'
+#!/usr/bin/env bash
+
+if [[ "${1:-}" == "--version" ]]; then
+  printf 'OpenClaw 2026.1.0\n'
+  exit 0
+fi
+
+case "${1:-}" in
+  update)
+    case "${2:-}" in
+      status)
+        printf 'Config was last written by a newer OpenClaw.\n'
+        printf '{"availability":{"available":false,"latestVersion":null},"channel":{"value":"stable"}}\n'
+        ;;
+      *)
+        printf '{"ok":true}\n'
+        ;;
+    esac
+    ;;
+  doctor)
+    printf 'doctor complete\n'
+    ;;
+  health)
+    printf 'Gateway emitted a warning before JSON.\n'
+    printf '{"ok":true}\n'
+    ;;
+  status)
+    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+CONFIG_BACKUP_ENABLED="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e '
+    .status == "OK"
+    and .updateAvailable == false
+    and .gatewayHealthy == true
+    and (.errors | length) == 0
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "doctor did not accept JSON output with a warning preamble"
+
+  pass "json preamble before OpenClaw JSON is accepted"
+}
+
 smoke_update_retry_success_is_not_failed() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/update-retry.XXXXXX")"
@@ -735,6 +800,7 @@ main() {
   smoke_telegram_commands_are_remediated
   smoke_config_version_drift_forces_update
   smoke_config_version_drift_update_failure_is_failed
+  smoke_json_preamble_is_accepted
   smoke_update_retry_success_is_not_failed
   smoke_remediates_openclaw_installation_drift
   smoke_default_deduplicates_local_openclaw_shim

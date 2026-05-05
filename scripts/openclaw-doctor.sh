@@ -413,6 +413,10 @@ build_openclaw_cmd() {
   fi
 }
 
+json_payload_from_output() {
+  awk 'found || $0 ~ /^[[:space:]]*[\{\[]/ { found=1; print }'
+}
+
 json_bool() {
   if [[ "$1" == "1" || "$1" == "true" ]]; then
     printf 'true'
@@ -1756,7 +1760,7 @@ run_self_test() {
     return 1
   fi
 
-  local health_output health_status
+  local health_output health_json health_status
   local health_cmd
   local deadline attempt
   build_openclaw_cmd health_cmd
@@ -1768,7 +1772,8 @@ run_self_test() {
     log INFO "Self-test health check"
     health_output="$("${health_cmd[@]}" 2>&1)"
     health_status=$?
-    if [[ "$health_status" -eq 0 ]] && printf '%s' "$health_output" | jq -e '.ok == true' >/dev/null 2>&1; then
+    health_json="$(printf '%s\n' "$health_output" | json_payload_from_output)"
+    if [[ "$health_status" -eq 0 ]] && printf '%s' "$health_json" | jq -e '.ok == true' >/dev/null 2>&1; then
       log INFO "Self-test health check succeeded"
       break
     fi
@@ -1777,7 +1782,8 @@ run_self_test() {
     sleep "$GATEWAY_WAIT_INTERVAL"
   done
 
-  if [[ "$health_status" -ne 0 ]] || ! printf '%s' "$health_output" | jq -e '.ok == true' >/dev/null 2>&1; then
+  health_json="$(printf '%s\n' "$health_output" | json_payload_from_output)"
+  if [[ "$health_status" -ne 0 ]] || ! printf '%s' "$health_json" | jq -e '.ok == true' >/dev/null 2>&1; then
     printf 'SELF_TEST=FAILED\n'
     printf 'Reason: health check failed\n'
     return 1
@@ -2171,7 +2177,7 @@ maybe_migrate_pm2_gateway_to_systemd() {
 }
 
 run_update_status() {
-  local output status
+  local output status json_output
   local cmd
   build_openclaw_cmd cmd
   cmd+=(update status --json --timeout "$STATUS_TIMEOUT")
@@ -2184,7 +2190,8 @@ run_update_status() {
     return 1
   fi
 
-  if ! printf '%s' "$output" | jq empty >/dev/null 2>&1; then
+  json_output="$(printf '%s\n' "$output" | json_payload_from_output)"
+  if ! printf '%s' "$json_output" | jq empty >/dev/null 2>&1; then
     UPDATE_ERROR="$output"
     append_array ERRORS "Update status returned invalid JSON."
     return 1
@@ -2193,13 +2200,13 @@ run_update_status() {
   CURRENT_VERSION_BEFORE="$("$OPENCLAW_BIN" --version 2>/dev/null | sed -E 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/' | head -n 1)"
   CURRENT_VERSION_AFTER="$CURRENT_VERSION_BEFORE"
   UPDATE_AVAILABLE=0
-  if printf '%s' "$output" | jq -e '.availability.available == true' >/dev/null 2>&1; then
+  if printf '%s' "$json_output" | jq -e '.availability.available == true' >/dev/null 2>&1; then
     UPDATE_AVAILABLE=1
-    AVAILABLE_VERSION="$(printf '%s' "$output" | jq -r '.availability.latestVersion // .update.registry.latestVersion // empty')"
+    AVAILABLE_VERSION="$(printf '%s' "$json_output" | jq -r '.availability.latestVersion // .update.registry.latestVersion // empty')"
   else
-    AVAILABLE_VERSION="$(printf '%s' "$output" | jq -r '.availability.latestVersion // empty')"
+    AVAILABLE_VERSION="$(printf '%s' "$json_output" | jq -r '.availability.latestVersion // empty')"
   fi
-  CHANNEL_VALUE="$(printf '%s' "$output" | jq -r '.channel.value // empty')"
+  CHANNEL_VALUE="$(printf '%s' "$json_output" | jq -r '.channel.value // empty')"
   return 0
 }
 
@@ -2459,7 +2466,7 @@ restart_gateway() {
 
 wait_for_gateway_health() {
   local deadline=$(( $(date +%s) + GATEWAY_WAIT_TIMEOUT ))
-  local output status
+  local output status json_output
   local cmd
   local attempt=1
   build_openclaw_cmd cmd
@@ -2470,8 +2477,9 @@ wait_for_gateway_health() {
     output="$("${cmd[@]}" 2>&1)"
     status=$?
     HEALTH_OUTPUT="$output"
+    json_output="$(printf '%s\n' "$output" | json_payload_from_output)"
 
-    if [[ "$status" -eq 0 ]] && printf '%s' "$output" | jq -e '.ok == true' >/dev/null 2>&1; then
+    if [[ "$status" -eq 0 ]] && printf '%s' "$json_output" | jq -e '.ok == true' >/dev/null 2>&1; then
       GATEWAY_HEALTHY=1
       log INFO "Checking gateway health succeeded"
       return 0
@@ -2488,14 +2496,15 @@ wait_for_gateway_health() {
 }
 
 check_gateway_health_once() {
-  local output status
+  local output status json_output
   local cmd
   build_openclaw_cmd cmd
   cmd+=(health --json --timeout "$HEALTH_TIMEOUT_MS")
   run_capture output status "Checking gateway health without restart" "${cmd[@]}"
   HEALTH_OUTPUT="$output"
+  json_output="$(printf '%s\n' "$output" | json_payload_from_output)"
 
-  if [[ "$status" -eq 0 ]] && printf '%s' "$output" | jq -e '.ok == true' >/dev/null 2>&1; then
+  if [[ "$status" -eq 0 ]] && printf '%s' "$json_output" | jq -e '.ok == true' >/dev/null 2>&1; then
     GATEWAY_HEALTHY=1
     return 0
   fi
