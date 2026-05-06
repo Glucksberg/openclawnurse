@@ -61,6 +61,8 @@ Common settings:
 - `REPORT_CHANNEL`: report channel, for example `telegram` or `none`.
 - `TELEGRAM_TARGET`: chat/group id for direct reports.
 - `TELEGRAM_BOT_TOKEN`: optional dedicated token. If empty, the Nurse can reuse the OpenClaw Telegram token from `~/.openclaw/openclaw.json`.
+- `EXPECTED_OPENCLAW_MODEL`: optional expected primary model. If unset, the Nurse can infer `openai-codex/*` when the host has Codex OAuth but no direct OpenAI API key.
+- `AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL`: restores model config drift after `openclaw doctor --repair`.
 - `EXTRA_PATH`: extra executable paths for environments such as Linuxbrew or custom package managers.
 
 See `config/openclaw-doctor.env.example` for the complete set of runtime options.

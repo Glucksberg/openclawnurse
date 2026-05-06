@@ -372,6 +372,7 @@ EOF
     and any(.remediations[]; .code == "telegram_native_commands" and .result == "applied")
   ' "$tmp/state/doctor-state.json" >/dev/null ||
     fail "telegram native commands were not remediated"
+  # shellcheck disable=SC2016 # jq expression is intentionally single-quoted.
   "$JQ_BIN" -e '[.commands[].command] as $commands | ($commands | index("new")) and ($commands | index("reset"))' \
     "$tmp/set-payload.json" >/dev/null ||
     fail "setMyCommands payload did not include required commands"
@@ -520,6 +521,171 @@ EOF
     fail "config version drift update failure did not fail the run"
 
   pass "config version drift update failure is failed"
+}
+
+smoke_model_config_drift_after_doctor_is_remediated() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/model-config-drift.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{
+  "auth": {
+    "profiles": {
+      "openai-codex:test@example.com": {
+        "provider": "openai-codex",
+        "mode": "oauth"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openai/gpt-5.5",
+        "fallbacks": [
+          "claude-cli/claude-opus-4-6"
+        ]
+      },
+      "models": {
+        "claude-cli/claude-opus-4-6": {
+          "alias": "opus"
+        },
+        "openai/gpt-5.4": {},
+        "openai/gpt-5.5": {}
+      },
+      "agentRuntime": {
+        "id": "pi"
+      }
+    }
+  },
+  "gateway": {
+    "port": 18789
+  }
+}
+EOF
+  cat >"$tmp/bin/openclaw" <<EOF
+#!/usr/bin/env bash
+cfg="$tmp/home/.openclaw/openclaw.json"
+
+if [[ "\${1:-}" == "--version" ]]; then
+  printf 'OpenClaw 2026.1.0\n'
+  exit 0
+fi
+
+case "\${1:-}" in
+  update)
+    case "\${2:-}" in
+      status)
+        printf '{"availability":{"available":false,"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
+        ;;
+      *)
+        printf '{"ok":true}\n'
+        ;;
+    esac
+    ;;
+  doctor)
+    tmp_cfg="\$cfg.tmp"
+    jq '.agents.defaults.model.primary = "openai/gpt-5.5"
+      | .agents.defaults.models = {
+          "claude-cli/claude-opus-4-6": {"alias":"opus"},
+          "openai/gpt-5.4": {},
+          "openai/gpt-5.5": {}
+        }
+      | .agents.defaults.agentRuntime = {"id":"pi"}' "\$cfg" >"\$tmp_cfg"
+    mv "\$tmp_cfg" "\$cfg"
+    printf 'doctor complete\n'
+    ;;
+  config)
+    case "\${2:-}" in
+      set)
+        path="\${3:-}"
+        value="\${4:-}"
+        tmp_cfg="\$cfg.tmp"
+        case "\$path" in
+          agents.defaults.model.primary)
+            jq --arg value "\$value" '.agents.defaults.model.primary = \$value' "\$cfg" >"\$tmp_cfg"
+            ;;
+          agents.defaults.models)
+            jq --argjson value "\$value" '.agents.defaults.models = \$value' "\$cfg" >"\$tmp_cfg"
+            ;;
+          *)
+            printf 'unsupported config set path: %s\n' "\$path" >&2
+            exit 2
+            ;;
+        esac
+        mv "\$tmp_cfg" "\$cfg"
+        printf '{"ok":true}\n'
+        ;;
+      unset)
+        path="\${3:-}"
+        tmp_cfg="\$cfg.tmp"
+        case "\$path" in
+          agents.defaults.agentRuntime)
+            jq 'del(.agents.defaults.agentRuntime)' "\$cfg" >"\$tmp_cfg"
+            ;;
+          *)
+            printf 'unsupported config unset path: %s\n' "\$path" >&2
+            exit 2
+            ;;
+        esac
+        mv "\$tmp_cfg" "\$cfg"
+        printf '{"ok":true}\n'
+        ;;
+      *)
+        printf '{}\n'
+        ;;
+    esac
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  status)
+    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+OPENCLAW_CONFIG_FILE="$tmp/home/.openclaw/openclaw.json"
+OPENAI_API_KEY=""
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+AUTO_REMEDIATE_MISSING_TRANSCRIPTS="false"
+AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS="false"
+RESTART_MODE="custom"
+RESTART_COMMAND="printf restarted >> '$tmp/restarts'"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e '
+    .agents.defaults.model.primary == "openai-codex/gpt-5.5"
+    and (.agents.defaults.agentRuntime | not)
+    and (.agents.defaults.models | has("openai-codex/gpt-5.5"))
+    and (.agents.defaults.models | has("openai/gpt-5.5") | not)
+  ' "$tmp/home/.openclaw/openclaw.json" >/dev/null ||
+    fail "OpenClaw model config drift was not repaired after doctor"
+  grep -Fq 'restarted' "$tmp/restarts" ||
+    fail "model config remediation did not restart the gateway"
+  "$JQ_BIN" -e '
+    .status == "OK"
+    and .restartAttempted == true
+    and .gatewayHealthy == true
+    and any(.incidentCodes[]; . == "openclaw_model_config_drift")
+    and any(.remediations[]; .code == "openclaw_model_config_drift" and .result == "applied")
+    and .sanity.expectedOpenclawModel == "openai-codex/gpt-5.5"
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "model config drift remediation was not recorded cleanly"
+
+  pass "model config drift after doctor is remediated"
 }
 
 smoke_json_preamble_is_accepted() {
@@ -800,6 +966,7 @@ main() {
   smoke_telegram_commands_are_remediated
   smoke_config_version_drift_forces_update
   smoke_config_version_drift_update_failure_is_failed
+  smoke_model_config_drift_after_doctor_is_remediated
   smoke_json_preamble_is_accepted
   smoke_update_retry_success_is_not_failed
   smoke_remediates_openclaw_installation_drift

@@ -167,6 +167,7 @@ ENABLE_GATEWAY_LOG_SCAN="${ENABLE_GATEWAY_LOG_SCAN:-true}"
 EXPECTED_OPENCLAW_MODEL="${EXPECTED_OPENCLAW_MODEL:-}"
 EXPECTED_TELEGRAM_COMMANDS="${EXPECTED_TELEGRAM_COMMANDS:-new reset}"
 AUTO_REMEDIATE_TELEGRAM_COMMANDS="${AUTO_REMEDIATE_TELEGRAM_COMMANDS:-true}"
+AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL="${AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL:-true}"
 GATEWAY_LOG_SINCE="${GATEWAY_LOG_SINCE:-last-run}"
 GATEWAY_LOG_FALLBACK_SINCE="${GATEWAY_LOG_FALLBACK_SINCE:-24 hours ago}"
 GATEWAY_LOG_MAX_LINES="${GATEWAY_LOG_MAX_LINES:-4000}"
@@ -237,6 +238,7 @@ append_array() {
   shift
   local value="$*"
   [[ -n "$value" ]] || return 0
+  # shellcheck disable=SC2178 # nameref points at an array selected by name.
   local -n ref="$name"
   ref+=("$value")
 }
@@ -244,6 +246,7 @@ append_array() {
 remove_array_value() {
   local name="$1"
   local value="$2"
+  # shellcheck disable=SC2178 # nameref points at an array selected by name.
   local -n ref="$name"
   local filtered=()
   local item
@@ -260,6 +263,7 @@ append_unique_array() {
   shift
   local value="$*"
   [[ -n "$value" ]] || return 0
+  # shellcheck disable=SC2178 # nameref points at an array selected by name.
   local -n ref="$name"
   local item
   for item in "${ref[@]:-}"; do
@@ -281,6 +285,7 @@ append_sanity_critical() {
 
 print_bullets_from_array() {
   local name="$1"
+  # shellcheck disable=SC2178 # nameref points at an array selected by name.
   local -n ref="$name"
   local item
   for item in "${ref[@]:-}"; do
@@ -291,6 +296,7 @@ print_bullets_from_array() {
 
 array_has_nonempty() {
   local name="$1"
+  # shellcheck disable=SC2178 # nameref points at an array selected by name.
   local -n ref="$name"
   local item
   for item in "${ref[@]:-}"; do
@@ -406,6 +412,7 @@ run_capture_with_heartbeat() {
 
 build_openclaw_cmd() {
   local name="$1"
+  # shellcheck disable=SC2178 # nameref points at an array selected by name.
   local -n ref="$name"
   ref=("$OPENCLAW_BIN")
   if [[ -n "$OPENCLAW_PROFILE" ]]; then
@@ -415,6 +422,18 @@ build_openclaw_cmd() {
 
 json_payload_from_output() {
   awk 'found || $0 ~ /^[[:space:]]*[\{\[]/ { found=1; print }'
+}
+
+count_fixed_lines() {
+  local text="$1"
+  local pattern="$2"
+  awk -v pat="$pattern" 'index($0, pat) > 0 { count++ } END { print count + 0 }' <<<"$text"
+}
+
+count_regex_lines() {
+  local text="$1"
+  local pattern="$2"
+  awk -v pat="$pattern" '$0 ~ pat { count++ } END { print count + 0 }' <<<"$text"
 }
 
 json_bool() {
@@ -435,6 +454,7 @@ json_int() {
 
 json_array_from_name() {
   local name="$1"
+  # shellcheck disable=SC2178 # nameref points at an array selected by name.
   local -n ref="$name"
   if ((${#ref[@]} == 0)); then
     printf '[]'
@@ -587,7 +607,9 @@ CONFIG_RESTORE_DIFF=""
 DIAGNOSTICS_JSON="{}"
 
 ERRORS=()
+# shellcheck disable=SC2034 # read through nameref helpers and persisted dynamically.
 FIXES=()
+# shellcheck disable=SC2034 # read through nameref helpers and persisted dynamically.
 ACTIONS=()
 INCIDENT_CODES=()
 REMEDIATIONS=()
@@ -595,6 +617,7 @@ SANITY_FINDINGS=()
 PREVIOUS_PENDING_PRESENT=0
 PREVIOUS_STATE_TIMESTAMP=""
 REMEDIATION_APPLIED=0
+MODEL_CONFIG_REMEDIATED=0
 GATEWAY_RESTARTS_TODAY=0
 GATEWAY_RESTARTS_IN_WINDOW=0
 SANITY_ATTEMPTED=0
@@ -608,6 +631,7 @@ GATEWAY_MODEL_DETECTED=""
 TELEGRAM_COMMANDS_SUMMARY=""
 GATEWAY_LOG_SUMMARY=""
 PROVIDER_EMPTY_INPUT_COUNT=0
+PROVIDER_AUTH_ERROR_COUNT=0
 STUCK_SESSION_COUNT=0
 CONFIG_INVALID_COUNT=0
 UPDATE_PROVENANCE_WARNING_COUNT=0
@@ -647,6 +671,7 @@ record_remediation() {
 
 json_remediations_from_name() {
   local name="$1"
+  # shellcheck disable=SC2178 # nameref points at an array selected by name.
   local -n ref="$name"
   if ((${#ref[@]} == 0)); then
     printf '[]'
@@ -781,6 +806,7 @@ persist_json() {
     --argjson sanityDegraded "$(json_bool "$SANITY_DEGRADED")" \
     --argjson sanityCritical "$(json_bool "$SANITY_CRITICAL")" \
     --argjson providerEmptyInputCount "$(json_int "$PROVIDER_EMPTY_INPUT_COUNT")" \
+    --argjson providerAuthErrorCount "$(json_int "$PROVIDER_AUTH_ERROR_COUNT")" \
     --argjson stuckSessionCount "$(json_int "$STUCK_SESSION_COUNT")" \
     --argjson configInvalidCount "$(json_int "$CONFIG_INVALID_COUNT")" \
     --argjson updateProvenanceWarningCount "$(json_int "$UPDATE_PROVENANCE_WARNING_COUNT")" \
@@ -838,6 +864,7 @@ persist_json() {
         telegramCommands: $telegramCommands,
         gatewayLogSummary: $gatewayLogSummary,
         providerEmptyInputCount: $providerEmptyInputCount,
+        providerAuthErrorCount: $providerAuthErrorCount,
         stuckSessionCount: $stuckSessionCount,
         configInvalidCount: $configInvalidCount,
         updateProvenanceWarningCount: $updateProvenanceWarningCount
@@ -1123,6 +1150,7 @@ openclaw_package_root_from_path() {
 }
 
 collect_protected_openclaw_paths() {
+  # shellcheck disable=SC2034,SC2178 # populated through append_unique_array nameref calls below.
   local -n protected_ref="$1"
   local path real root unit_text exec_start entrypoint
 
@@ -1231,7 +1259,68 @@ resolve_expected_model_from_config() {
   [[ -n "$EXPECTED_OPENCLAW_MODEL" ]] && return 0
   local cfg_file="$OPENCLAW_STATE_HOME/openclaw.json"
   [[ -f "$cfg_file" ]] || return 0
-  EXPECTED_OPENCLAW_MODEL="$(jq -r '.agents.defaults.model.primary // .models.default // .model // empty' "$cfg_file" 2>/dev/null)"
+
+  local current_model
+  current_model="$(jq -r '.agents.defaults.model.primary // .models.default // .model // empty' "$cfg_file" 2>/dev/null)"
+  if [[ "$current_model" == openai/* ]] && config_has_codex_oauth "$cfg_file" && ! config_has_direct_openai_auth "$cfg_file"; then
+    EXPECTED_OPENCLAW_MODEL="openai-codex/${current_model#openai/}"
+    return 0
+  fi
+
+  EXPECTED_OPENCLAW_MODEL="$current_model"
+}
+
+config_has_codex_oauth() {
+  local cfg_file="$1"
+  jq -e '
+    (.auth.profiles // {})
+    | to_entries
+    | any(.value.provider == "openai-codex" and ((.value.mode // "oauth") == "oauth"))
+  ' "$cfg_file" >/dev/null 2>&1
+}
+
+config_has_direct_openai_auth() {
+  local cfg_file="$1"
+  [[ -n "${OPENAI_API_KEY:-}" ]] && return 0
+  jq -e '
+    (.auth.profiles // {})
+    | to_entries
+    | any(.value.provider == "openai")
+  ' "$cfg_file" >/dev/null 2>&1
+}
+
+detect_openclaw_model_config_drift() {
+  resolve_expected_model_from_config
+  [[ -n "$EXPECTED_OPENCLAW_MODEL" ]] || return 0
+
+  local cfg_file="$OPENCLAW_STATE_HOME/openclaw.json"
+  [[ -f "$cfg_file" ]] || return 0
+  jq empty "$cfg_file" >/dev/null 2>&1 || return 0
+
+  local current_model runtime_id has_expected_model finding
+  current_model="$(jq -r '.agents.defaults.model.primary // empty' "$cfg_file" 2>/dev/null)"
+  runtime_id="$(jq -r '.agents.defaults.agentRuntime.id // empty' "$cfg_file" 2>/dev/null)"
+  has_expected_model="$(jq -r --arg model "$EXPECTED_OPENCLAW_MODEL" '(.agents.defaults.models // {}) | has($model)' "$cfg_file" 2>/dev/null)"
+
+  if [[ "$current_model" == "$EXPECTED_OPENCLAW_MODEL" && "$has_expected_model" == "true" ]]; then
+    if [[ "$EXPECTED_OPENCLAW_MODEL" != openai-codex/* || -z "$runtime_id" ]]; then
+      return 0
+    fi
+  fi
+
+  add_incident_code "openclaw_model_config_drift"
+  if [[ "$current_model" == openai/* && "$EXPECTED_OPENCLAW_MODEL" == openai-codex/* ]]; then
+    finding="OpenClaw config uses direct OpenAI model $current_model, but this host is configured for Codex OAuth; expected $EXPECTED_OPENCLAW_MODEL."
+  else
+    finding="OpenClaw model config drift: primary=${current_model:-missing}, expected=$EXPECTED_OPENCLAW_MODEL."
+  fi
+  [[ -n "$runtime_id" && "$EXPECTED_OPENCLAW_MODEL" == openai-codex/* ]] && finding="$finding Runtime override agents.defaults.agentRuntime=$runtime_id is incompatible with the expected Codex OAuth model."
+  append_sanity_finding "$finding"
+  if [[ "$AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL" == "true" ]]; then
+    append_array ACTIONS "OpenClawNurse will restore the expected OpenClaw model config after doctor repair."
+  else
+    append_array ACTIONS "Set agents.defaults.model.primary to $EXPECTED_OPENCLAW_MODEL and remove incompatible runtime overrides manually."
+  fi
 }
 
 validate_openclaw_config_contracts() {
@@ -1311,6 +1400,7 @@ reset_sanity_state_for_final_pass() {
   TELEGRAM_COMMANDS_SUMMARY=""
   GATEWAY_LOG_SUMMARY=""
   PROVIDER_EMPTY_INPUT_COUNT=0
+  PROVIDER_AUTH_ERROR_COUNT=0
   STUCK_SESSION_COUNT=0
   CONFIG_INVALID_COUNT=0
   UPDATE_PROVENANCE_WARNING_COUNT=0
@@ -1327,6 +1417,9 @@ reset_sanity_state_for_final_pass() {
   remove_array_value ACTIONS "Inspect active Telegram/OpenClaw sessions if stuck session diagnostics continue."
   remove_array_value ACTIONS "Review OpenClaw install provenance if updates or gateway restarts are skipped."
   remove_array_value ACTIONS "Restart the gateway or update the OpenClaw default model configuration."
+  remove_array_value ACTIONS "OpenClawNurse will restore the expected OpenClaw model config after doctor repair."
+  remove_array_value ACTIONS "Set agents.defaults.model.primary to $EXPECTED_OPENCLAW_MODEL and remove incompatible runtime overrides manually."
+  remove_array_value ACTIONS "Restore Codex OAuth model config or provide OPENAI_API_KEY for direct OpenAI models."
 }
 
 run_final_sanity_pass() {
@@ -1523,6 +1616,7 @@ run_runtime_sanity() {
   detect_config_version_drift || true
   resolve_expected_model_from_config
   validate_openclaw_config_contracts || true
+  detect_openclaw_model_config_drift || true
   scan_shell_openclaw_aliases || true
 
   local current_version
@@ -1702,16 +1796,29 @@ run_gateway_log_scan() {
     return 0
   fi
 
-  PROVIDER_EMPTY_INPUT_COUNT="$(printf '%s\n' "$logs" | grep -F 'One of "input" or "previous_response_id"' | wc -l | tr -d ' ')"
-  STUCK_SESSION_COUNT="$(printf '%s\n' "$logs" | grep -F '[diagnostic] stuck session' | wc -l | tr -d ' ')"
-  CONFIG_INVALID_COUNT="$(printf '%s\n' "$logs" | grep -Ei 'Config invalid|Invalid config' | wc -l | tr -d ' ')"
-  UPDATE_PROVENANCE_WARNING_COUNT="$(printf '%s\n' "$logs" | grep -Ei 'not-git-install|Gateway restart update skipped|unknown update provenance' | wc -l | tr -d ' ')"
+  PROVIDER_EMPTY_INPUT_COUNT="$(count_fixed_lines "$logs" 'One of "input" or "previous_response_id"')"
+  PROVIDER_AUTH_ERROR_COUNT="$(count_regex_lines "$logs" 'No API key found for provider "openai"|FailoverError:.*provider "openai"|reason=auth')"
+  STUCK_SESSION_COUNT="$(count_fixed_lines "$logs" '[diagnostic] stuck session')"
+  CONFIG_INVALID_COUNT="$(count_regex_lines "$logs" 'Config invalid|Invalid config')"
+  UPDATE_PROVENANCE_WARNING_COUNT="$(count_regex_lines "$logs" 'not-git-install|Gateway restart update skipped|unknown update provenance')"
   GATEWAY_MODEL_DETECTED="$(printf '%s\n' "$logs" | grep -Eo 'agent model: [^[:space:]]+' | sed 's/^agent model: //' | tail -n 1)"
-  GATEWAY_LOG_SUMMARY="since=$since; emptyInput=$PROVIDER_EMPTY_INPUT_COUNT; stuckSessions=$STUCK_SESSION_COUNT; configInvalid=$CONFIG_INVALID_COUNT; updateProvenanceWarnings=$UPDATE_PROVENANCE_WARNING_COUNT"
+  GATEWAY_LOG_SUMMARY="since=$since; emptyInput=$PROVIDER_EMPTY_INPUT_COUNT; providerAuth=$PROVIDER_AUTH_ERROR_COUNT; stuckSessions=$STUCK_SESSION_COUNT; configInvalid=$CONFIG_INVALID_COUNT; updateProvenanceWarnings=$UPDATE_PROVENANCE_WARNING_COUNT"
 
   if (( PROVIDER_EMPTY_INPUT_COUNT > 0 )); then
     append_sanity_finding "Gateway logs contain $PROVIDER_EMPTY_INPUT_COUNT provider empty-input error(s) since $since."
     append_array ACTIONS "Inspect recent ingress commands; a command may be reaching OpenClaw but producing an empty provider prompt."
+  fi
+
+  if (( PROVIDER_AUTH_ERROR_COUNT > 0 )); then
+    local latest_auth_line latest_ready_line
+    latest_auth_line="$(printf '%s\n' "$logs" | awk 'BEGIN { IGNORECASE=1 } /No API key found for provider "openai"|FailoverError:.*provider "openai"|reason=auth/ { n=NR } END { print n + 0 }')"
+    latest_ready_line="$(printf '%s\n' "$logs" | awk '/\\[gateway\\] ready|http server listening|agent model: openai-codex\// { n=NR } END { print n + 0 }')"
+    resolve_expected_model_from_config
+    if ! (( latest_ready_line > latest_auth_line )) || [[ "$EXPECTED_OPENCLAW_MODEL" != openai-codex/* ]]; then
+      add_incident_code "provider_auth"
+      append_sanity_finding "Gateway logs contain $PROVIDER_AUTH_ERROR_COUNT direct OpenAI auth error(s) since $since."
+      append_array ACTIONS "Restore Codex OAuth model config or provide OPENAI_API_KEY for direct OpenAI models."
+    fi
   fi
 
   if (( STUCK_SESSION_COUNT > 0 )); then
@@ -2040,7 +2147,7 @@ maybe_auto_archive_orphan_transcripts() {
 }
 
 run_preflight_checks() {
-  local missing=0
+  local missing_required=0
   local required=(jq flock timeout "$OPENCLAW_BIN")
   local cmd
 
@@ -2064,7 +2171,7 @@ run_preflight_checks() {
   for cmd in "${required[@]}"; do
     if ! command_exists "$cmd"; then
       append_array ERRORS "Missing required command: $cmd"
-      missing=1
+      missing_required=1
     fi
   done
 
@@ -2076,12 +2183,14 @@ run_preflight_checks() {
     append_unique_array ACTIONS "Configure TELEGRAM_BOT_TOKEN so OpenClawNurse can deliver reports."
   fi
 
-  return "$missing"
+  return "$missing_required"
 }
 
 
 pm2_gateway_app_names_json() {
-  printf '%s\n' $PM2_GATEWAY_APP_NAMES | jq -Rsc 'split("\n") | map(select(length > 0))'
+  local app_names=()
+  read -r -a app_names <<<"$PM2_GATEWAY_APP_NAMES"
+  printf '%s\n' "${app_names[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))'
 }
 
 pm2_gateway_apps_json() {
@@ -2309,7 +2418,9 @@ run_update() {
 
   UPDATE_ERROR="$output"
 
-  local doctor_repair_output doctor_repair_status
+  # shellcheck disable=SC2034 # run_capture_with_heartbeat writes the captured output by nameref.
+  local doctor_repair_output
+  local doctor_repair_status
   local repair_cmd
   build_openclaw_cmd repair_cmd
   repair_cmd+=(doctor --repair --non-interactive)
@@ -2397,6 +2508,80 @@ run_doctor_phase() {
   DOCTOR_OUTPUT="$output"
   DOCTOR_EXIT_CODE="$status"
   classify_doctor "$output" "$status"
+}
+
+remediate_expected_openclaw_model_config() {
+  [[ "$AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL" == "true" ]] || return 0
+  [[ -n "$EXPECTED_OPENCLAW_MODEL" ]] || return 0
+  [[ -f "$OPENCLAW_CONFIG_FILE" ]] || return 0
+  jq empty "$OPENCLAW_CONFIG_FILE" >/dev/null 2>&1 || return 0
+
+  local current_model runtime_id has_expected_model should_fix=0
+  current_model="$(jq -r '.agents.defaults.model.primary // empty' "$OPENCLAW_CONFIG_FILE" 2>/dev/null)"
+  runtime_id="$(jq -r '.agents.defaults.agentRuntime.id // empty' "$OPENCLAW_CONFIG_FILE" 2>/dev/null)"
+  has_expected_model="$(jq -r --arg model "$EXPECTED_OPENCLAW_MODEL" '(.agents.defaults.models // {}) | has($model)' "$OPENCLAW_CONFIG_FILE" 2>/dev/null)"
+
+  [[ "$current_model" != "$EXPECTED_OPENCLAW_MODEL" ]] && should_fix=1
+  [[ "$has_expected_model" != "true" ]] && should_fix=1
+  if [[ "$EXPECTED_OPENCLAW_MODEL" == openai-codex/* && -n "$runtime_id" ]]; then
+    should_fix=1
+  fi
+  [[ "$should_fix" -eq 1 ]] || return 0
+
+  add_incident_code "openclaw_model_config_drift"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would restore OpenClaw model config to $EXPECTED_OPENCLAW_MODEL."
+    record_remediation "openclaw_model_config_drift" "would_apply" "would set agents.defaults.model.primary"
+    return 0
+  fi
+
+  local models_json output status
+  models_json="$(jq -c --arg model "$EXPECTED_OPENCLAW_MODEL" '
+    ((.agents.defaults.models // {}) + {($model): {}})
+    | if ($model | startswith("openai-codex/")) then
+        with_entries(select(.key | startswith("openai/") | not))
+      else
+        .
+      end
+  ' "$OPENCLAW_CONFIG_FILE")"
+
+  local cmd
+  build_openclaw_cmd cmd
+  run_capture output status "Restoring expected OpenClaw primary model" \
+    "${cmd[@]}" config set agents.defaults.model.primary "$EXPECTED_OPENCLAW_MODEL"
+  if [[ "$status" -ne 0 ]]; then
+    append_array ERRORS "Failed to restore expected OpenClaw primary model."
+    append_array ACTIONS "Set agents.defaults.model.primary to $EXPECTED_OPENCLAW_MODEL manually."
+    record_remediation "openclaw_model_config_drift" "apply_failed" "$output"
+    return 1
+  fi
+
+  build_openclaw_cmd cmd
+  run_capture output status "Restoring expected OpenClaw model registry" \
+    "${cmd[@]}" config set agents.defaults.models "$models_json" --strict-json --replace
+  if [[ "$status" -ne 0 ]]; then
+    append_array ERRORS "Failed to restore expected OpenClaw model registry."
+    append_array ACTIONS "Remove incompatible direct OpenAI model entries from agents.defaults.models manually."
+    record_remediation "openclaw_model_config_drift" "apply_failed" "$output"
+    return 1
+  fi
+
+  if [[ "$EXPECTED_OPENCLAW_MODEL" == openai-codex/* && -n "$runtime_id" ]]; then
+    build_openclaw_cmd cmd
+    run_capture output status "Removing incompatible OpenClaw agent runtime override" \
+      "${cmd[@]}" config unset agents.defaults.agentRuntime
+    if [[ "$status" -ne 0 ]]; then
+      append_array ERRORS "Failed to remove incompatible OpenClaw agent runtime override."
+      append_array ACTIONS "Remove agents.defaults.agentRuntime manually."
+      record_remediation "openclaw_model_config_drift" "apply_failed" "$output"
+      return 1
+    fi
+  fi
+
+  REMEDIATION_APPLIED=1
+  MODEL_CONFIG_REMEDIATED=1
+  append_array FIXES "Restored OpenClaw model config to $EXPECTED_OPENCLAW_MODEL."
+  record_remediation "openclaw_model_config_drift" "applied" "set expected OpenClaw model config"
 }
 
 refresh_gateway_service_after_update() {
@@ -2786,7 +2971,9 @@ deliver_report() {
     retry_pending_report
   fi
 
-  local send_output send_status
+  # shellcheck disable=SC2034 # run_capture writes the captured output by nameref; only status is needed here.
+  local send_output
+  local send_status
   local trimmed
   trimmed="$(trim_report "$report_text")"
   run_capture send_output send_status "Delivering report" \
@@ -2909,15 +3096,19 @@ main() {
   fi
 
   run_doctor_phase
+  remediate_expected_openclaw_model_config || true
   maybe_auto_archive_orphan_transcripts || true
   maybe_auto_remediate_missing_transcripts || true
   if [[ "$REMEDIATION_APPLIED" -eq 1 ]]; then
     run_doctor_phase
+    remediate_expected_openclaw_model_config || true
   fi
 
-  if [[ "$UPDATE_SUCCEEDED" -eq 1 || "$CONFIG_RESTORED" -eq 1 ]]; then
-    restart_gateway || true
-    wait_for_gateway_health || true
+  if [[ "$UPDATE_SUCCEEDED" -eq 1 || "$CONFIG_RESTORED" -eq 1 || "$MODEL_CONFIG_REMEDIATED" -eq 1 ]]; then
+    if restart_gateway; then
+      record_gateway_restart
+      wait_for_gateway_health || true
+    fi
   else
     maybe_auto_restart_unhealthy_gateway || true
   fi
