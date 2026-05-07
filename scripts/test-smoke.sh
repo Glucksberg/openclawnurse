@@ -302,6 +302,92 @@ EOF
   pass "telegram sanity runs for implicit bot token configs"
 }
 
+smoke_commitments_trace_model_access_is_reported() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/commitments.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw/commitments/extractor-sessions/main/run"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"commitments":{"enabled":true,"maxPerDay":2},"agents":{"defaults":{"model":{"primary":"openai-codex/gpt-5.5"}}}}
+EOF
+  cat >"$tmp/home/.openclaw/commitments/extractor-sessions/main/run/trace.json" <<'EOF'
+{"provider":"openai","modelId":"gpt-5.5","errorMessage":"Project does not have access to model openai/gpt-5.5"}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_COMMITMENTS_SANITY="true"
+CONFIG_BACKUP_ENABLED="false"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify --dry-run >/dev/null
+
+  "$JQ_BIN" -e '.status == "DEGRADED" and any(.incidentCodes[]; . == "commitments_extractor_model_access") and .sanity.modelAccessErrorCount >= 1' \
+    "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "commitments model access trace was not reported"
+
+  pass "commitments trace model access errors are reported"
+}
+
+smoke_security_audit_critical_is_reported() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/security.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  cat >"$tmp/bin/openclaw" <<'EOF'
+#!/usr/bin/env bash
+
+case "${1:-}" in
+  --version)
+    printf 'OpenClaw 2026.1.0\n'
+    ;;
+  update)
+    printf '{"availability":{"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
+    ;;
+  doctor)
+    printf 'doctor complete\n'
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  security)
+    printf '{"findings":[{"severity":"critical","checkId":"security.exposure.open_groups_with_runtime_or_fs","title":"unsafe"}],"summary":{"critical":1,"warn":0,"info":0}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="true"
+CONFIG_BACKUP_ENABLED="false"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify --dry-run >/dev/null
+
+  "$JQ_BIN" -e '.status == "FAILED" and any(.incidentCodes[]; . == "security_audit_critical") and .sanity.securityAuditCriticalCount == 1' \
+    "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "security audit critical finding was not reported"
+
+  pass "security audit critical findings are reported"
+}
+
 smoke_telegram_commands_are_remediated() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/telegram-commands.XXXXXX")"
@@ -963,6 +1049,8 @@ main() {
   smoke_self_test_uses_openclaw_telegram_token
   smoke_sanity_overrides_updated_status
   smoke_telegram_sanity_uses_implicit_bot_token
+  smoke_commitments_trace_model_access_is_reported
+  smoke_security_audit_critical_is_reported
   smoke_telegram_commands_are_remediated
   smoke_config_version_drift_forces_update
   smoke_config_version_drift_update_failure_is_failed

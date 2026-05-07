@@ -13,6 +13,7 @@ It is designed to be installed next to an OpenClaw runtime and run unattended fr
 - backs up and restores `openclaw.json` when the config is invalid
 - deduplicates stale OpenClaw installations that can shadow the active CLI
 - repairs local launcher/path drift for common npm/pnpm installs
+- checks commitments, security audit output, package drift and local hotfix markers
 - restarts the OpenClaw gateway when maintenance requires it
 - waits for gateway health after maintenance
 - scans runtime, Telegram, config and gateway logs for actionable issues
@@ -63,6 +64,9 @@ Common settings:
 - `TELEGRAM_BOT_TOKEN`: optional dedicated token. If empty, the Nurse can reuse the OpenClaw Telegram token from `~/.openclaw/openclaw.json`.
 - `EXPECTED_OPENCLAW_MODEL`: optional expected primary model. If unset, the Nurse can infer `openai-codex/*` when the host has Codex OAuth but no direct OpenAI API key.
 - `AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL`: restores model config drift after `openclaw doctor --repair`.
+- `ENABLE_COMMITMENTS_SANITY`: checks enabled commitments and recent extractor traces for model/provider errors.
+- `ENABLE_SECURITY_AUDIT`: runs `openclaw security audit --json` and promotes critical findings to failed status.
+- `ENABLE_PACKAGE_DRIFT_SANITY`: detects local package hotfix markers that could be overwritten by future updates.
 - `EXTRA_PATH`: extra executable paths for environments such as Linuxbrew or custom package managers.
 
 See `config/openclaw-doctor.env.example` for the complete set of runtime options.
@@ -82,6 +86,24 @@ For OpenClaw-managed alerts, run the installer with:
 ```
 
 The alert helper reads `doctor-state.json` and sends only relevant incident or recovery messages.
+
+## Sanity Probes
+
+The extra probes are designed to detect issues that `openclaw doctor` may report
+indirectly or not report on its own:
+
+- commitments: verifies that enabled commitments can be listed and scans recent
+  extractor traces for provider/model errors.
+- security audit: runs `openclaw security audit --json`; critical findings mark
+  the Nurse run as failed, while warnings become follow-up items.
+- package drift: looks for local hotfix markers inside the active OpenClaw
+  package so operators know updates may overwrite local repairs.
+- gateway logs: scans recent journal output for provider errors, config issues,
+  stuck sessions, and update provenance warnings.
+
+The Nurse only auto-fixes narrow local file permission issues. Sensitive policy
+changes such as open groups with elevated tools, insecure Control UI exposure, or
+channel scope changes remain manual follow-up.
 
 ## Runtime Behavior
 

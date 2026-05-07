@@ -164,6 +164,13 @@ DIAGNOSTIC_LOG_LINES="${DIAGNOSTIC_LOG_LINES:-20}"
 ENABLE_RUNTIME_SANITY="${ENABLE_RUNTIME_SANITY:-true}"
 ENABLE_TELEGRAM_SANITY="${ENABLE_TELEGRAM_SANITY:-true}"
 ENABLE_GATEWAY_LOG_SCAN="${ENABLE_GATEWAY_LOG_SCAN:-true}"
+ENABLE_COMMITMENTS_SANITY="${ENABLE_COMMITMENTS_SANITY:-true}"
+ENABLE_SECURITY_AUDIT="${ENABLE_SECURITY_AUDIT:-true}"
+SECURITY_AUDIT_DEEP="${SECURITY_AUDIT_DEEP:-false}"
+SECURITY_AUDIT_TIMEOUT="${SECURITY_AUDIT_TIMEOUT:-90}"
+AUTO_FIX_SECURITY_FILE_PERMS="${AUTO_FIX_SECURITY_FILE_PERMS:-true}"
+ENABLE_PACKAGE_DRIFT_SANITY="${ENABLE_PACKAGE_DRIFT_SANITY:-true}"
+COMMITMENTS_TRACE_SCAN_DAYS="${COMMITMENTS_TRACE_SCAN_DAYS:-14}"
 EXPECTED_OPENCLAW_MODEL="${EXPECTED_OPENCLAW_MODEL:-}"
 EXPECTED_TELEGRAM_COMMANDS="${EXPECTED_TELEGRAM_COMMANDS:-new reset}"
 AUTO_REMEDIATE_TELEGRAM_COMMANDS="${AUTO_REMEDIATE_TELEGRAM_COMMANDS:-true}"
@@ -630,11 +637,20 @@ GATEWAY_PACKAGE_VERSION=""
 GATEWAY_MODEL_DETECTED=""
 TELEGRAM_COMMANDS_SUMMARY=""
 GATEWAY_LOG_SUMMARY=""
+COMMITMENTS_SUMMARY=""
+SECURITY_AUDIT_SUMMARY=""
+PACKAGE_DRIFT_SUMMARY=""
+DOCTOR_WARNING_SUMMARY=""
 PROVIDER_EMPTY_INPUT_COUNT=0
 PROVIDER_AUTH_ERROR_COUNT=0
 STUCK_SESSION_COUNT=0
 CONFIG_INVALID_COUNT=0
 UPDATE_PROVENANCE_WARNING_COUNT=0
+COMMITMENTS_ERROR_COUNT=0
+MODEL_ACCESS_ERROR_COUNT=0
+SECURITY_AUDIT_CRITICAL_COUNT=0
+SECURITY_AUDIT_WARN_COUNT=0
+LOCAL_HOTFIX_COUNT=0
 CONFIG_LAST_TOUCHED_VERSION=""
 CONFIG_VERSION_DRIFT=0
 CONFIG_VERSION_DRIFT_FINDING=""
@@ -776,6 +792,10 @@ persist_json() {
     --arg expectedOpenclawModel "$EXPECTED_OPENCLAW_MODEL" \
     --arg telegramCommands "$TELEGRAM_COMMANDS_SUMMARY" \
     --arg gatewayLogSummary "$GATEWAY_LOG_SUMMARY" \
+    --arg commitmentsSummary "$COMMITMENTS_SUMMARY" \
+    --arg securityAuditSummary "$SECURITY_AUDIT_SUMMARY" \
+    --arg packageDriftSummary "$PACKAGE_DRIFT_SUMMARY" \
+    --arg doctorWarningSummary "$DOCTOR_WARNING_SUMMARY" \
     --arg reportText "$report_text" \
     --argjson dryRun "$(json_bool "$DRY_RUN")" \
     --argjson updateAttempted "$(json_bool "$UPDATE_ATTEMPTED")" \
@@ -810,6 +830,11 @@ persist_json() {
     --argjson stuckSessionCount "$(json_int "$STUCK_SESSION_COUNT")" \
     --argjson configInvalidCount "$(json_int "$CONFIG_INVALID_COUNT")" \
     --argjson updateProvenanceWarningCount "$(json_int "$UPDATE_PROVENANCE_WARNING_COUNT")" \
+    --argjson commitmentsErrorCount "$(json_int "$COMMITMENTS_ERROR_COUNT")" \
+    --argjson modelAccessErrorCount "$(json_int "$MODEL_ACCESS_ERROR_COUNT")" \
+    --argjson securityAuditCriticalCount "$(json_int "$SECURITY_AUDIT_CRITICAL_COUNT")" \
+    --argjson securityAuditWarnCount "$(json_int "$SECURITY_AUDIT_WARN_COUNT")" \
+    --argjson localHotfixCount "$(json_int "$LOCAL_HOTFIX_COUNT")" \
     --argjson sanityFindings "$sanity_findings_json" \
     '{
       timestamp: $timestamp,
@@ -863,11 +888,20 @@ persist_json() {
         gatewayModelDetected: $gatewayModelDetected,
         telegramCommands: $telegramCommands,
         gatewayLogSummary: $gatewayLogSummary,
+        commitmentsSummary: $commitmentsSummary,
+        securityAuditSummary: $securityAuditSummary,
+        packageDriftSummary: $packageDriftSummary,
+        doctorWarningSummary: $doctorWarningSummary,
         providerEmptyInputCount: $providerEmptyInputCount,
         providerAuthErrorCount: $providerAuthErrorCount,
         stuckSessionCount: $stuckSessionCount,
         configInvalidCount: $configInvalidCount,
-        updateProvenanceWarningCount: $updateProvenanceWarningCount
+        updateProvenanceWarningCount: $updateProvenanceWarningCount,
+        commitmentsErrorCount: $commitmentsErrorCount,
+        modelAccessErrorCount: $modelAccessErrorCount,
+        securityAuditCriticalCount: $securityAuditCriticalCount,
+        securityAuditWarnCount: $securityAuditWarnCount,
+        localHotfixCount: $localHotfixCount
       },
       outputs: {
         update: $updateOutput,
@@ -1399,11 +1433,20 @@ reset_sanity_state_for_final_pass() {
   GATEWAY_MODEL_DETECTED=""
   TELEGRAM_COMMANDS_SUMMARY=""
   GATEWAY_LOG_SUMMARY=""
+  COMMITMENTS_SUMMARY=""
+  SECURITY_AUDIT_SUMMARY=""
+  PACKAGE_DRIFT_SUMMARY=""
+  DOCTOR_WARNING_SUMMARY=""
   PROVIDER_EMPTY_INPUT_COUNT=0
   PROVIDER_AUTH_ERROR_COUNT=0
   STUCK_SESSION_COUNT=0
   CONFIG_INVALID_COUNT=0
   UPDATE_PROVENANCE_WARNING_COUNT=0
+  COMMITMENTS_ERROR_COUNT=0
+  MODEL_ACCESS_ERROR_COUNT=0
+  SECURITY_AUDIT_CRITICAL_COUNT=0
+  SECURITY_AUDIT_WARN_COUNT=0
+  LOCAL_HOTFIX_COUNT=0
 
   remove_array_value ACTIONS "Inspect shell openclaw aliases/functions if CLI and gateway versions diverge."
   remove_array_value ACTIONS "Remove or update stale OpenClaw installations that can shadow the current CLI."
@@ -1425,6 +1468,9 @@ reset_sanity_state_for_final_pass() {
 run_final_sanity_pass() {
   reset_sanity_state_for_final_pass
   run_runtime_sanity || true
+  scan_openclaw_package_hotfixes || true
+  run_commitments_sanity || true
+  run_security_audit_sanity || true
   run_telegram_sanity || true
   run_gateway_log_scan || true
 }
@@ -1850,6 +1896,216 @@ run_gateway_log_scan() {
   fi
 }
 
+scan_openclaw_package_hotfixes() {
+  [[ "$ENABLE_PACKAGE_DRIFT_SANITY" == "true" ]] || return 0
+  SANITY_ATTEMPTED=1
+
+  local roots=()
+  local candidate root marker_count marker
+  if [[ "$OPENCLAW_BIN" == */* ]]; then
+    root="$(openclaw_package_root_from_path "$OPENCLAW_BIN" || true)"
+    [[ -n "$root" ]] && append_unique_array roots "$root"
+  else
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] || continue
+      root="$(openclaw_package_root_from_path "$candidate" || true)"
+      [[ -n "$root" ]] && append_unique_array roots "$root"
+    done < <(type -a -P "$OPENCLAW_BIN" 2>/dev/null || true)
+  fi
+
+  for candidate in $OPENCLAW_EXTRA_SCAN_PATHS; do
+    [[ -e "$candidate" || -L "$candidate" ]] || continue
+    root="$(openclaw_package_root_from_path "$candidate" || true)"
+    [[ -n "$root" ]] && append_unique_array roots "$root"
+  done
+
+  local hotfix_lines=()
+  for root in "${roots[@]:-}"; do
+    [[ -d "$root" ]] || continue
+    marker_count="$(find "$root" -type f \( -name '*.bak-commitments-model-*' -o -name '*.openclawnurse-hotfix-*' \) 2>/dev/null | wc -l | tr -d ' ')"
+    if (( marker_count > 0 )); then
+      LOCAL_HOTFIX_COUNT=$((LOCAL_HOTFIX_COUNT + marker_count))
+      hotfix_lines+=("$root:$marker_count")
+      while IFS= read -r marker; do
+        [[ -n "$marker" ]] || continue
+        append_unique_array ACTIONS "Local OpenClaw package hotfix marker found at $marker; upstream or reapply this fix after package updates."
+      done < <(find "$root" -type f \( -name '*.bak-commitments-model-*' -o -name '*.openclawnurse-hotfix-*' \) 2>/dev/null | head -n 5)
+    fi
+  done
+
+  if (( LOCAL_HOTFIX_COUNT > 0 )); then
+    add_incident_code "openclaw_package_local_hotfix"
+    PACKAGE_DRIFT_SUMMARY="localHotfixMarkers=$LOCAL_HOTFIX_COUNT; roots=${hotfix_lines[*]}"
+    append_sanity_finding "OpenClaw package has $LOCAL_HOTFIX_COUNT local hotfix marker(s); future updates may overwrite them."
+  else
+    PACKAGE_DRIFT_SUMMARY="localHotfixMarkers=0"
+  fi
+}
+
+run_commitments_sanity() {
+  [[ "$ENABLE_COMMITMENTS_SANITY" == "true" ]] || return 0
+  SANITY_ATTEMPTED=1
+
+  local enabled="false"
+  if [[ -f "$OPENCLAW_CONFIG_FILE" ]] && jq empty "$OPENCLAW_CONFIG_FILE" >/dev/null 2>&1; then
+    enabled="$(jq -r '.commitments.enabled // false' "$OPENCLAW_CONFIG_FILE" 2>/dev/null)"
+  fi
+
+  if [[ "$enabled" != "true" ]]; then
+    COMMITMENTS_SUMMARY="disabled"
+    return 0
+  fi
+
+  local output status cmd
+  build_openclaw_cmd cmd
+  cmd+=(commitments --all --json)
+  run_capture_allow_fail output status "Checking commitments store" timeout "${STATUS_TIMEOUT}s" "${cmd[@]}"
+  if [[ "$status" -ne 0 ]] || ! printf '%s' "$output" | jq empty >/dev/null 2>&1; then
+    add_incident_code "commitments_cli_failed"
+    COMMITMENTS_SUMMARY="enabled=true; cli=failed"
+    append_sanity_finding "Commitments are enabled, but 'openclaw commitments --all --json' failed."
+    append_unique_array ACTIONS "Verify the OpenClaw commitments command and current package version."
+    return 0
+  fi
+
+  local count store_path max_per_day
+  count="$(printf '%s' "$output" | jq -r '.count // (.commitments | length) // 0' 2>/dev/null)"
+  store_path="$(printf '%s' "$output" | jq -r '.storePath // .store // empty' 2>/dev/null)"
+  max_per_day="$(jq -r '.commitments.maxPerDay // empty' "$OPENCLAW_CONFIG_FILE" 2>/dev/null || true)"
+
+  local trace_dir="$OPENCLAW_STATE_HOME/commitments/extractor-sessions"
+  local trace_logs=""
+  if [[ -d "$trace_dir" ]]; then
+    trace_logs="$(find "$trace_dir" -type f -mtime "-$COMMITMENTS_TRACE_SCAN_DAYS" -print0 2>/dev/null \
+      | xargs -0 grep -IhE 'errorMessage|does not have access to model|model_not_found|unsupported model|Unauthorized|provider|modelId|openai/gpt-5\.5' 2>/dev/null || true)"
+  fi
+
+  COMMITMENTS_ERROR_COUNT="$(printf '%s\n' "$trace_logs" | grep -Ei 'errorMessage|failed|error' | wc -l | tr -d ' ')"
+  MODEL_ACCESS_ERROR_COUNT="$(printf '%s\n' "$trace_logs" | grep -Ei 'does not have access to model|model_not_found|unsupported model|unauthorized|permission denied' | wc -l | tr -d ' ')"
+
+  resolve_expected_model_from_config
+  local mismatch_count=0
+  if [[ -n "$EXPECTED_OPENCLAW_MODEL" && -n "$trace_logs" ]]; then
+    mismatch_count="$(printf '%s\n' "$trace_logs" | grep -E 'modelId|provider|openai/gpt-5\.5' | grep -Fv "$EXPECTED_OPENCLAW_MODEL" | wc -l | tr -d ' ')"
+  fi
+
+  COMMITMENTS_SUMMARY="enabled=true; count=${count:-0}; maxPerDay=${max_per_day:-unknown}; store=${store_path:-unknown}; traceErrors=$COMMITMENTS_ERROR_COUNT; modelAccessErrors=$MODEL_ACCESS_ERROR_COUNT"
+
+  if (( MODEL_ACCESS_ERROR_COUNT > 0 )); then
+    add_incident_code "commitments_extractor_model_access"
+    append_sanity_finding "Commitments extractor traces contain $MODEL_ACCESS_ERROR_COUNT model access error(s) in the last $COMMITMENTS_TRACE_SCAN_DAYS day(s)."
+    append_unique_array ACTIONS "Check commitments extractor provider/model routing; it may be using a model the account cannot access."
+  elif (( COMMITMENTS_ERROR_COUNT > 0 )); then
+    add_incident_code "commitments_extractor_failed"
+    append_sanity_finding "Commitments extractor traces contain $COMMITMENTS_ERROR_COUNT error line(s) in the last $COMMITMENTS_TRACE_SCAN_DAYS day(s)."
+    append_unique_array ACTIONS "Inspect recent files under $trace_dir for failed commitment extraction runs."
+  fi
+
+  if (( mismatch_count > 0 )); then
+    add_incident_code "commitments_extractor_model_mismatch"
+    append_sanity_finding "Commitments extractor traces mention model/provider values that differ from expected model $EXPECTED_OPENCLAW_MODEL."
+    append_unique_array ACTIONS "Align commitments extraction model selection with the agent/default OpenClaw model."
+  fi
+}
+
+fix_security_file_permissions() {
+  [[ "$AUTO_FIX_SECURITY_FILE_PERMS" == "true" ]] || return 0
+
+  local path
+  for path in "$OPENCLAW_STATE_HOME/credentials"; do
+    [[ -e "$path" ]] || continue
+    if [[ -n "$(find "$path" -maxdepth 0 -perm /077 -print -quit 2>/dev/null)" ]]; then
+      add_incident_code "security_file_permissions"
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        append_array FIXES "Dry-run: would tighten permissions on $path."
+        record_remediation "security_file_permissions" "would_apply" "chmod go-rwx $path"
+      elif chmod go-rwx "$path" 2>/dev/null; then
+        append_array FIXES "Tightened permissions on $path."
+        record_remediation "security_file_permissions" "applied" "chmod go-rwx $path"
+        REMEDIATION_APPLIED=1
+      else
+        append_sanity_finding "Security file permission fix failed for $path."
+        record_remediation "security_file_permissions" "apply_failed" "chmod go-rwx $path failed"
+      fi
+    fi
+  done
+}
+
+run_security_audit_sanity() {
+  [[ "$ENABLE_SECURITY_AUDIT" == "true" ]] || return 0
+  SANITY_ATTEMPTED=1
+
+  fix_security_file_permissions || true
+
+  local cmd output status
+  build_openclaw_cmd cmd
+  cmd+=(security audit --json)
+  [[ "$SECURITY_AUDIT_DEEP" == "true" ]] && cmd+=(--deep)
+
+  run_capture_allow_fail output status "Running OpenClaw security audit" timeout "${SECURITY_AUDIT_TIMEOUT}s" "${cmd[@]}"
+  if [[ "$status" -ne 0 ]] || ! printf '%s' "$output" | jq empty >/dev/null 2>&1; then
+    add_incident_code "security_audit_failed"
+    SECURITY_AUDIT_SUMMARY="failed"
+    append_sanity_finding "OpenClaw security audit failed or returned invalid JSON."
+    append_unique_array ACTIONS "Run openclaw security audit --json manually and inspect stderr/output."
+    return 0
+  fi
+
+  SECURITY_AUDIT_CRITICAL_COUNT="$(printf '%s' "$output" | jq -r '[.findings[]? | select(.severity == "critical")] | length' 2>/dev/null)"
+  SECURITY_AUDIT_WARN_COUNT="$(printf '%s' "$output" | jq -r '[.findings[]? | select(.severity == "warn")] | length' 2>/dev/null)"
+  local top_findings
+  top_findings="$(printf '%s' "$output" | jq -r '.findings[]? | select(.severity == "critical" or .severity == "warn") | "\(.severity):\(.checkId)"' 2>/dev/null | head -n 5 | paste -sd ',' -)"
+  SECURITY_AUDIT_SUMMARY="critical=$SECURITY_AUDIT_CRITICAL_COUNT; warn=$SECURITY_AUDIT_WARN_COUNT${top_findings:+; top=$top_findings}"
+
+  if (( SECURITY_AUDIT_CRITICAL_COUNT > 0 )); then
+    add_incident_code "security_audit_critical"
+    append_sanity_critical "OpenClaw security audit reports $SECURITY_AUDIT_CRITICAL_COUNT critical finding(s)."
+    append_unique_array ACTIONS "Review openclaw security audit findings before exposing channels, tools, or Control UI."
+  elif (( SECURITY_AUDIT_WARN_COUNT > 0 )); then
+    add_incident_code "security_audit_warn"
+    append_sanity_finding "OpenClaw security audit reports $SECURITY_AUDIT_WARN_COUNT warning(s)."
+    append_unique_array ACTIONS "Review openclaw security audit warnings and decide which policy changes are intentional."
+  fi
+}
+
+parse_doctor_output_signals() {
+  local output="$1"
+  local lowered
+  lowered="$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')"
+  local signals=()
+
+  if printf '%s' "$lowered" | grep -Eq 'system node.*below required|node.*below required'; then
+    signals+=("system-node-below-required")
+    append_sanity_finding "Doctor reports the system Node.js is below OpenClaw's required version."
+    append_unique_array ACTIONS "Keep the gateway service pinned to the bundled supported Node.js runtime or update the system Node.js package."
+  fi
+
+  if printf '%s' "$lowered" | grep -Eq 'no active memory plugin'; then
+    signals+=("memory-plugin-inactive")
+    append_sanity_finding "Doctor reports no active memory plugin registered for the current config."
+    append_unique_array ACTIONS "Verify whether claude-mem should provide OpenClaw memory search in this profile."
+  fi
+
+  if printf '%s' "$lowered" | grep -Eq 'missing requirements[[:space:]]+[1-9]|missing requirements'; then
+    signals+=("skills-missing-requirements")
+    append_sanity_finding "Doctor reports skills with missing requirements."
+    append_unique_array ACTIONS "Review OpenClaw doctor skills output and install only the skill requirements that are actually needed."
+  fi
+
+  if printf '%s' "$lowered" | grep -Eq 'plugins.*errors:[[:space:]]*[1-9]|errors:[[:space:]]*[1-9]'; then
+    signals+=("doctor-errors")
+    append_sanity_finding "Doctor output contains non-zero error counters."
+    append_unique_array ACTIONS "Inspect OpenClaw doctor output for plugin/runtime errors."
+  fi
+
+  if ((${#signals[@]} > 0)); then
+    DOCTOR_WARNING_SUMMARY="$(printf '%s ' "${signals[@]}" | sed 's/[[:space:]]$//')"
+    add_incident_code "doctor_warnings"
+  else
+    DOCTOR_WARNING_SUMMARY="none"
+  fi
+}
+
 run_self_test() {
   log INFO "Running self-test"
 
@@ -1897,6 +2153,9 @@ run_self_test() {
   fi
 
   run_runtime_sanity || true
+  scan_openclaw_package_hotfixes || true
+  run_commitments_sanity || true
+  run_security_audit_sanity || true
   run_telegram_sanity || true
   local original_gateway_log_since="$GATEWAY_LOG_SINCE"
   GATEWAY_LOG_SINCE="10 minutes ago"
@@ -2508,6 +2767,7 @@ run_doctor_phase() {
   DOCTOR_OUTPUT="$output"
   DOCTOR_EXIT_CODE="$status"
   classify_doctor "$output" "$status"
+  parse_doctor_output_signals "$output"
 }
 
 remediate_expected_openclaw_model_config() {
@@ -2906,6 +3166,14 @@ EOF
     printf '\nDoctor highlights:\n%s\n' "$summary_lines"
   fi
 
+  if [[ -n "$COMMITMENTS_SUMMARY" || -n "$SECURITY_AUDIT_SUMMARY" || -n "$PACKAGE_DRIFT_SUMMARY" || -n "$DOCTOR_WARNING_SUMMARY" ]]; then
+    printf '\nSanity probes:\n'
+    [[ -n "$COMMITMENTS_SUMMARY" ]] && printf -- '- commitments: %s\n' "$COMMITMENTS_SUMMARY"
+    [[ -n "$SECURITY_AUDIT_SUMMARY" ]] && printf -- '- security audit: %s\n' "$SECURITY_AUDIT_SUMMARY"
+    [[ -n "$PACKAGE_DRIFT_SUMMARY" ]] && printf -- '- package drift: %s\n' "$PACKAGE_DRIFT_SUMMARY"
+    [[ -n "$DOCTOR_WARNING_SUMMARY" ]] && printf -- '- doctor warnings: %s\n' "$DOCTOR_WARNING_SUMMARY"
+  fi
+
   if array_has_nonempty SANITY_FINDINGS; then
     printf '\nSanity findings:\n'
     print_bullets_from_array SANITY_FINDINGS
@@ -3083,6 +3351,9 @@ main() {
   maybe_auto_remediate_openclaw_installations || true
   maybe_auto_remediate_shell_openclaw_shadowing || true
   run_runtime_sanity || true
+  scan_openclaw_package_hotfixes || true
+  run_commitments_sanity || true
+  run_security_audit_sanity || true
   run_telegram_sanity || true
   run_gateway_log_scan || true
 

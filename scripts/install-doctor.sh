@@ -8,6 +8,7 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/openclawnurse}"
 CONFIG_DIR="${CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/openclawnurse}"
 STATE_DIR="${STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/openclawnurse}"
+LOCAL_BIN_DIR="${LOCAL_BIN_DIR:-$HOME/.local/bin}"
 SYSTEMD_USER_DIR="${SYSTEMD_USER_DIR:-$HOME/.config/systemd/user}"
 CONFIG_FILE="${CONFIG_FILE:-$CONFIG_DIR/openclawnurse.env}"
 SCHEDULER="${SCHEDULER:-auto}"
@@ -348,6 +349,16 @@ install_runtime_files() {
   install -m 0644 "$REPO_ROOT/systemd/openclawnurse.timer" "$INSTALL_DIR/systemd/openclawnurse.timer.template"
 }
 
+install_cli_wrapper() {
+  mkdir -p "$LOCAL_BIN_DIR"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'exec %q --config %q "$@"\n' "$INSTALL_DIR/bin/openclaw-doctor.sh" "$CONFIG_FILE"
+  } >"$LOCAL_BIN_DIR/openclawnurse"
+  chmod 0755 "$LOCAL_BIN_DIR/openclawnurse"
+  log "Installed CLI wrapper at $LOCAL_BIN_DIR/openclawnurse"
+}
+
 should_configure_openclaw_alert() {
   case "$CONFIGURE_OPENCLAW_ALERT" in
     true) return 0 ;;
@@ -602,6 +613,7 @@ main() {
   source "$CONFIG_FILE"
   apply_cli_overrides
   install_runtime_files
+  install_cli_wrapper
   configure_openclaw_alert_env
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
