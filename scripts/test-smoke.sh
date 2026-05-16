@@ -302,6 +302,93 @@ EOF
   pass "telegram sanity runs for implicit bot token configs"
 }
 
+smoke_disabled_high_frequency_cron_is_ignored() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/cron-disabled.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw/cron"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/home/.openclaw/cron/jobs.json" <<'EOF'
+{"jobs":[{"id":"disabled-fast","name":"disabled fast isolated","enabled":false,"sessionTarget":"isolated","schedule":{"everyMs":30000}}]}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="true"
+CONFIG_BACKUP_ENABLED="false"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e '.status == "OK" and .sanity.cronSummary == "" and (.incidentCodes | index("high_frequency_isolated_cron") | not)' \
+    "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "disabled high-frequency cron job was treated as enabled"
+
+  pass "disabled high-frequency cron jobs are ignored"
+}
+
+smoke_model_auth_notice_does_not_degrade() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/model-auth.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/bin/openclaw-auth-warning" <<'EOF'
+#!/usr/bin/env bash
+
+case "${1:-}" in
+  --version)
+    printf 'OpenClaw 2026.1.0\n'
+    ;;
+  update)
+    printf '{"availability":{"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
+    ;;
+  doctor)
+    printf 'Model auth\n'
+    printf 'openai-codex:default: expired (0m)\n'
+    printf 'Warnings: 1\n'
+    printf 'Doctor complete.\n'
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  status)
+    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw-auth-warning"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw-auth-warning"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e '.status == "OK" and (.incidentCodes | index("model_auth_expired")) and (.actions[] | contains("Refresh the expired model auth profile"))' \
+    "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "model auth notice degraded an otherwise healthy run"
+
+  pass "model auth notice does not degrade healthy runs"
+}
+
 smoke_commitments_trace_model_access_is_reported() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/commitments.XXXXXX")"
@@ -1049,6 +1136,8 @@ main() {
   smoke_self_test_uses_openclaw_telegram_token
   smoke_sanity_overrides_updated_status
   smoke_telegram_sanity_uses_implicit_bot_token
+  smoke_disabled_high_frequency_cron_is_ignored
+  smoke_model_auth_notice_does_not_degrade
   smoke_commitments_trace_model_access_is_reported
   smoke_security_audit_critical_is_reported
   smoke_telegram_commands_are_remediated

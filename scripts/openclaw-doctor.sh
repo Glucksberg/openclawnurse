@@ -154,6 +154,7 @@ PM2_GATEWAY_APP_NAMES="${PM2_GATEWAY_APP_NAMES:-${PM2_GATEWAY_APP_NAME:-openclaw
 MAX_GATEWAY_RESTARTS_PER_DAY="${MAX_GATEWAY_RESTARTS_PER_DAY:-1}"
 MAX_GATEWAY_RESTARTS_PER_WINDOW="${MAX_GATEWAY_RESTARTS_PER_WINDOW:-3}"
 GATEWAY_RESTART_WINDOW_SECONDS="${GATEWAY_RESTART_WINDOW_SECONDS:-300}"
+MAX_DOCTOR_REMEDIATION_PASSES="${MAX_DOCTOR_REMEDIATION_PASSES:-3}"
 MAX_ORPHAN_TRANSCRIPTS_PER_RUN="${MAX_ORPHAN_TRANSCRIPTS_PER_RUN:-20}"
 OPENCLAW_CONFIG_FILE="${OPENCLAW_CONFIG_FILE:-$OPENCLAW_STATE_HOME/openclaw.json}"
 CONFIG_BACKUP_ENABLED="${CONFIG_BACKUP_ENABLED:-true}"
@@ -172,6 +173,8 @@ SECURITY_AUDIT_TIMEOUT="${SECURITY_AUDIT_TIMEOUT:-90}"
 AUTO_FIX_SECURITY_FILE_PERMS="${AUTO_FIX_SECURITY_FILE_PERMS:-true}"
 ENABLE_PACKAGE_DRIFT_SANITY="${ENABLE_PACKAGE_DRIFT_SANITY:-true}"
 COMMITMENTS_TRACE_SCAN_DAYS="${COMMITMENTS_TRACE_SCAN_DAYS:-14}"
+ENABLE_DISK_SANITY="${ENABLE_DISK_SANITY:-true}"
+ENABLE_CRON_SANITY="${ENABLE_CRON_SANITY:-true}"
 EXPECTED_OPENCLAW_MODEL="${EXPECTED_OPENCLAW_MODEL:-}"
 EXPECTED_TELEGRAM_COMMANDS="${EXPECTED_TELEGRAM_COMMANDS:-new reset}"
 AUTO_REMEDIATE_TELEGRAM_COMMANDS="${AUTO_REMEDIATE_TELEGRAM_COMMANDS:-true}"
@@ -179,6 +182,15 @@ AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL="${AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL
 GATEWAY_LOG_SINCE="${GATEWAY_LOG_SINCE:-last-run}"
 GATEWAY_LOG_FALLBACK_SINCE="${GATEWAY_LOG_FALLBACK_SINCE:-24 hours ago}"
 GATEWAY_LOG_MAX_LINES="${GATEWAY_LOG_MAX_LINES:-4000}"
+DISK_WARN_PERCENT="${DISK_WARN_PERCENT:-90}"
+DISK_CRITICAL_PERCENT="${DISK_CRITICAL_PERCENT:-97}"
+DISK_WARN_MIN_FREE_MB="${DISK_WARN_MIN_FREE_MB:-1024}"
+DISK_CRITICAL_MIN_FREE_MB="${DISK_CRITICAL_MIN_FREE_MB:-256}"
+OPENCLAW_LOG_SQLITE_WARN_MB="${OPENCLAW_LOG_SQLITE_WARN_MB:-1024}"
+DISK_TOP_OFFENDERS_LIMIT="${DISK_TOP_OFFENDERS_LIMIT:-8}"
+CRON_ISOLATED_MIN_INTERVAL_SECONDS="${CRON_ISOLATED_MIN_INTERVAL_SECONDS:-300}"
+ORPHAN_TRANSCRIPT_SAFETY_SECONDS="${ORPHAN_TRANSCRIPT_SAFETY_SECONDS:-300}"
+ORPHAN_TRANSCRIPT_ARCHIVE_DIR="${ORPHAN_TRANSCRIPT_ARCHIVE_DIR:-$STATE_DIR/orphan-transcripts}"
 OPENCLAW_EXTRA_SCAN_PATHS="${OPENCLAW_EXTRA_SCAN_PATHS:-$HOME/openclaw/node_modules/.bin/openclaw $HOME/.local/share/pnpm/openclaw $HOME/.npm-global/bin/openclaw}"
 CHECK_SHELL_ALIASES="${CHECK_SHELL_ALIASES:-true}"
 AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS="${AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS:-true}"
@@ -264,6 +276,11 @@ remove_array_value() {
     fi
   done
   ref=("${filtered[@]}")
+}
+
+remove_incident_code() {
+  local value="$1"
+  remove_array_value INCIDENT_CODES "$value"
 }
 
 append_unique_array() {
@@ -632,6 +649,9 @@ ACTIONS=()
 INCIDENT_CODES=()
 REMEDIATIONS=()
 SANITY_FINDINGS=()
+DISK_FINDINGS_SUMMARY=""
+CRON_FINDINGS_SUMMARY=""
+MODEL_AUTH_SUMMARY=""
 PREVIOUS_PENDING_PRESENT=0
 PREVIOUS_STATE_TIMESTAMP=""
 REMEDIATION_APPLIED=0
@@ -763,7 +783,7 @@ persist_json() {
   local report_text="$1"
   local report_json_tmp="$RUN_JSON_FILE.tmp"
   local state_json_tmp="$STATE_FILE.tmp"
-  local errors_json fixes_json actions_json incident_codes_json remediations_json diagnostics_json sanity_findings_json
+  local errors_json fixes_json actions_json incident_codes_json remediations_json diagnostics_json sanity_findings_json status_reasons_json
 
   errors_json="$(json_array_from_name ERRORS)"
   fixes_json="$(json_array_from_name FIXES)"
@@ -771,6 +791,7 @@ persist_json() {
   incident_codes_json="$(json_array_from_name INCIDENT_CODES)"
   remediations_json="$(json_remediations_from_name REMEDIATIONS)"
   sanity_findings_json="$(printf '%s\n' "${SANITY_FINDINGS[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0))' 2>/dev/null || printf '[]')"
+  status_reasons_json="$(build_status_reasons | jq -Rsc 'split("\n") | map(select(length > 0))' 2>/dev/null || printf '[]')"
   if printf '%s' "$DIAGNOSTICS_JSON" | jq empty >/dev/null 2>&1; then
     diagnostics_json="$DIAGNOSTICS_JSON"
   else
@@ -807,6 +828,9 @@ persist_json() {
     --arg securityAuditSummary "$SECURITY_AUDIT_SUMMARY" \
     --arg packageDriftSummary "$PACKAGE_DRIFT_SUMMARY" \
     --arg doctorWarningSummary "$DOCTOR_WARNING_SUMMARY" \
+    --arg diskSummary "$DISK_FINDINGS_SUMMARY" \
+    --arg cronSummary "$CRON_FINDINGS_SUMMARY" \
+    --arg modelAuthSummary "$MODEL_AUTH_SUMMARY" \
     --arg reportText "$report_text" \
     --argjson dryRun "$(json_bool "$DRY_RUN")" \
     --argjson updateAttempted "$(json_bool "$UPDATE_ATTEMPTED")" \
@@ -822,17 +846,18 @@ persist_json() {
     --argjson doctorExitCode "$(json_int "$DOCTOR_EXIT_CODE")" \
     --argjson consecutiveFailures "$(json_int "$CONSECUTIVE_FAILURES")" \
     --argjson durationSeconds "$(json_int "$DURATION_SECONDS")" \
-    --arg errorsJson "$errors_json" \
-    --arg fixesJson "$fixes_json" \
-    --arg actionsJson "$actions_json" \
-    --arg incidentCodesJson "$incident_codes_json" \
-    --arg remediationsJson "$remediations_json" \
+    --argjson errors "$errors_json" \
+    --argjson fixes "$fixes_json" \
+    --argjson actions "$actions_json" \
+    --argjson incidentCodes "$incident_codes_json" \
+    --argjson remediations "$remediations_json" \
     --argjson gatewayRestartsToday "$(json_int "$GATEWAY_RESTARTS_TODAY")" \
     --argjson gatewayRestartsInWindow "$(json_int "$GATEWAY_RESTARTS_IN_WINDOW")" \
     --argjson configRestored "$(json_bool "$CONFIG_RESTORED")" \
     --argjson configBackupCreated "$(json_bool "$CONFIG_BACKUP_CREATED")" \
     --argjson configVersionDrift "$(json_bool "$CONFIG_VERSION_DRIFT")" \
     --argjson diagnostics "$diagnostics_json" \
+    --argjson statusReasons "$status_reasons_json" \
     --argjson sanityAttempted "$(json_bool "$SANITY_ATTEMPTED")" \
     --argjson sanityDegraded "$(json_bool "$SANITY_DEGRADED")" \
     --argjson sanityCritical "$(json_bool "$SANITY_CRITICAL")" \
@@ -874,6 +899,7 @@ persist_json() {
       fixes: $fixes,
       actions: $actions,
       incidentCodes: $incidentCodes,
+      statusReasons: $statusReasons,
       remediations: $remediations,
       gatewayRestartsToday: $gatewayRestartsToday,
       gatewayRestartsInWindow: $gatewayRestartsInWindow,
@@ -903,6 +929,9 @@ persist_json() {
         securityAuditSummary: $securityAuditSummary,
         packageDriftSummary: $packageDriftSummary,
         doctorWarningSummary: $doctorWarningSummary,
+        diskSummary: $diskSummary,
+        cronSummary: $cronSummary,
+        modelAuthSummary: $modelAuthSummary,
         providerEmptyInputCount: $providerEmptyInputCount,
         providerAuthErrorCount: $providerAuthErrorCount,
         stuckSessionCount: $stuckSessionCount,
@@ -982,10 +1011,39 @@ build_summary_from_output() {
   local output="$1"
   local extracted
   extracted="$(printf '%s\n' "$output" \
-    | grep -E 'missing transcripts|No channel security warnings detected|Telegram:|Agents:|Session store|synced ' \
+    | grep -E 'Model auth|expired|missing transcripts|orphan transcript|No channel security warnings detected|Telegram:|Agents:|Session store|synced ' \
     | sed -E 's/[[:space:]]*│[[:space:]]*$//; s/^[[:space:][:punct:]]+//; s/[[:space:]]+/ /g' \
     | head -n 6)"
   printf '%s' "$extracted"
+}
+
+build_status_reasons() {
+  if ((${#ERRORS[@]} > 0)); then
+    printf -- '- Errors are present: %s\n' "${ERRORS[0]}"
+  fi
+  if [[ "$SANITY_CRITICAL" -eq 1 ]]; then
+    printf -- '- Critical sanity finding is present.\n'
+  elif [[ "$SANITY_DEGRADED" -eq 1 ]]; then
+    printf -- '- Sanity findings require attention.\n'
+  fi
+  if [[ -n "$MODEL_AUTH_SUMMARY" ]]; then
+    printf -- '- Model auth notice: %s\n' "$MODEL_AUTH_SUMMARY"
+  fi
+  if [[ "$DOCTOR_CLASSIFICATION" == "needs_manual_attention" ]]; then
+    printf -- '- OpenClaw doctor found unresolved operational issues.\n'
+  fi
+  if [[ "$NOTIFICATION_PENDING" -eq 1 ]]; then
+    printf -- '- Report delivery is pending.\n'
+  fi
+  if [[ "$GATEWAY_HEALTHY" -eq 0 && "$RESTART_ATTEMPTED" -eq 1 ]]; then
+    printf -- '- Gateway restart was attempted but health did not recover.\n'
+  fi
+  if ((${#INCIDENT_CODES[@]} > 0)); then
+    printf -- '- Incident codes: %s\n' "${INCIDENT_CODES[*]}"
+  fi
+  if [[ "$STATUS" == "OK" ]]; then
+    printf -- '- No active errors, critical sanity findings, or unresolved doctor findings.\n'
+  fi
 }
 
 is_valid_json_file() {
@@ -2117,6 +2175,173 @@ parse_doctor_output_signals() {
   fi
 }
 
+disk_metric_line() {
+  local path="$1"
+  df -Pm "$path" 2>/dev/null | awk 'NR == 2 { gsub(/%/, "", $5); print $1 "|" $4 "|" $5 "|" $6 }'
+}
+
+disk_top_offenders() {
+  local path="$1"
+  local limit="$2"
+  local scan_path="$path"
+  [[ -d "$scan_path" ]] || scan_path="$(dirname "$path")"
+  du -xh --max-depth=1 "$scan_path" 2>/dev/null | sort -h | tail -n "$limit"
+}
+
+run_disk_sanity() {
+  [[ "$ENABLE_DISK_SANITY" == "true" ]] || return 0
+  SANITY_ATTEMPTED=1
+
+  local paths=("$OPENCLAW_STATE_HOME" "$HOME" "/tmp")
+  local seen_mounts=()
+  local path metric fs avail_mb used_pct mount offender_summary line
+  local findings=()
+
+  for path in "${paths[@]}"; do
+    [[ -e "$path" ]] || continue
+    metric="$(disk_metric_line "$path")"
+    [[ -n "$metric" ]] || continue
+    IFS='|' read -r fs avail_mb used_pct mount <<<"$metric"
+    if [[ " ${seen_mounts[*]} " == *" $mount "* ]]; then
+      continue
+    fi
+    seen_mounts+=("$mount")
+
+    line="$mount used=${used_pct}% free=${avail_mb}MB fs=$fs"
+    findings+=("$line")
+    if (( used_pct >= DISK_CRITICAL_PERCENT || avail_mb <= DISK_CRITICAL_MIN_FREE_MB )); then
+      add_incident_code "disk_pressure"
+      offender_summary="$(disk_top_offenders "$path" "$DISK_TOP_OFFENDERS_LIMIT")"
+      append_sanity_critical "Disk critically constrained on $line. Top usage near $path: ${offender_summary//$'\n'/; }"
+      append_array ERRORS "Disk is critically constrained on $mount."
+      append_array ACTIONS "Free disk space on $mount before OpenClaw writes, updates or reports fail."
+    elif (( used_pct >= DISK_WARN_PERCENT || avail_mb <= DISK_WARN_MIN_FREE_MB )); then
+      add_incident_code "disk_pressure"
+      offender_summary="$(disk_top_offenders "$path" "$DISK_TOP_OFFENDERS_LIMIT")"
+      append_sanity_finding "Disk pressure on $line. Top usage near $path: ${offender_summary//$'\n'/; }"
+      append_array ACTIONS "Review disk usage and prune caches/logs before the filesystem fills."
+    fi
+  done
+
+  DISK_FINDINGS_SUMMARY="$(printf '%s\n' "${findings[@]:-}" | sed '/^$/d')"
+
+  local sqlite_path sqlite_size_mb
+  while IFS= read -r sqlite_path; do
+    [[ -n "$sqlite_path" ]] || continue
+    sqlite_size_mb=$(( ($(stat -c '%s' "$sqlite_path" 2>/dev/null || printf 0) + 1048575) / 1048576 ))
+    if (( sqlite_size_mb >= OPENCLAW_LOG_SQLITE_WARN_MB )); then
+      add_incident_code "large_log_sqlite"
+      append_sanity_finding "Large OpenClaw/Codex log database: $sqlite_path is ${sqlite_size_mb}MB."
+      append_array ACTIONS "Rotate or remove oversized logs_*.sqlite after stopping the gateway/app-server."
+    fi
+  done < <(find "$OPENCLAW_STATE_HOME/agents" -type f -name 'logs_*.sqlite' 2>/dev/null)
+}
+
+run_cron_sanity() {
+  [[ "$ENABLE_CRON_SANITY" == "true" ]] || return 0
+  SANITY_ATTEMPTED=1
+
+  local jobs_file="$OPENCLAW_STATE_HOME/cron/jobs.json"
+  [[ -f "$jobs_file" ]] || return 0
+  if ! jq empty "$jobs_file" >/dev/null 2>&1; then
+    append_sanity_finding "Cron sanity skipped because $jobs_file is not valid JSON."
+    return 0
+  fi
+
+  local threshold_ms=$((CRON_ISOLATED_MIN_INTERVAL_SECONDS * 1000))
+  local risky
+  risky="$(jq -r --argjson threshold "$threshold_ms" '
+    .jobs[]?
+    | select((if has("enabled") then .enabled else true end) == true)
+    | select((.sessionTarget // "") == "isolated")
+    | select((.schedule.everyMs // 0) > 0 and (.schedule.everyMs // 0) < $threshold)
+    | "\(.id) \(.name // "unnamed") every=\((.schedule.everyMs / 1000)|floor)s"
+  ' "$jobs_file")"
+
+  CRON_FINDINGS_SUMMARY="$risky"
+  if [[ -n "$risky" ]]; then
+    add_incident_code "high_frequency_isolated_cron"
+    append_sanity_finding "High-frequency isolated OpenClaw cron jobs can create session churn and orphan transcripts: ${risky//$'\n'/; }"
+    append_array ACTIONS "Move very frequent isolated cron agent jobs to direct scripts/timers, or increase their interval above ${CRON_ISOLATED_MIN_INTERVAL_SECONDS}s."
+  fi
+}
+
+default_openclaw_agent_id() {
+  local agent_id=""
+  if [[ -f "$OPENCLAW_CONFIG_FILE" ]] && jq empty "$OPENCLAW_CONFIG_FILE" >/dev/null 2>&1; then
+    agent_id="$(jq -r '.session.defaultAgentId // .agents.defaultId // .agents.default // empty' "$OPENCLAW_CONFIG_FILE" 2>/dev/null || true)"
+  fi
+  printf '%s' "${agent_id:-main}"
+}
+
+session_store_paths() {
+  if [[ "$AUTO_REMEDIATE_ALL_AGENTS" == "true" ]]; then
+    find "$OPENCLAW_STATE_HOME/agents" -mindepth 3 -maxdepth 3 -type f -path '*/sessions/sessions.json' 2>/dev/null
+    return 0
+  fi
+
+  local agent_id
+  agent_id="$(default_openclaw_agent_id)"
+  local store="$OPENCLAW_STATE_HOME/agents/$agent_id/sessions/sessions.json"
+  if [[ -f "$store" ]]; then
+    printf '%s\n' "$store"
+  fi
+}
+
+is_safe_orphan_transcript_age() {
+  local path="$1"
+  local now mtime
+  now="$(date +%s)"
+  mtime="$(stat -c '%Y' "$path" 2>/dev/null || printf '%s' "$now")"
+  (( now - mtime >= ORPHAN_TRANSCRIPT_SAFETY_SECONDS ))
+}
+
+inventory_orphan_transcript_paths() {
+  local store session_dir protected_json transcript_path transcript_name
+  while IFS= read -r store; do
+    [[ -n "$store" && -f "$store" ]] || continue
+    jq empty "$store" >/dev/null 2>&1 || continue
+    session_dir="$(dirname "$store")"
+    protected_json="$(jq -r '
+      def rows:
+        if type == "array" then .[]
+        elif type == "object" then .[]
+        else empty
+        end;
+      [rows | .sessionFile? // empty | select(length > 0) | split("/")[-1] | sub("\\.jsonl$"; "")]
+      | unique
+      | @json
+    ' "$store" 2>/dev/null || printf '[]')"
+
+    while IFS= read -r transcript_path; do
+      [[ -n "$transcript_path" && -f "$transcript_path" ]] || continue
+      is_safe_orphan_transcript_age "$transcript_path" || continue
+      transcript_name="$(basename "$transcript_path")"
+      if jq -n -e --arg name "$transcript_name" --argjson protected "$protected_json" '
+        $protected
+        | any(. as $stem | $name == ($stem + ".jsonl") or ($name | startswith($stem + ".")))
+      ' >/dev/null 2>&1; then
+        continue
+      fi
+      printf '%s\n' "$transcript_path"
+    done < <(find "$session_dir" -maxdepth 1 -type f -name '*.jsonl' 2>/dev/null)
+  done < <(session_store_paths)
+}
+
+archive_transcript_path() {
+  local transcript_path="$1"
+  local archive_root="$2"
+  local relative="$transcript_path"
+  if [[ "$relative" == "$OPENCLAW_STATE_HOME/"* ]]; then
+    relative="${relative#"$OPENCLAW_STATE_HOME/"}"
+  else
+    relative="${relative#/}"
+  fi
+  local dest="$archive_root/$relative"
+  mkdir -p "$(dirname "$dest")"
+  mv "$transcript_path" "$dest"
+}
+
 run_self_test() {
   log INFO "Running self-test"
 
@@ -2172,6 +2397,8 @@ run_self_test() {
   GATEWAY_LOG_SINCE="10 minutes ago"
   run_gateway_log_scan || true
   GATEWAY_LOG_SINCE="$original_gateway_log_since"
+  run_disk_sanity || true
+  run_cron_sanity || true
 
   if [[ "$SANITY_CRITICAL" -eq 1 ]]; then
     printf 'SELF_TEST=FAILED\n'
@@ -2216,6 +2443,36 @@ classify_doctor() {
   local exit_code="$2"
   local lowered
   lowered="$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')"
+  local actionable_lowered="$lowered"
+
+  if printf '%s' "$lowered" | grep -Eq 'model auth|auth profile|openai-codex:.*expired|auth login|authentication.*expired'; then
+    add_incident_code "model_auth_expired"
+    MODEL_AUTH_SUMMARY="$(printf '%s\n' "$output" \
+      | grep -Ei 'model auth|auth profile|openai-codex:.*expired|auth login|authentication.*expired' \
+      | sed -E 's/^[[:space:][:punct:]]+//; s/[[:space:]]+/ /g' \
+      | head -n 2 \
+      | paste -sd '; ' -)"
+    MODEL_AUTH_SUMMARY="${MODEL_AUTH_SUMMARY:-OpenClaw doctor reported an expired model auth profile.}"
+    append_unique_array ACTIONS "Refresh the expired model auth profile when you next need that profile; this does not degrade the gateway if another valid profile is active."
+    local warning_count
+    warning_count="$(printf '%s\n' "$lowered" | sed -nE 's/.*warnings:[[:space:]]*([0-9]+).*/\1/p' | sort -nr | head -n 1)"
+    warning_count="${warning_count:-0}"
+    actionable_lowered="$(printf '%s\n' "$lowered" | grep -viE 'model auth|auth profile|openai-codex:.*expired|auth login|authentication.*expired' || true)"
+    if (( warning_count <= 1 )); then
+      actionable_lowered="$(printf '%s\n' "$actionable_lowered" | grep -viE 'warnings:[[:space:]]*[1-9]' || true)"
+    fi
+  fi
+
+  if printf '%s' "$actionable_lowered" | grep -q 'orphan transcript'; then
+    local eligible_orphan_count
+    eligible_orphan_count="$(inventory_orphan_transcript_paths | sed '/^$/d' | head -n 1 | wc -l | tr -d ' ')"
+    if [[ "$eligible_orphan_count" == "0" ]]; then
+      append_unique_array ACTIONS "Fresh orphan transcripts, if any, are inside the ${ORPHAN_TRANSCRIPT_SAFETY_SECONDS}s safety window and will be rechecked automatically."
+      actionable_lowered="$(printf '%s\n' "$actionable_lowered" \
+        | grep -viE 'orphan|transcript|sessions\.json|\.jsonl|active session history|archive them safely|deleted\.<timestamp>|examples:' \
+        || true)"
+    fi
+  fi
 
   if [[ "$exit_code" -ne 0 ]]; then
     add_incident_code "doctor_failed"
@@ -2225,7 +2482,7 @@ classify_doctor() {
     return
   fi
 
-  if printf '%s' "$lowered" | grep -Eq 'doctor changes|synced|repaired|fixed|migrated|normalized|generated and configured|archived [0-9]+ orphan transcript|pruned [0-9]+'; then
+  if printf '%s' "$actionable_lowered" | grep -Eq 'doctor changes|synced|repaired|fixed|migrated|normalized|generated and configured|archived [0-9]+ orphan transcript|pruned [0-9]+'; then
     add_incident_code "doctor_repaired"
     DOCTOR_CLASSIFICATION="repaired"
     DOCTOR_SUMMARY="doctor applied at least one corrective action"
@@ -2233,14 +2490,14 @@ classify_doctor() {
     return
   fi
 
-  if printf '%s' "$lowered" | grep -Eq 'missing transcripts|needs manual attention|lasterror|errors:[[:space:]]*[1-9]|warnings:[[:space:]]*[1-9]|failed|unhealthy|orphan|corrupt|broken'; then
-    if printf '%s' "$lowered" | grep -q 'missing transcripts'; then
+  if printf '%s' "$actionable_lowered" | grep -Eq 'missing transcripts|needs manual attention|lasterror|errors:[[:space:]]*[1-9]|warnings:[[:space:]]*[1-9]|failed|unhealthy|orphan|corrupt|broken'; then
+    if printf '%s' "$actionable_lowered" | grep -q 'missing transcripts'; then
       add_incident_code "missing_transcripts"
     fi
-    if printf '%s' "$lowered" | grep -q 'orphan transcript'; then
+    if printf '%s' "$actionable_lowered" | grep -q 'orphan transcript'; then
       add_incident_code "orphan_transcripts"
     fi
-    if printf '%s' "$lowered" | grep -Eq 'unhealthy|gateway'; then
+    if printf '%s' "$actionable_lowered" | grep -Eq 'unhealthy|gateway'; then
       add_incident_code "gateway_unhealthy"
     fi
     DOCTOR_CLASSIFICATION="needs_manual_attention"
@@ -2249,7 +2506,7 @@ classify_doctor() {
     return
   fi
 
-  if printf '%s' "$lowered" | grep -Eq 'no channel security warnings detected|doctor complete'; then
+  if printf '%s' "$actionable_lowered" | grep -Eq 'no channel security warnings detected|doctor complete'; then
     DOCTOR_CLASSIFICATION="healthy"
     DOCTOR_SUMMARY="doctor completed without actionable findings"
     if [[ "$REMEDIATION_APPLIED" -eq 1 ]]; then
@@ -2350,36 +2607,39 @@ maybe_auto_archive_orphan_transcripts() {
   printf '%s' "$DOCTOR_OUTPUT" | grep -qi 'orphan transcript file' || return 0
   add_incident_code "orphan_transcripts"
 
+  local transcript_paths=()
+  local transcript_path
+  while IFS= read -r transcript_path; do
+    [[ -n "$transcript_path" ]] || continue
+    append_unique_array transcript_paths "$transcript_path"
+  done < <(inventory_orphan_transcript_paths | sort -u)
+
   local transcript_names=()
   while IFS= read -r transcript_name; do
     [[ -n "$transcript_name" ]] || continue
     transcript_names+=("$transcript_name")
   done < <(printf '%s' "$DOCTOR_OUTPUT" | grep -oE '[[:alnum:]_.-]+\.jsonl' | sort -u)
 
-  if ((${#transcript_names[@]} == 0)); then
-    append_array ACTIONS "Doctor reported orphan transcripts, but no transcript filenames could be extracted automatically."
-    record_remediation "orphan_transcripts" "preview_failed" "no transcript filenames could be extracted"
-    return 1
+  if ((${#transcript_paths[@]} == 0 && ${#transcript_names[@]} > 0)); then
+    local transcript_name
+    for transcript_name in "${transcript_names[@]}"; do
+      while IFS= read -r transcript_path; do
+        [[ -n "$transcript_path" ]] || continue
+        is_safe_orphan_transcript_age "$transcript_path" || continue
+        append_unique_array transcript_paths "$transcript_path"
+      done < <(find "$OPENCLAW_STATE_HOME/agents" -type f -name "$transcript_name" 2>/dev/null)
+    done
   fi
-
-  local transcript_paths=()
-  local transcript_name transcript_path
-  for transcript_name in "${transcript_names[@]}"; do
-    while IFS= read -r transcript_path; do
-      [[ -n "$transcript_path" ]] || continue
-      transcript_paths+=("$transcript_path")
-    done < <(find "$OPENCLAW_STATE_HOME/agents" -type f -name "$transcript_name" 2>/dev/null)
-  done
 
   if ((${#transcript_paths[@]} == 0)); then
     if [[ "$DRY_RUN" -eq 0 ]]; then
-      append_array FIXES "Doctor reported orphan transcripts, but no matching files remained after doctor repair."
-      record_remediation "orphan_transcripts" "not_needed" "no matching files remained after doctor repair"
+      append_array FIXES "Doctor reported orphan transcripts, but no eligible files remained outside the ${ORPHAN_TRANSCRIPT_SAFETY_SECONDS}s safety window."
+      record_remediation "orphan_transcripts" "deferred" "no eligible files outside safety window"
       return 0
     fi
-    append_array ACTIONS "Doctor reported orphan transcripts, but no matching files were found under $OPENCLAW_STATE_HOME/agents."
-    record_remediation "orphan_transcripts" "preview_failed" "no matching files found under agent state"
-    return 1
+    append_array ACTIONS "Doctor reported orphan transcripts, but no eligible files were found outside the ${ORPHAN_TRANSCRIPT_SAFETY_SECONDS}s safety window."
+    record_remediation "orphan_transcripts" "deferred" "no eligible files outside safety window"
+    return 0
   fi
 
   if ((${#transcript_paths[@]} > MAX_ORPHAN_TRANSCRIPTS_PER_RUN)); then
@@ -2390,7 +2650,7 @@ maybe_auto_archive_orphan_transcripts() {
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     append_array FIXES "Dry-run: would archive ${#transcript_paths[@]} orphan transcript file(s)."
-    append_array ACTIONS "Run without --dry-run to archive orphan transcript files automatically."
+    append_array ACTIONS "Run without --dry-run to archive orphan transcript files automatically. Files newer than ${ORPHAN_TRANSCRIPT_SAFETY_SECONDS}s are left untouched."
     record_remediation "orphan_transcripts" "would_apply" "would archive ${#transcript_paths[@]} orphan transcript files"
     return 0
   fi
@@ -2398,22 +2658,34 @@ maybe_auto_archive_orphan_transcripts() {
   local archived_count=0
   local ts
   ts="$(date --iso-8601=seconds | tr ':' '-')"
+  local archive_root="$ORPHAN_TRANSCRIPT_ARCHIVE_DIR/$ts"
   for transcript_path in "${transcript_paths[@]}"; do
     [[ -f "$transcript_path" ]] || continue
-    mv "$transcript_path" "$transcript_path.deleted.$ts"
+    archive_transcript_path "$transcript_path" "$archive_root"
     archived_count=$((archived_count + 1))
   done
 
   if ((archived_count == 0)); then
-    append_array ACTIONS "Doctor reported orphan transcripts, but no matching files remained by the time remediation ran."
-    record_remediation "orphan_transcripts" "not_needed" "no matching files remained by apply time"
-    return 1
+    append_array FIXES "Doctor reported orphan transcripts, but no eligible files remained by the time remediation ran."
+    record_remediation "orphan_transcripts" "deferred" "no eligible files remained by apply time"
+    return 0
   fi
 
   REMEDIATION_APPLIED=1
-  append_array FIXES "Archived $archived_count orphan transcript file(s)."
-  record_remediation "orphan_transcripts" "applied" "archived $archived_count orphan transcript files"
+  append_array FIXES "Archived $archived_count orphan transcript file(s) to $archive_root."
+  record_remediation "orphan_transcripts" "applied" "archived $archived_count orphan transcript files to $archive_root"
   return 0
+}
+
+prepare_doctor_recheck_after_remediation() {
+  remove_incident_code "missing_transcripts"
+  remove_incident_code "orphan_transcripts"
+  remove_incident_code "doctor_repaired"
+  remove_array_value ACTIONS "Review the doctor recommendations that remain unresolved."
+  remove_array_value ACTIONS "Run without --dry-run to archive orphan transcript files automatically. Files newer than ${ORPHAN_TRANSCRIPT_SAFETY_SECONDS}s are left untouched."
+  remove_array_value ACTIONS "Run without --dry-run to auto-prune session entries with missing transcripts."
+  DOCTOR_CLASSIFICATION="unknown"
+  DOCTOR_SUMMARY="doctor will be rechecked after remediation"
 }
 
 run_preflight_checks() {
@@ -2937,6 +3209,7 @@ wait_for_gateway_health() {
 
     if [[ "$status" -eq 0 ]] && printf '%s' "$json_output" | jq -e '.ok == true' >/dev/null 2>&1; then
       GATEWAY_HEALTHY=1
+      remove_incident_code "gateway_unhealthy"
       log INFO "Checking gateway health succeeded"
       return 0
     fi
@@ -2962,6 +3235,7 @@ check_gateway_health_once() {
 
   if [[ "$status" -eq 0 ]] && printf '%s' "$json_output" | jq -e '.ok == true' >/dev/null 2>&1; then
     GATEWAY_HEALTHY=1
+    remove_incident_code "gateway_unhealthy"
     return 0
   fi
 
@@ -3131,6 +3405,8 @@ build_report() {
 
   local summary_lines
   summary_lines="$(build_summary_from_output "$DOCTOR_OUTPUT")"
+  local status_reason_lines
+  status_reason_lines="$(build_status_reasons)"
 
   cat <<EOF
 OpenClawNurse Daily Report
@@ -3152,6 +3428,10 @@ Health check: $health_line
 Config: $CONFIG_HEALTH
 Duration: ${DURATION_SECONDS}s
 EOF
+
+  if [[ -n "$status_reason_lines" ]]; then
+    printf '\nStatus reasons:\n%s\n' "$status_reason_lines"
+  fi
 
   if [[ "$CONFIG_BACKUP_CREATED" -eq 1 ]]; then
     printf '\nConfig backup: created\n'
@@ -3185,6 +3465,17 @@ EOF
     [[ -n "$SECURITY_AUDIT_SUMMARY" ]] && printf -- '- security audit: %s\n' "$SECURITY_AUDIT_SUMMARY"
     [[ -n "$PACKAGE_DRIFT_SUMMARY" ]] && printf -- '- package drift: %s\n' "$PACKAGE_DRIFT_SUMMARY"
     [[ -n "$DOCTOR_WARNING_SUMMARY" ]] && printf -- '- doctor warnings: %s\n' "$DOCTOR_WARNING_SUMMARY"
+  fi
+
+  if [[ -n "$MODEL_AUTH_SUMMARY" ]]; then
+    printf '\nModel auth:\n%s\n' "$MODEL_AUTH_SUMMARY"
+  fi
+
+  if [[ -n "$DISK_FINDINGS_SUMMARY" || -n "$CRON_FINDINGS_SUMMARY" || -n "$GATEWAY_LOG_SUMMARY" ]]; then
+    printf '\nSanity summaries:\n'
+    [[ -n "$DISK_FINDINGS_SUMMARY" ]] && printf -- '- Disk: %s\n' "${DISK_FINDINGS_SUMMARY//$'\n'/; }"
+    [[ -n "$CRON_FINDINGS_SUMMARY" ]] && printf -- '- Cron: %s\n' "${CRON_FINDINGS_SUMMARY//$'\n'/; }"
+    [[ -n "$GATEWAY_LOG_SUMMARY" ]] && printf -- '- Gateway logs: %s\n' "$GATEWAY_LOG_SUMMARY"
   fi
 
   if array_has_nonempty SANITY_FINDINGS; then
@@ -3369,6 +3660,8 @@ main() {
   run_security_audit_sanity || true
   run_telegram_sanity || true
   run_gateway_log_scan || true
+  run_disk_sanity || true
+  run_cron_sanity || true
 
   if should_attempt_update; then
     run_update || true
@@ -3380,13 +3673,20 @@ main() {
   fi
 
   run_doctor_phase
-  remediate_expected_openclaw_model_config || true
-  maybe_auto_archive_orphan_transcripts || true
-  maybe_auto_remediate_missing_transcripts || true
-  if [[ "$REMEDIATION_APPLIED" -eq 1 ]]; then
-    run_doctor_phase
+  local doctor_pass=0
+  while (( doctor_pass < MAX_DOCTOR_REMEDIATION_PASSES )); do
+    REMEDIATION_APPLIED=0
     remediate_expected_openclaw_model_config || true
-  fi
+    maybe_auto_archive_orphan_transcripts || true
+    maybe_auto_remediate_missing_transcripts || true
+    if [[ "$REMEDIATION_APPLIED" -ne 1 ]]; then
+      break
+    fi
+    prepare_doctor_recheck_after_remediation
+    run_doctor_phase
+    doctor_pass=$((doctor_pass + 1))
+  done
+  remediate_expected_openclaw_model_config || true
 
   if [[ "$UPDATE_SUCCEEDED" -eq 1 || "$CONFIG_RESTORED" -eq 1 || "$MODEL_CONFIG_REMEDIATED" -eq 1 ]]; then
     if restart_gateway; then
