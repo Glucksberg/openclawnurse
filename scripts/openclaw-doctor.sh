@@ -131,6 +131,7 @@ REPORT_CHANNEL="${REPORT_CHANNEL:-telegram}"
 TELEGRAM_TARGET="${TELEGRAM_TARGET:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 AUTO_DETECT_TELEGRAM_TARGET="${AUTO_DETECT_TELEGRAM_TARGET:-true}"
+TELEGRAM_MESSAGE_THREAD_ID="${TELEGRAM_MESSAGE_THREAD_ID:-}"
 TELEGRAM_API_BASE_URL="${TELEGRAM_API_BASE_URL:-https://api.telegram.org}"
 AUTO_UPDATE="${AUTO_UPDATE:-true}"
 UPDATE_CHANNEL="${UPDATE_CHANNEL:-stable}"
@@ -532,25 +533,35 @@ send_telegram_message() {
     jq -n \
       --arg channel "telegram" \
       --arg target "$TELEGRAM_TARGET" \
+      --arg thread_id "$TELEGRAM_MESSAGE_THREAD_ID" \
       --arg text "$message_text" \
-      '{ok:true,dryRun:true,channel:$channel,target:$target,messageLength:($text|length)}'
+      '{ok:true,dryRun:true,channel:$channel,target:$target,messageThreadId:($thread_id|if length==0 then empty else . end),messageLength:($text|length)}'
     return 0
   fi
 
   local response
   local http_code
+  local -a curl_args
+  curl_args=(
+    -sS
+    -X POST
+    --connect-timeout 10
+    --max-time 30
+    -o /tmp/openclawnurse-telegram-response.$$
+    -w '%{http_code}'
+    --data-urlencode "chat_id=$TELEGRAM_TARGET"
+    --data-urlencode "text=$message_text"
+    --data-urlencode "disable_web_page_preview=true"
+    --data-urlencode "parse_mode="
+    "$TELEGRAM_API_BASE_URL/bot$TELEGRAM_BOT_TOKEN/sendMessage"
+  )
+
+  if [[ -n "$TELEGRAM_MESSAGE_THREAD_ID" ]]; then
+    curl_args+=(--data-urlencode "message_thread_id=$TELEGRAM_MESSAGE_THREAD_ID")
+  fi
+
   response="$(
-    curl -sS \
-      -X POST \
-      --connect-timeout 10 \
-      --max-time 30 \
-      -o /tmp/openclawnurse-telegram-response.$$ \
-      -w '%{http_code}' \
-      --data-urlencode "chat_id=$TELEGRAM_TARGET" \
-      --data-urlencode "text=$message_text" \
-      --data-urlencode "disable_web_page_preview=true" \
-      --data-urlencode "parse_mode=" \
-      "$TELEGRAM_API_BASE_URL/bot$TELEGRAM_BOT_TOKEN/sendMessage"
+    curl "${curl_args[@]}"
   )"
   http_code="$response"
 
@@ -811,11 +822,11 @@ persist_json() {
     --argjson doctorExitCode "$(json_int "$DOCTOR_EXIT_CODE")" \
     --argjson consecutiveFailures "$(json_int "$CONSECUTIVE_FAILURES")" \
     --argjson durationSeconds "$(json_int "$DURATION_SECONDS")" \
-    --argjson errors "$errors_json" \
-    --argjson fixes "$fixes_json" \
-    --argjson actions "$actions_json" \
-    --argjson incidentCodes "$incident_codes_json" \
-    --argjson remediations "$remediations_json" \
+    --arg errorsJson "$errors_json" \
+    --arg fixesJson "$fixes_json" \
+    --arg actionsJson "$actions_json" \
+    --arg incidentCodesJson "$incident_codes_json" \
+    --arg remediationsJson "$remediations_json" \
     --argjson gatewayRestartsToday "$(json_int "$GATEWAY_RESTARTS_TODAY")" \
     --argjson gatewayRestartsInWindow "$(json_int "$GATEWAY_RESTARTS_IN_WINDOW")" \
     --argjson configRestored "$(json_bool "$CONFIG_RESTORED")" \
@@ -2343,7 +2354,7 @@ maybe_auto_archive_orphan_transcripts() {
   while IFS= read -r transcript_name; do
     [[ -n "$transcript_name" ]] || continue
     transcript_names+=("$transcript_name")
-  done < <(printf '%s' "$DOCTOR_OUTPUT" | grep -oE '[[:alnum:]_.-]+\.trajectory\.jsonl' | sort -u)
+  done < <(printf '%s' "$DOCTOR_OUTPUT" | grep -oE '[[:alnum:]_.-]+\.jsonl' | sort -u)
 
   if ((${#transcript_names[@]} == 0)); then
     append_array ACTIONS "Doctor reported orphan transcripts, but no transcript filenames could be extracted automatically."
@@ -3072,8 +3083,10 @@ collect_diagnostics() {
       --arg configError "$config_error" \
       --arg gatewayLog "$gateway_log" \
       --arg gatewayErr "$gateway_err" \
-      --argjson openclawStatus "$openclaw_status" \
-      '{
+      --arg openclawStatusJson "$openclaw_status" \
+      'def json_or($raw; $fallback): try ($raw | fromjson) catch $fallback;
+      (json_or($openclawStatusJson; null)) as $openclawStatus
+      | {
         collectedAt: $collectedAt,
         openclawVersion: $version,
         processSnapshot: $processSnapshot,
