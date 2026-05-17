@@ -6,6 +6,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 JQ_BIN="${JQ_BIN:-jq}"
 SMOKE_TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$SMOKE_TMP_ROOT"' EXIT
+export RUN_PROFILE=heavy
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -146,6 +147,68 @@ EOF
     fail "REPORT_CHANNEL=none left a pending report"
 
   pass "report channel none skips direct notification"
+}
+
+smoke_light_profile_skips_heavy_maintenance() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/light-profile.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  cat >"$tmp/bin/openclaw" <<EOF
+#!/usr/bin/env bash
+case "\${1:-}" in
+  --version)
+    printf 'OpenClaw 2026.1.0\n'
+    ;;
+  update)
+    if [[ "\${2:-}" == "status" ]]; then
+      printf '{"availability":{"available":false,"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
+    else
+      printf '{"ok":true}\n'
+    fi
+    ;;
+  doctor|security)
+    printf 'heavy command should not run in light profile\n' >>"$tmp/heavy-called"
+    exit 99
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  status)
+    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+RUN_PROFILE="light"
+AUTO_UPDATE="false"
+ENABLE_SECURITY_AUDIT="true"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EOF
+
+  RUN_PROFILE=light HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  [[ ! -f "$tmp/heavy-called" ]] || fail "light profile ran doctor/security audit"
+  "$JQ_BIN" -e '
+    .status == "OK"
+    and .runProfile == "light"
+    and .doctorAttempted == false
+    and .doctorSummary == "skipped in light profile"
+    and .sanity.securityAuditSummary == "skipped in light profile"
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "light profile did not persist a clean lightweight run"
+
+  pass "light profile skips heavy maintenance"
 }
 
 smoke_missing_telegram_token_does_not_block_maintenance() {
@@ -1266,6 +1329,7 @@ main() {
   smoke_doctor_without_complete_config
   smoke_pending_report_after_notification_failure
   smoke_report_channel_none_skips_delivery
+  smoke_light_profile_skips_heavy_maintenance
   smoke_missing_telegram_token_does_not_block_maintenance
   smoke_self_test_uses_openclaw_telegram_token
   smoke_sanity_overrides_updated_status

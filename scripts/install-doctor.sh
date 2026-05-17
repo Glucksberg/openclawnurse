@@ -358,6 +358,8 @@ install_runtime_files() {
 }
 
 configure_self_update_env() {
+  set_env_default RUN_PROFILE "light"
+  set_env_default HEAVY_RUN_KEY "openclawnurse-heavy"
   set_env_value SELF_UPDATE_REPO_DIR "$REPO_ROOT"
   set_env_default AUTO_SELF_UPDATE "true"
   set_env_default SELF_UPDATE_REMOTE "origin"
@@ -378,6 +380,13 @@ install_cli_wrapper() {
   } >"$LOCAL_BIN_DIR/openclawnurse"
   chmod 0755 "$LOCAL_BIN_DIR/openclawnurse"
   log "Installed CLI wrapper at $LOCAL_BIN_DIR/openclawnurse"
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'exec %q --config %q openclawnurse-heavy "$@"\n' "$INSTALL_DIR/bin/openclaw-doctor.sh" "$CONFIG_FILE"
+  } >"$LOCAL_BIN_DIR/openclawnurse-heavy"
+  chmod 0755 "$LOCAL_BIN_DIR/openclawnurse-heavy"
+  log "Installed heavy-run wrapper at $LOCAL_BIN_DIR/openclawnurse-heavy"
 }
 
 should_configure_openclaw_alert() {

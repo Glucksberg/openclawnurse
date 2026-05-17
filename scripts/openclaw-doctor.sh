@@ -19,6 +19,8 @@ DRY_RUN=0
 RETRY_PENDING_ONLY=0
 NO_NOTIFY=0
 SELF_TEST=0
+REQUESTED_RUN_PROFILE=""
+REQUESTED_RUN_KEY=""
 
 usage() {
   cat <<'EOF'
@@ -30,6 +32,11 @@ Options:
   --retry-pending       Only retry pending notifications and exit.
   --no-notify           Skip notification delivery for this run.
   --self-test           Validate config, connectivity and OpenClaw access without maintenance.
+  --light               Run the normal lightweight maintenance profile.
+  --heavy               Run heavyweight doctor/security maintenance.
+  --mode <light|heavy>  Select the maintenance profile explicitly.
+  --run-key <key>       Select a profile through a configured trigger key.
+  openclawnurse-heavy   Heavy run trigger key for agents.
   -h, --help            Show this help.
 EOF
 }
@@ -54,6 +61,30 @@ while (($# > 0)); do
       ;;
     --self-test)
       SELF_TEST=1
+      shift
+      ;;
+    --light)
+      REQUESTED_RUN_PROFILE="light"
+      shift
+      ;;
+    --heavy)
+      REQUESTED_RUN_PROFILE="heavy"
+      shift
+      ;;
+    --mode)
+      REQUESTED_RUN_PROFILE="${2:?missing value for --mode}"
+      shift 2
+      ;;
+    --run-key)
+      REQUESTED_RUN_KEY="${2:?missing value for --run-key}"
+      shift 2
+      ;;
+    openclawnurse-heavy)
+      REQUESTED_RUN_KEY="$1"
+      shift
+      ;;
+    openclawnurse-light)
+      REQUESTED_RUN_PROFILE="light"
       shift
       ;;
     -h|--help)
@@ -133,6 +164,24 @@ TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 AUTO_DETECT_TELEGRAM_TARGET="${AUTO_DETECT_TELEGRAM_TARGET:-true}"
 TELEGRAM_MESSAGE_THREAD_ID="${TELEGRAM_MESSAGE_THREAD_ID:-}"
 TELEGRAM_API_BASE_URL="${TELEGRAM_API_BASE_URL:-https://api.telegram.org}"
+RUN_PROFILE="${RUN_PROFILE:-light}"
+HEAVY_RUN_KEY="${HEAVY_RUN_KEY:-openclawnurse-heavy}"
+if [[ -n "$REQUESTED_RUN_KEY" ]]; then
+  if [[ "$REQUESTED_RUN_KEY" == "$HEAVY_RUN_KEY" ]]; then
+    REQUESTED_RUN_PROFILE="heavy"
+  else
+    echo "Unsupported run key: $REQUESTED_RUN_KEY" >&2
+    exit 2
+  fi
+fi
+[[ -n "$REQUESTED_RUN_PROFILE" ]] && RUN_PROFILE="$REQUESTED_RUN_PROFILE"
+case "$RUN_PROFILE" in
+  light|heavy) ;;
+  *)
+    echo "Unsupported RUN_PROFILE=$RUN_PROFILE; expected light or heavy." >&2
+    exit 2
+    ;;
+esac
 AUTO_UPDATE="${AUTO_UPDATE:-true}"
 UPDATE_CHANNEL="${UPDATE_CHANNEL:-stable}"
 UPDATE_TAG="${UPDATE_TAG:-}"
@@ -343,6 +392,10 @@ array_has_nonempty() {
 
 command_exists() {
   command -v "$1" >/dev/null 2>&1
+}
+
+is_heavy_run() {
+  [[ "$RUN_PROFILE" == "heavy" ]]
 }
 
 run_capture() {
@@ -823,6 +876,7 @@ persist_json() {
     --arg timestamp "$RUN_ISO" \
     --arg hostname "$HOST_NAME" \
     --arg status "$STATUS" \
+    --arg runProfile "$RUN_PROFILE" \
     --arg currentVersionBefore "$CURRENT_VERSION_BEFORE" \
     --arg currentVersionAfter "$CURRENT_VERSION_AFTER" \
     --arg availableVersion "$AVAILABLE_VERSION" \
@@ -909,6 +963,7 @@ persist_json() {
       timestamp: $timestamp,
       hostname: $hostname,
       status: $status,
+      runProfile: $runProfile,
       currentVersionBefore: $currentVersionBefore,
       currentVersionAfter: $currentVersionAfter,
       availableVersion: $availableVersion,
@@ -1573,7 +1628,11 @@ run_final_sanity_pass() {
   run_runtime_sanity || true
   scan_openclaw_package_hotfixes || true
   run_commitments_sanity || true
-  run_security_audit_sanity || true
+  if is_heavy_run; then
+    run_security_audit_sanity || true
+  else
+    SECURITY_AUDIT_SUMMARY="skipped in light profile"
+  fi
   run_telegram_sanity || true
   run_gateway_log_scan || true
 }
@@ -3771,6 +3830,10 @@ build_report() {
   local mode_text="live"
   [[ "$DRY_RUN" -eq 1 ]] && mode_text="dry-run"
 
+  local profile_text="$RUN_PROFILE"
+  [[ "$RUN_PROFILE" == "heavy" ]] && profile_text="heavy"
+  [[ "$RUN_PROFILE" == "light" ]] && profile_text="light"
+
   local update_line="not attempted"
   if [[ "$UPDATE_ATTEMPTED" -eq 1 && "$UPDATE_SUCCEEDED" -eq 1 ]]; then
     update_line="applied successfully"
@@ -3814,6 +3877,7 @@ Date: $RUN_DATE
 Host: $HOST_NAME
 Instance: $REPORT_INSTANCE_LABEL
 Mode: $mode_text
+Profile: $profile_text
 Status: $STATUS
 
 Version before: ${CURRENT_VERSION_BEFORE:-unknown}
@@ -4008,6 +4072,7 @@ main() {
 
   log INFO "$PROGRAM_NAME $PROGRAM_VERSION starting"
   log INFO "Using config file $CONFIG_FILE"
+  log INFO "Using run profile $RUN_PROFILE"
 
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
@@ -4060,7 +4125,11 @@ main() {
   run_runtime_sanity || true
   scan_openclaw_package_hotfixes || true
   run_commitments_sanity || true
-  run_security_audit_sanity || true
+  if is_heavy_run; then
+    run_security_audit_sanity || true
+  else
+    SECURITY_AUDIT_SUMMARY="skipped in light profile"
+  fi
   run_telegram_sanity || true
   run_gateway_log_scan || true
   run_disk_sanity || true
@@ -4075,22 +4144,26 @@ main() {
     refresh_stale_gateway_service || true
   fi
 
-  run_doctor_phase
-  local doctor_pass=0
-  while (( doctor_pass < MAX_DOCTOR_REMEDIATION_PASSES )); do
-    REMEDIATION_APPLIED=0
-    DOCTOR_RECHECK_NEEDED=0
-    remediate_expected_openclaw_model_config || true
-    maybe_auto_archive_orphan_transcripts || true
-    maybe_auto_remediate_missing_transcripts || true
-    if [[ "$REMEDIATION_APPLIED" -ne 1 || "$DOCTOR_RECHECK_NEEDED" -ne 1 ]]; then
-      break
-    fi
-    prepare_doctor_recheck_after_remediation
+  if is_heavy_run; then
     run_doctor_phase
-    doctor_pass=$((doctor_pass + 1))
-  done
-  remediate_expected_openclaw_model_config || true
+    local doctor_pass=0
+    while (( doctor_pass < MAX_DOCTOR_REMEDIATION_PASSES )); do
+      REMEDIATION_APPLIED=0
+      DOCTOR_RECHECK_NEEDED=0
+      remediate_expected_openclaw_model_config || true
+      maybe_auto_archive_orphan_transcripts || true
+      maybe_auto_remediate_missing_transcripts || true
+      if [[ "$REMEDIATION_APPLIED" -ne 1 || "$DOCTOR_RECHECK_NEEDED" -ne 1 ]]; then
+        break
+      fi
+      prepare_doctor_recheck_after_remediation
+      run_doctor_phase
+      doctor_pass=$((doctor_pass + 1))
+    done
+    remediate_expected_openclaw_model_config || true
+  else
+    DOCTOR_SUMMARY="skipped in light profile"
+  fi
 
   if [[ "$UPDATE_SUCCEEDED" -eq 1 || "$CONFIG_RESTORED" -eq 1 || "$MODEL_CONFIG_REMEDIATED" -eq 1 ]]; then
     if restart_gateway; then

@@ -56,6 +56,8 @@ The main config file is:
 Common settings:
 
 - `OPENCLAW_BIN`: OpenClaw CLI path. Defaults to `openclaw`.
+- `RUN_PROFILE`: `light` for the normal daily run, or `heavy` for full doctor/security maintenance.
+- `openclawnurse-heavy`: installed wrapper/trigger key for agents to request the heavy profile explicitly.
 - `AUTO_UPDATE`: whether the Nurse should apply available updates.
 - `AUTO_SELF_UPDATE`: whether the Nurse should pull its own git upstream, validate it, install the refreshed runtime scripts, and use the new version on the next run.
 - `SELF_UPDATE_REPO_DIR`: local OpenClawNurse git checkout used for self-update. The installer writes this automatically.
