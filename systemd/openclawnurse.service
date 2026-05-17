@@ -8,3 +8,7 @@ EnvironmentFile=__CONFIG_FILE__
 Environment=PATH=%h/.npm-global/bin:%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=__INSTALL_DIR__
 ExecStart=__INSTALL_DIR__/bin/openclaw-doctor.sh --config __CONFIG_FILE__
+MemoryMax=1800M
+MemorySwapMax=512M
+CPUQuota=75%
+TasksMax=128
