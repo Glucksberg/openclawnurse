@@ -149,6 +149,7 @@ SELF_UPDATE_RESTART_GATEWAY="${SELF_UPDATE_RESTART_GATEWAY:-false}"
 SELF_UPDATE_POST_SELF_TEST="${SELF_UPDATE_POST_SELF_TEST:-false}"
 STATUS_TIMEOUT="${STATUS_TIMEOUT:-10}"
 DOCTOR_TIMEOUT="${DOCTOR_TIMEOUT:-900}"
+DOCTOR_NO_WORKSPACE_SUGGESTIONS="${DOCTOR_NO_WORKSPACE_SUGGESTIONS:-true}"
 GATEWAY_WAIT_TIMEOUT="${GATEWAY_WAIT_TIMEOUT:-180}"
 GATEWAY_WAIT_INTERVAL="${GATEWAY_WAIT_INTERVAL:-5}"
 HEALTH_TIMEOUT_MS="${HEALTH_TIMEOUT_MS:-10000}"
@@ -3416,12 +3417,14 @@ run_doctor_phase() {
     local cmd
     build_openclaw_cmd cmd
     cmd+=(doctor --non-interactive)
+    [[ "$DOCTOR_NO_WORKSPACE_SUGGESTIONS" == "true" ]] && cmd+=(--no-workspace-suggestions)
     run_capture_with_heartbeat output status "Running doctor in dry-run mode" 30 \
       timeout "${DOCTOR_TIMEOUT}s" "${cmd[@]}"
   else
     local cmd
     build_openclaw_cmd cmd
     cmd+=(doctor --repair --non-interactive)
+    [[ "$DOCTOR_NO_WORKSPACE_SUGGESTIONS" == "true" ]] && cmd+=(--no-workspace-suggestions)
     run_capture_with_heartbeat output status "Running doctor repair" 30 \
       timeout "${DOCTOR_TIMEOUT}s" "${cmd[@]}"
   fi
