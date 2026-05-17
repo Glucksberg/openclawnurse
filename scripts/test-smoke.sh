@@ -1126,8 +1126,142 @@ EOF
   pass "default deduplicates local OpenClaw shim and shell function"
 }
 
+write_minimal_self_update_tree() {
+  local tree="$1"
+  local marker="$2"
+
+  mkdir -p "$tree/scripts" "$tree/systemd" "$tree/config"
+  cat >"$tree/install.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+EOF
+  chmod +x "$tree/install.sh"
+
+  cat >"$tree/scripts/openclaw-doctor.sh" <<EOF
+#!/usr/bin/env bash
+set -u
+case "\${1:-}" in
+  -h|--help)
+    printf 'self-update test doctor help\n'
+    exit 0
+    ;;
+esac
+printf '%s\n' '$marker'
+EOF
+  chmod +x "$tree/scripts/openclaw-doctor.sh"
+
+  cat >"$tree/scripts/openclawnurse-openclaw-alert.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+exit 0
+EOF
+  chmod +x "$tree/scripts/openclawnurse-openclaw-alert.sh"
+
+  cat >"$tree/scripts/install-doctor.sh" <<'EOF'
+#!/usr/bin/env bash
+set -u
+exit 0
+EOF
+  chmod +x "$tree/scripts/install-doctor.sh"
+
+  cat >"$tree/systemd/openclawnurse.service" <<'EOF'
+[Service]
+ExecStart=/bin/true
+EOF
+  cat >"$tree/systemd/openclawnurse.timer" <<'EOF'
+[Timer]
+OnCalendar=daily
+EOF
+}
+
+git_commit_all() {
+  local repo="$1"
+  local message="$2"
+  git -C "$repo" add .
+  git -C "$repo" -c user.name='OpenClawNurse Test' -c user.email='test@example.invalid' commit -m "$message" >/dev/null
+}
+
+smoke_self_update_applies_valid_upstream() {
+  local tmp remote repo updater target_head
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/self-update.XXXXXX")"
+  remote="$tmp/remote.git"
+  repo="$tmp/repo"
+  updater="$tmp/updater"
+
+  mkdir -p "$tmp/bin" "$tmp/home" "$tmp/state" "$tmp/data" "$tmp/cfg"
+  make_fake_openclaw "$tmp/bin/openclaw"
+
+  git -c init.defaultBranch=main init --bare "$remote" >/dev/null
+  git -c init.defaultBranch=main init "$repo" >/dev/null
+  write_minimal_self_update_tree "$repo" "self-update-old"
+  git_commit_all "$repo" "initial"
+  git -C "$repo" branch -M main
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -u origin main >/dev/null 2>&1
+
+  git clone --branch main "$remote" "$updater" >/dev/null 2>&1
+  write_minimal_self_update_tree "$updater" "self-update-new"
+  git_commit_all "$updater" "update"
+  git -C "$updater" push origin main >/dev/null 2>&1
+  target_head="$(git -C "$updater" rev-parse HEAD)"
+
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+EXTRA_PATH="$tmp/bin"
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+DATA_DIR="$tmp/data"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+AUTO_SELF_UPDATE="true"
+SELF_UPDATE_REPO_DIR="$repo"
+SELF_UPDATE_REMOTE="origin"
+SELF_UPDATE_BRANCH="main"
+SELF_UPDATE_POLICY="reset-to-remote"
+SELF_UPDATE_RUN_TESTS="false"
+SELF_UPDATE_ROLLBACK_ON_FAILURE="true"
+SELF_UPDATE_RESTART_GATEWAY="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="false"
+AUTO_REFRESH_STALE_GATEWAY_SERVICE="false"
+AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS="false"
+AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="false"
+AUTO_RESTART_UNHEALTHY_GATEWAY="false"
+AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  [[ "$(git -C "$repo" rev-parse HEAD)" == "$target_head" ]] ||
+    fail "self-update did not reset the repo to upstream"
+  grep -Fq 'self-update-new' "$tmp/data/bin/openclaw-doctor.sh" ||
+    fail "self-update did not install the refreshed doctor script"
+  "$JQ_BIN" -e --arg target "$target_head" '
+    .status == "OK"
+    and .selfUpdate.attempted == true
+    and .selfUpdate.available == true
+    and .selfUpdate.applied == true
+    and .selfUpdate.rolledBack == false
+    and .selfUpdate.to == $target
+    and any(.remediations[]; .code == "openclawnurse_self_update" and .result == "applied")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "self-update state was not persisted as applied"
+
+  pass "self-update applies valid upstream and installs refreshed runtime"
+}
+
 main() {
   require_cmd "$JQ_BIN"
+  require_cmd git
 
   smoke_doctor_without_complete_config
   smoke_pending_report_after_notification_failure
@@ -1148,6 +1282,7 @@ main() {
   smoke_update_retry_success_is_not_failed
   smoke_remediates_openclaw_installation_drift
   smoke_default_deduplicates_local_openclaw_shim
+  smoke_self_update_applies_valid_upstream
 }
 
 main "$@"

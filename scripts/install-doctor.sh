@@ -188,6 +188,14 @@ set_env_value() {
   fi
 }
 
+set_env_default() {
+  local key="$1"
+  local value="$2"
+  if ! grep -Eq "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
+    set_env_value "$key" "$value"
+  fi
+}
+
 confirm_prompt() {
   local prompt="$1"
   local default="${2:-yes}"
@@ -347,6 +355,19 @@ install_runtime_files() {
   install -m 0755 "$REPO_ROOT/scripts/openclawnurse-openclaw-alert.sh" "$INSTALL_DIR/bin/openclawnurse-openclaw-alert.sh"
   install -m 0644 "$REPO_ROOT/systemd/openclawnurse.service" "$INSTALL_DIR/systemd/openclawnurse.service.template"
   install -m 0644 "$REPO_ROOT/systemd/openclawnurse.timer" "$INSTALL_DIR/systemd/openclawnurse.timer.template"
+}
+
+configure_self_update_env() {
+  set_env_value SELF_UPDATE_REPO_DIR "$REPO_ROOT"
+  set_env_default AUTO_SELF_UPDATE "true"
+  set_env_default SELF_UPDATE_REMOTE "origin"
+  set_env_default SELF_UPDATE_BRANCH "main"
+  set_env_default SELF_UPDATE_POLICY "reset-to-remote"
+  set_env_default SELF_UPDATE_TIMEOUT "300"
+  set_env_default SELF_UPDATE_RUN_TESTS "true"
+  set_env_default SELF_UPDATE_ROLLBACK_ON_FAILURE "true"
+  set_env_default SELF_UPDATE_RESTART_GATEWAY "false"
+  set_env_default SELF_UPDATE_POST_SELF_TEST "false"
 }
 
 install_cli_wrapper() {
@@ -613,6 +634,7 @@ main() {
   source "$CONFIG_FILE"
   apply_cli_overrides
   install_runtime_files
+  configure_self_update_env
   install_cli_wrapper
   configure_openclaw_alert_env
   # shellcheck disable=SC1090

@@ -57,6 +57,9 @@ Common settings:
 
 - `OPENCLAW_BIN`: OpenClaw CLI path. Defaults to `openclaw`.
 - `AUTO_UPDATE`: whether the Nurse should apply available updates.
+- `AUTO_SELF_UPDATE`: whether the Nurse should pull its own git upstream, validate it, install the refreshed runtime scripts, and use the new version on the next run.
+- `SELF_UPDATE_REPO_DIR`: local OpenClawNurse git checkout used for self-update. The installer writes this automatically.
+- `SELF_UPDATE_POLICY`: `reset-to-remote` for aggressive upstream convergence with a clean-worktree guard, or `fast-forward` for stricter history preservation.
 - `RESTART_MODE`: gateway restart strategy, usually `systemd_user`.
 - `SYSTEMD_UNIT_NAME`: gateway service name, usually `openclaw-gateway.service`.
 - `REPORT_CHANNEL`: report channel, for example `telegram` or `none`.

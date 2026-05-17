@@ -137,6 +137,16 @@ AUTO_UPDATE="${AUTO_UPDATE:-true}"
 UPDATE_CHANNEL="${UPDATE_CHANNEL:-stable}"
 UPDATE_TAG="${UPDATE_TAG:-}"
 UPDATE_TIMEOUT="${UPDATE_TIMEOUT:-900}"
+AUTO_SELF_UPDATE="${AUTO_SELF_UPDATE:-false}"
+SELF_UPDATE_REPO_DIR="${SELF_UPDATE_REPO_DIR:-}"
+SELF_UPDATE_REMOTE="${SELF_UPDATE_REMOTE:-origin}"
+SELF_UPDATE_BRANCH="${SELF_UPDATE_BRANCH:-main}"
+SELF_UPDATE_POLICY="${SELF_UPDATE_POLICY:-reset-to-remote}"
+SELF_UPDATE_TIMEOUT="${SELF_UPDATE_TIMEOUT:-300}"
+SELF_UPDATE_RUN_TESTS="${SELF_UPDATE_RUN_TESTS:-true}"
+SELF_UPDATE_ROLLBACK_ON_FAILURE="${SELF_UPDATE_ROLLBACK_ON_FAILURE:-true}"
+SELF_UPDATE_RESTART_GATEWAY="${SELF_UPDATE_RESTART_GATEWAY:-false}"
+SELF_UPDATE_POST_SELF_TEST="${SELF_UPDATE_POST_SELF_TEST:-false}"
 STATUS_TIMEOUT="${STATUS_TIMEOUT:-10}"
 DOCTOR_TIMEOUT="${DOCTOR_TIMEOUT:-300}"
 GATEWAY_WAIT_TIMEOUT="${GATEWAY_WAIT_TIMEOUT:-180}"
@@ -634,6 +644,15 @@ HEALTH_OUTPUT=""
 UPDATE_ERROR=""
 RESTART_ERROR=""
 HEALTH_ERROR=""
+SELF_UPDATE_ATTEMPTED=0
+SELF_UPDATE_AVAILABLE=0
+SELF_UPDATE_APPLIED=0
+SELF_UPDATE_ROLLED_BACK=0
+SELF_UPDATE_FROM=""
+SELF_UPDATE_TO=""
+SELF_UPDATE_REPO_RESOLVED=""
+SELF_UPDATE_SUMMARY=""
+SELF_UPDATE_ERROR=""
 DURATION_SECONDS=0
 CONFIG_HEALTH="unknown"
 CONFIG_RESTORED=0
@@ -813,6 +832,14 @@ persist_json() {
     --arg updateError "$UPDATE_ERROR" \
     --arg restartError "$RESTART_ERROR" \
     --arg healthError "$HEALTH_ERROR" \
+    --arg selfUpdateFrom "$SELF_UPDATE_FROM" \
+    --arg selfUpdateTo "$SELF_UPDATE_TO" \
+    --arg selfUpdateRepo "$SELF_UPDATE_REPO_RESOLVED" \
+    --arg selfUpdateRemote "$SELF_UPDATE_REMOTE" \
+    --arg selfUpdateBranch "$SELF_UPDATE_BRANCH" \
+    --arg selfUpdatePolicy "$SELF_UPDATE_POLICY" \
+    --arg selfUpdateSummary "$SELF_UPDATE_SUMMARY" \
+    --arg selfUpdateError "$SELF_UPDATE_ERROR" \
     --arg configHealth "$CONFIG_HEALTH" \
     --arg configLastTouchedVersion "$CONFIG_LAST_TOUCHED_VERSION" \
     --arg configRestoreDiff "$CONFIG_RESTORE_DIFF" \
@@ -836,6 +863,10 @@ persist_json() {
     --argjson updateAttempted "$(json_bool "$UPDATE_ATTEMPTED")" \
     --argjson updateAvailable "$(json_bool "$UPDATE_AVAILABLE")" \
     --argjson updateSucceeded "$(json_bool "$UPDATE_SUCCEEDED")" \
+    --argjson selfUpdateAttempted "$(json_bool "$SELF_UPDATE_ATTEMPTED")" \
+    --argjson selfUpdateAvailable "$(json_bool "$SELF_UPDATE_AVAILABLE")" \
+    --argjson selfUpdateApplied "$(json_bool "$SELF_UPDATE_APPLIED")" \
+    --argjson selfUpdateRolledBack "$(json_bool "$SELF_UPDATE_ROLLED_BACK")" \
     --argjson doctorAttempted "$(json_bool "$DOCTOR_ATTEMPTED")" \
     --argjson restartAttempted "$(json_bool "$RESTART_ATTEMPTED")" \
     --argjson restartSucceeded "$(json_bool "$RESTART_SUCCEEDED")" \
@@ -884,6 +915,20 @@ persist_json() {
       dryRun: $dryRun,
       updateAttempted: $updateAttempted,
       updateSucceeded: $updateSucceeded,
+      selfUpdate: {
+        attempted: $selfUpdateAttempted,
+        available: $selfUpdateAvailable,
+        applied: $selfUpdateApplied,
+        rolledBack: $selfUpdateRolledBack,
+        from: $selfUpdateFrom,
+        to: $selfUpdateTo,
+        repo: $selfUpdateRepo,
+        remote: $selfUpdateRemote,
+        branch: $selfUpdateBranch,
+        policy: $selfUpdatePolicy,
+        summary: $selfUpdateSummary,
+        error: $selfUpdateError
+      },
       doctorAttempted: $doctorAttempted,
       doctorExitCode: $doctorExitCode,
       doctorSummary: $doctorSummary,
@@ -1034,6 +1079,9 @@ build_status_reasons() {
   fi
   if [[ "$NOTIFICATION_PENDING" -eq 1 ]]; then
     printf -- '- Report delivery is pending.\n'
+  fi
+  if [[ -n "$SELF_UPDATE_ERROR" ]]; then
+    printf -- '- Self-update issue: %s\n' "$SELF_UPDATE_ERROR"
   fi
   if [[ "$GATEWAY_HEALTHY" -eq 0 && "$RESTART_ATTEMPTED" -eq 1 ]]; then
     printf -- '- Gateway restart was attempted but health did not recover.\n'
@@ -2688,6 +2736,350 @@ prepare_doctor_recheck_after_remediation() {
   DOCTOR_SUMMARY="doctor will be rechecked after remediation"
 }
 
+resolve_self_update_repo_dir() {
+  local candidate
+  local script_dir
+  local parent
+
+  for candidate in "$SELF_UPDATE_REPO_DIR" "$HOME/projects/openclawnurse"; do
+    [[ -n "$candidate" ]] || continue
+    if [[ -d "$candidate/.git" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  parent="$script_dir"
+  while [[ "$parent" != "/" ]]; do
+    if [[ -d "$parent/.git" ]]; then
+      printf '%s' "$parent"
+      return 0
+    fi
+    parent="$(dirname "$parent")"
+  done
+
+  return 1
+}
+
+self_update_capture() {
+  local output_var="$1"
+  local status_var="$2"
+  local label="$3"
+  shift 3
+
+  if command_exists timeout && [[ "$SELF_UPDATE_TIMEOUT" =~ ^[0-9]+$ ]] && (( SELF_UPDATE_TIMEOUT > 0 )); then
+    run_capture_allow_fail "$output_var" "$status_var" "$label" timeout "${SELF_UPDATE_TIMEOUT}s" "$@"
+  else
+    run_capture_allow_fail "$output_var" "$status_var" "$label" "$@"
+  fi
+}
+
+self_update_validation_error() {
+  local detail="$1"
+  SELF_UPDATE_ERROR="$detail"
+  add_incident_code "self_update_failed"
+  append_array ERRORS "$detail"
+}
+
+validate_self_update_tree() {
+  local tree="$1"
+  local output status script json_file
+
+  for script in \
+    "$tree/install.sh" \
+    "$tree/scripts/openclaw-doctor.sh" \
+    "$tree/scripts/openclawnurse-openclaw-alert.sh" \
+    "$tree/scripts/install-doctor.sh" \
+    "$tree/systemd/openclawnurse.service" \
+    "$tree/systemd/openclawnurse.timer"; do
+    if [[ ! -f "$script" ]]; then
+      printf 'missing required file: %s\n' "$script"
+      return 1
+    fi
+  done
+
+  self_update_capture output status "Validating OpenClawNurse installer syntax" bash -n "$tree/install.sh"
+  if [[ "$status" -ne 0 ]]; then
+    printf '%s\n' "$output"
+    return 1
+  fi
+
+  while IFS= read -r script; do
+    [[ -n "$script" ]] || continue
+    self_update_capture output status "Validating OpenClawNurse script syntax: $(basename "$script")" bash -n "$script"
+    if [[ "$status" -ne 0 ]]; then
+      printf '%s\n' "$output"
+      return 1
+    fi
+  done < <(find "$tree/scripts" -maxdepth 1 -type f -name '*.sh' 2>/dev/null | sort)
+
+  if command_exists jq; then
+    while IFS= read -r json_file; do
+      [[ -n "$json_file" ]] || continue
+      self_update_capture output status "Validating OpenClawNurse JSON: $(basename "$json_file")" jq empty "$json_file"
+      if [[ "$status" -ne 0 ]]; then
+        printf '%s\n' "$output"
+        return 1
+      fi
+    done < <(find "$tree/config" -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort)
+  fi
+
+  if [[ "$SELF_UPDATE_RUN_TESTS" == "true" && -x "$tree/scripts/test-smoke.sh" ]]; then
+    self_update_capture output status "Running OpenClawNurse smoke tests for self-update target" "$tree/scripts/test-smoke.sh"
+    if [[ "$status" -ne 0 ]]; then
+      printf '%s\n' "$output"
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+validate_self_update_candidate() {
+  local repo="$1"
+  local target="$2"
+  local worktree="$STATE_DIR/self-update-worktree-$RUN_ID"
+  local output status cleanup_status
+
+  rm -rf "$worktree"
+  self_update_capture output status "Preparing OpenClawNurse self-update validation worktree" \
+    git -C "$repo" worktree add --detach "$worktree" "$target"
+  if [[ "$status" -ne 0 ]]; then
+    printf '%s\n' "$output"
+    return 1
+  fi
+
+  validate_self_update_tree "$worktree"
+  status=$?
+
+  self_update_capture output cleanup_status "Removing OpenClawNurse self-update validation worktree" \
+    git -C "$repo" worktree remove --force "$worktree"
+  if [[ "$cleanup_status" -ne 0 ]]; then
+    rm -rf "$worktree"
+  fi
+
+  return "$status"
+}
+
+install_self_update_runtime_files() {
+  local repo="$1"
+  mkdir -p "$DATA_DIR/bin" "$DATA_DIR/systemd"
+  install -m 0755 "$repo/scripts/openclaw-doctor.sh" "$DATA_DIR/bin/openclaw-doctor.sh"
+  install -m 0755 "$repo/scripts/openclawnurse-openclaw-alert.sh" "$DATA_DIR/bin/openclawnurse-openclaw-alert.sh"
+  install -m 0644 "$repo/systemd/openclawnurse.service" "$DATA_DIR/systemd/openclawnurse.service.template"
+  install -m 0644 "$repo/systemd/openclawnurse.timer" "$DATA_DIR/systemd/openclawnurse.timer.template"
+  if command_exists systemctl; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
+post_validate_self_update_install() {
+  local output status
+  self_update_capture output status "Validating installed OpenClawNurse doctor syntax" bash -n "$DATA_DIR/bin/openclaw-doctor.sh"
+  if [[ "$status" -ne 0 ]]; then
+    printf '%s\n' "$output"
+    return 1
+  fi
+
+  self_update_capture output status "Validating installed OpenClawNurse help" "$DATA_DIR/bin/openclaw-doctor.sh" --help
+  if [[ "$status" -ne 0 ]]; then
+    printf '%s\n' "$output"
+    return 1
+  fi
+
+  if [[ "$SELF_UPDATE_POST_SELF_TEST" == "true" ]]; then
+    AUTO_SELF_UPDATE=false \
+      REPORT_CHANNEL=none \
+      LOCK_FILE="$STATE_DIR/self-update-self-test-$RUN_ID.lock" \
+      "$DATA_DIR/bin/openclaw-doctor.sh" --config "$CONFIG_FILE" --self-test --no-notify >/dev/null
+  fi
+}
+
+rollback_self_update() {
+  local repo="$1"
+  local backup_ref="$2"
+  local output status
+
+  self_update_capture output status "Rolling back OpenClawNurse self-update" git -C "$repo" reset --hard "$backup_ref"
+  if [[ "$status" -ne 0 ]]; then
+    SELF_UPDATE_ERROR="OpenClawNurse self-update rollback failed."
+    add_incident_code "self_update_rollback_failed"
+    append_array ERRORS "$SELF_UPDATE_ERROR"
+    append_array ACTIONS "Inspect $repo and backup ref $backup_ref before the next Nurse run."
+    return 1
+  fi
+
+  if ! install_self_update_runtime_files "$repo"; then
+    SELF_UPDATE_ERROR="OpenClawNurse self-update rollback restored git but failed to reinstall runtime files."
+    add_incident_code "self_update_rollback_failed"
+    append_array ERRORS "$SELF_UPDATE_ERROR"
+    return 1
+  fi
+
+  SELF_UPDATE_ROLLED_BACK=1
+  append_array FIXES "Rolled OpenClawNurse back to ${SELF_UPDATE_FROM:0:12} after failed post-update validation."
+  record_remediation "openclawnurse_self_update" "rolled_back" "restored $backup_ref"
+  return 0
+}
+
+maybe_self_update() {
+  [[ "$AUTO_SELF_UPDATE" == "true" ]] || {
+    SELF_UPDATE_SUMMARY="disabled"
+    return 0
+  }
+  [[ "$DRY_RUN" -eq 0 && "$SELF_TEST" -eq 0 && "$RETRY_PENDING_ONLY" -eq 0 ]] || {
+    SELF_UPDATE_SUMMARY="skipped in non-maintenance mode"
+    return 0
+  }
+
+  SELF_UPDATE_ATTEMPTED=1
+
+  if ! command_exists git; then
+    SELF_UPDATE_ERROR="OpenClawNurse self-update is enabled but git is not available."
+    add_incident_code "self_update_failed"
+    append_array ERRORS "$SELF_UPDATE_ERROR"
+    return 1
+  fi
+  if ! command_exists install; then
+    SELF_UPDATE_ERROR="OpenClawNurse self-update is enabled but install is not available."
+    add_incident_code "self_update_failed"
+    append_array ERRORS "$SELF_UPDATE_ERROR"
+    return 1
+  fi
+
+  local repo
+  if ! repo="$(resolve_self_update_repo_dir)"; then
+    SELF_UPDATE_ERROR="OpenClawNurse self-update is enabled but SELF_UPDATE_REPO_DIR does not point to a git repo."
+    add_incident_code "self_update_failed"
+    append_array ERRORS "$SELF_UPDATE_ERROR"
+    append_array ACTIONS "Set SELF_UPDATE_REPO_DIR to the OpenClawNurse git checkout."
+    return 1
+  fi
+  SELF_UPDATE_REPO_RESOLVED="$repo"
+
+  local dirty
+  dirty="$(git -C "$repo" status --porcelain 2>/dev/null || true)"
+  if [[ -n "$dirty" ]]; then
+    SELF_UPDATE_SUMMARY="skipped because repo has local changes"
+    SELF_UPDATE_ERROR="OpenClawNurse self-update skipped because $repo has uncommitted changes."
+    add_incident_code "self_update_dirty_worktree"
+    append_sanity_finding "$SELF_UPDATE_ERROR"
+    append_array ACTIONS "Commit, stash or remove local OpenClawNurse changes so self-update can safely reset to upstream."
+    record_remediation "openclawnurse_self_update" "blocked_by_dirty_worktree" "$repo"
+    return 0
+  fi
+
+  local output status current target
+  self_update_capture output status "Fetching OpenClawNurse upstream" \
+    git -C "$repo" fetch "$SELF_UPDATE_REMOTE" "+refs/heads/$SELF_UPDATE_BRANCH:refs/remotes/$SELF_UPDATE_REMOTE/$SELF_UPDATE_BRANCH"
+  if [[ "$status" -ne 0 ]]; then
+    SELF_UPDATE_ERROR="OpenClawNurse self-update fetch failed."
+    add_incident_code "self_update_failed"
+    append_array ERRORS "$SELF_UPDATE_ERROR"
+    append_array ACTIONS "Check network access and remote $SELF_UPDATE_REMOTE/$SELF_UPDATE_BRANCH for $repo."
+    record_remediation "openclawnurse_self_update" "fetch_failed" "$SELF_UPDATE_REMOTE/$SELF_UPDATE_BRANCH"
+    return 1
+  fi
+
+  current="$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || true)"
+  target="$(git -C "$repo" rev-parse --verify "refs/remotes/$SELF_UPDATE_REMOTE/$SELF_UPDATE_BRANCH^{commit}" 2>/dev/null || true)"
+  SELF_UPDATE_FROM="$current"
+  SELF_UPDATE_TO="$target"
+  if [[ -z "$current" || -z "$target" ]]; then
+    SELF_UPDATE_ERROR="OpenClawNurse self-update could not resolve current or target revision."
+    add_incident_code "self_update_failed"
+    append_array ERRORS "$SELF_UPDATE_ERROR"
+    return 1
+  fi
+
+  if [[ "$current" == "$target" ]]; then
+    SELF_UPDATE_SUMMARY="already up to date"
+    record_remediation "openclawnurse_self_update" "not_needed" "$current"
+    return 0
+  fi
+  SELF_UPDATE_AVAILABLE=1
+
+  if ! output="$(validate_self_update_candidate "$repo" "$target" 2>&1)"; then
+    self_update_validation_error "OpenClawNurse self-update target failed validation."
+    append_array ACTIONS "Review upstream OpenClawNurse tests before applying $target."
+    record_remediation "openclawnurse_self_update" "validation_failed" "${target:0:12}"
+    return 1
+  fi
+
+  local backup_ref="refs/heads/backup/openclawnurse-self-update-$RUN_ID"
+  self_update_capture output status "Creating OpenClawNurse self-update backup ref" \
+    git -C "$repo" update-ref "$backup_ref" "$current"
+  if [[ "$status" -ne 0 ]]; then
+    SELF_UPDATE_ERROR="OpenClawNurse self-update could not create backup ref."
+    add_incident_code "self_update_failed"
+    append_array ERRORS "$SELF_UPDATE_ERROR"
+    return 1
+  fi
+
+  case "$SELF_UPDATE_POLICY" in
+    reset-to-remote)
+      self_update_capture output status "Applying OpenClawNurse self-update by reset-to-remote" git -C "$repo" reset --hard "$target"
+      ;;
+    fast-forward)
+      if ! git -C "$repo" merge-base --is-ancestor "$current" "$target"; then
+        SELF_UPDATE_ERROR="OpenClawNurse self-update target is not a fast-forward from current HEAD."
+        add_incident_code "self_update_failed"
+        append_array ERRORS "$SELF_UPDATE_ERROR"
+        append_array ACTIONS "Use SELF_UPDATE_POLICY=reset-to-remote or reconcile local branch history manually."
+        return 1
+      fi
+      self_update_capture output status "Applying OpenClawNurse self-update by fast-forward" git -C "$repo" merge --ff-only "$target"
+      ;;
+    *)
+      SELF_UPDATE_ERROR="Unsupported SELF_UPDATE_POLICY=$SELF_UPDATE_POLICY."
+      add_incident_code "self_update_failed"
+      append_array ERRORS "$SELF_UPDATE_ERROR"
+      return 1
+      ;;
+  esac
+
+  if [[ "$status" -ne 0 ]]; then
+    SELF_UPDATE_ERROR="OpenClawNurse self-update apply failed."
+    add_incident_code "self_update_failed"
+    append_array ERRORS "$SELF_UPDATE_ERROR"
+    append_array ACTIONS "Inspect $repo and backup ref ${backup_ref#refs/heads/}."
+    return 1
+  fi
+
+  if ! install_self_update_runtime_files "$repo"; then
+    SELF_UPDATE_ERROR="OpenClawNurse self-update applied git revision but failed to install runtime files."
+    add_incident_code "self_update_failed"
+    append_array ERRORS "$SELF_UPDATE_ERROR"
+    if [[ "$SELF_UPDATE_ROLLBACK_ON_FAILURE" == "true" ]]; then
+      rollback_self_update "$repo" "$backup_ref" || true
+    fi
+    return 1
+  fi
+
+  if ! output="$(post_validate_self_update_install 2>&1)"; then
+    SELF_UPDATE_ERROR="OpenClawNurse self-update post-install validation failed."
+    add_incident_code "self_update_failed"
+    append_array ERRORS "$SELF_UPDATE_ERROR"
+    record_remediation "openclawnurse_self_update" "post_validation_failed" "${target:0:12}"
+    if [[ "$SELF_UPDATE_ROLLBACK_ON_FAILURE" == "true" ]]; then
+      rollback_self_update "$repo" "$backup_ref" || true
+    fi
+    return 1
+  fi
+
+  SELF_UPDATE_APPLIED=1
+  SELF_UPDATE_SUMMARY="updated to ${target:0:12}; new script takes over on the next run"
+  append_array FIXES "OpenClawNurse self-updated from ${current:0:12} to ${target:0:12}."
+  record_remediation "openclawnurse_self_update" "applied" "${current:0:12} -> ${target:0:12}"
+
+  if [[ "$SELF_UPDATE_RESTART_GATEWAY" == "true" ]]; then
+    restart_gateway && record_gateway_restart && wait_for_gateway_health || true
+  fi
+
+  return 0
+}
+
 run_preflight_checks() {
   local missing_required=0
   local required=(jq flock timeout "$OPENCLAW_BIN")
@@ -3395,6 +3787,19 @@ build_report() {
     update_line="already on the latest version"
   fi
 
+  local self_update_line="not attempted"
+  if [[ "$SELF_UPDATE_ATTEMPTED" -eq 1 && "$SELF_UPDATE_APPLIED" -eq 1 ]]; then
+    self_update_line="applied ${SELF_UPDATE_FROM:0:12} -> ${SELF_UPDATE_TO:0:12}"
+  elif [[ "$SELF_UPDATE_ATTEMPTED" -eq 1 && "$SELF_UPDATE_ROLLED_BACK" -eq 1 ]]; then
+    self_update_line="rolled back after failed validation"
+  elif [[ "$SELF_UPDATE_ATTEMPTED" -eq 1 && "$SELF_UPDATE_AVAILABLE" -eq 1 && -n "$SELF_UPDATE_ERROR" ]]; then
+    self_update_line="failed before apply"
+  elif [[ "$SELF_UPDATE_ATTEMPTED" -eq 1 && -n "$SELF_UPDATE_SUMMARY" ]]; then
+    self_update_line="$SELF_UPDATE_SUMMARY"
+  elif [[ "$AUTO_SELF_UPDATE" != "true" ]]; then
+    self_update_line="disabled"
+  fi
+
   local restart_line="not required"
   [[ "$RESTART_ATTEMPTED" -eq 1 && "$RESTART_SUCCEEDED" -eq 1 ]] && restart_line="completed"
   [[ "$RESTART_ATTEMPTED" -eq 1 && "$RESTART_SUCCEEDED" -eq 0 ]] && restart_line="failed"
@@ -3422,6 +3827,7 @@ Version available: ${AVAILABLE_VERSION:-unknown}
 Channel: ${CHANNEL_VALUE:-unknown}
 
 Update: $update_line
+Self-update: $self_update_line
 Doctor: $DOCTOR_SUMMARY
 Restart: $restart_line
 Health check: $health_line
@@ -3632,6 +4038,8 @@ main() {
     fi
     exit 1
   fi
+
+  maybe_self_update || true
 
   if ! run_preflight_checks; then
     STATUS="FAILED"
