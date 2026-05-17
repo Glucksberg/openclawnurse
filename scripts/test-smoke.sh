@@ -840,25 +840,25 @@ EOF
   HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
 
   "$JQ_BIN" -e '
-    .agents.defaults.model.primary == "openai-codex/gpt-5.5"
-    and (.agents.defaults.agentRuntime | not)
-    and (.agents.defaults.models | has("openai-codex/gpt-5.5"))
-    and (.agents.defaults.models | has("openai/gpt-5.5") | not)
+    .agents.defaults.model.primary == "openai/gpt-5.5"
+    and .agents.defaults.agentRuntime.id == "pi"
+    and (.agents.defaults.models | has("openai/gpt-5.5"))
+    and (.agents.defaults.models | has("openai-codex/gpt-5.5") | not)
   ' "$tmp/home/.openclaw/openclaw.json" >/dev/null ||
-    fail "OpenClaw model config drift was not repaired after doctor"
-  grep -Fq 'restarted' "$tmp/restarts" ||
-    fail "model config remediation did not restart the gateway"
+    fail "OpenClaw doctor model route repair was not preserved"
+  [[ ! -f "$tmp/restarts" ]] ||
+    fail "canonical OpenAI model route should not force a gateway restart"
   "$JQ_BIN" -e '
     .status == "OK"
-    and .restartAttempted == true
+    and .restartAttempted == false
     and .gatewayHealthy == true
-    and any(.incidentCodes[]; . == "openclaw_model_config_drift")
-    and any(.remediations[]; .code == "openclaw_model_config_drift" and .result == "applied")
-    and .sanity.expectedOpenclawModel == "openai-codex/gpt-5.5"
+    and all(.incidentCodes[]; . != "openclaw_model_config_drift")
+    and all(.remediations[]; .code != "openclaw_model_config_drift")
+    and .sanity.expectedOpenclawModel == "openai/gpt-5.5"
   ' "$tmp/state/doctor-state.json" >/dev/null ||
-    fail "model config drift remediation was not recorded cleanly"
+    fail "canonical OpenAI model route was not recorded cleanly"
 
-  pass "model config drift after doctor is remediated"
+  pass "canonical OpenAI model route after doctor is preserved"
 }
 
 smoke_json_preamble_is_accepted() {

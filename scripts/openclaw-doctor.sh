@@ -674,6 +674,7 @@ MODEL_AUTH_SUMMARY=""
 PREVIOUS_PENDING_PRESENT=0
 PREVIOUS_STATE_TIMESTAMP=""
 REMEDIATION_APPLIED=0
+DOCTOR_RECHECK_NEEDED=0
 MODEL_CONFIG_REMEDIATED=0
 GATEWAY_RESTARTS_TODAY=0
 GATEWAY_RESTARTS_IN_WINDOW=0
@@ -1413,31 +1414,12 @@ resolve_expected_model_from_config() {
 
   local current_model
   current_model="$(jq -r '.agents.defaults.model.primary // .models.default // .model // empty' "$cfg_file" 2>/dev/null)"
-  if [[ "$current_model" == openai/* ]] && config_has_codex_oauth "$cfg_file" && ! config_has_direct_openai_auth "$cfg_file"; then
-    EXPECTED_OPENCLAW_MODEL="openai-codex/${current_model#openai/}"
+  if [[ "$current_model" == openai-codex/* ]]; then
+    EXPECTED_OPENCLAW_MODEL="openai/${current_model#openai-codex/}"
     return 0
   fi
 
   EXPECTED_OPENCLAW_MODEL="$current_model"
-}
-
-config_has_codex_oauth() {
-  local cfg_file="$1"
-  jq -e '
-    (.auth.profiles // {})
-    | to_entries
-    | any(.value.provider == "openai-codex" and ((.value.mode // "oauth") == "oauth"))
-  ' "$cfg_file" >/dev/null 2>&1
-}
-
-config_has_direct_openai_auth() {
-  local cfg_file="$1"
-  [[ -n "${OPENAI_API_KEY:-}" ]] && return 0
-  jq -e '
-    (.auth.profiles // {})
-    | to_entries
-    | any(.value.provider == "openai")
-  ' "$cfg_file" >/dev/null 2>&1
 }
 
 detect_openclaw_model_config_drift() {
@@ -1455,13 +1437,16 @@ detect_openclaw_model_config_drift() {
 
   if [[ "$current_model" == "$EXPECTED_OPENCLAW_MODEL" && "$has_expected_model" == "true" ]]; then
     if [[ "$EXPECTED_OPENCLAW_MODEL" != openai-codex/* || -z "$runtime_id" ]]; then
+      remove_incident_code "openclaw_model_config_drift"
+      remove_array_value ACTIONS "OpenClawNurse will restore the expected OpenClaw model config after doctor repair."
+      remove_array_value ACTIONS "Set agents.defaults.model.primary to $EXPECTED_OPENCLAW_MODEL and remove incompatible runtime overrides manually."
       return 0
     fi
   fi
 
   add_incident_code "openclaw_model_config_drift"
-  if [[ "$current_model" == openai/* && "$EXPECTED_OPENCLAW_MODEL" == openai-codex/* ]]; then
-    finding="OpenClaw config uses direct OpenAI model $current_model, but this host is configured for Codex OAuth; expected $EXPECTED_OPENCLAW_MODEL."
+  if [[ "$current_model" == openai-codex/* && "$EXPECTED_OPENCLAW_MODEL" == openai/* ]]; then
+    finding="OpenClaw config uses legacy Codex model ref $current_model; expected canonical $EXPECTED_OPENCLAW_MODEL."
   else
     finding="OpenClaw model config drift: primary=${current_model:-missing}, expected=$EXPECTED_OPENCLAW_MODEL."
   fi
@@ -2645,6 +2630,7 @@ maybe_auto_remediate_missing_transcripts() {
   fi
 
   REMEDIATION_APPLIED=1
+  DOCTOR_RECHECK_NEEDED=1
   append_array FIXES "Pruned $missing_count session entries with missing transcripts${after_count:+; remaining entries: $after_count}."
   record_remediation "missing_transcripts" "applied" "pruned $missing_count session entries"
   return 0
@@ -2720,6 +2706,7 @@ maybe_auto_archive_orphan_transcripts() {
   fi
 
   REMEDIATION_APPLIED=1
+  DOCTOR_RECHECK_NEEDED=1
   append_array FIXES "Archived $archived_count orphan transcript file(s) to $archive_root."
   record_remediation "orphan_transcripts" "applied" "archived $archived_count orphan transcript files to $archive_root"
   return 0
@@ -3475,6 +3462,8 @@ remediate_expected_openclaw_model_config() {
     ((.agents.defaults.models // {}) + {($model): {}})
     | if ($model | startswith("openai-codex/")) then
         with_entries(select(.key | startswith("openai/") | not))
+      elif ($model | startswith("openai/")) then
+        with_entries(select(.key | startswith("openai-codex/") | not))
       else
         .
       end
@@ -3515,6 +3504,9 @@ remediate_expected_openclaw_model_config() {
 
   REMEDIATION_APPLIED=1
   MODEL_CONFIG_REMEDIATED=1
+  remove_incident_code "openclaw_model_config_drift"
+  remove_array_value ACTIONS "OpenClawNurse will restore the expected OpenClaw model config after doctor repair."
+  remove_array_value ACTIONS "Set agents.defaults.model.primary to $EXPECTED_OPENCLAW_MODEL and remove incompatible runtime overrides manually."
   append_array FIXES "Restored OpenClaw model config to $EXPECTED_OPENCLAW_MODEL."
   record_remediation "openclaw_model_config_drift" "applied" "set expected OpenClaw model config"
 }
@@ -4084,10 +4076,11 @@ main() {
   local doctor_pass=0
   while (( doctor_pass < MAX_DOCTOR_REMEDIATION_PASSES )); do
     REMEDIATION_APPLIED=0
+    DOCTOR_RECHECK_NEEDED=0
     remediate_expected_openclaw_model_config || true
     maybe_auto_archive_orphan_transcripts || true
     maybe_auto_remediate_missing_transcripts || true
-    if [[ "$REMEDIATION_APPLIED" -ne 1 ]]; then
+    if [[ "$REMEDIATION_APPLIED" -ne 1 || "$DOCTOR_RECHECK_NEEDED" -ne 1 ]]; then
       break
     fi
     prepare_doctor_recheck_after_remediation
