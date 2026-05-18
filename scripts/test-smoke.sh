@@ -759,6 +759,114 @@ EOF
   pass "config version drift update failure is failed"
 }
 
+smoke_openclaw_user_plugin_drift_is_remediated() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/plugin-drift.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw/npm/node_modules/@openclaw/codex"
+  cat >"$tmp/bin/openclaw" <<'EOF'
+#!/usr/bin/env bash
+
+case "${1:-}" in
+  --version)
+    printf 'OpenClaw 2026.1.0\n'
+    ;;
+  update)
+    if [[ "${2:-}" == "status" ]]; then
+      printf '{"availability":{"available":false,"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
+    else
+      printf '{"ok":true}\n'
+    fi
+    ;;
+  doctor)
+    printf 'doctor complete\n'
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  status)
+    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/bin/npm" <<EOF
+#!/usr/bin/env bash
+prefix=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --prefix)
+      prefix="\${2:-}"
+      shift 2
+      ;;
+    install|--save-exact)
+      shift
+      ;;
+    @openclaw/*@*)
+      spec="\$1"
+      pkg="\${spec%@*}"
+      version="\${spec##*@}"
+      mkdir -p "\$prefix/node_modules/\$pkg"
+      printf '{"name":"%s","version":"%s"}\n' "\$pkg" "\$version" >"\$prefix/node_modules/\$pkg/package.json"
+      "$JQ_BIN" --arg pkg "\$pkg" --arg version "\$version" '.dependencies[\$pkg] = \$version' "\$prefix/package.json" >"\$prefix/package.json.tmp"
+      mv "\$prefix/package.json.tmp" "\$prefix/package.json"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf 'fake npm ok\n'
+EOF
+  chmod +x "$tmp/bin/npm"
+  cat >"$tmp/home/.openclaw/npm/package.json" <<'EOF'
+{"dependencies":{"@openclaw/codex":"2026.0.9"}}
+EOF
+  cat >"$tmp/home/.openclaw/npm/node_modules/@openclaw/codex/package.json" <<'EOF'
+{"name":"@openclaw/codex","version":"2026.0.9"}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+EXTRA_PATH="$tmp/bin"
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="true"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+RESTART_COMMAND="true"
+EOF
+
+  PATH="$tmp/bin:$PATH" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e '
+    .status == "OK"
+    and .restartAttempted == true
+    and .sanity.openclawUserPluginDriftCount == 0
+    and .sanity.openclawUserPluginAlignAttempted == true
+    and .sanity.openclawUserPluginAlignSucceeded == true
+    and (.sanity.openclawUserPluginsSummary | contains("@openclaw/codex=2026.1.0"))
+    and any(.remediations[]; .code == "openclaw_user_plugin_drift" and .result == "applied")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "OpenClaw user plugin drift was not remediated"
+
+  "$JQ_BIN" -e '.version == "2026.1.0"' "$tmp/home/.openclaw/npm/node_modules/@openclaw/codex/package.json" >/dev/null ||
+    fail "plugin package was not aligned"
+
+  pass "OpenClaw user plugin drift is remediated"
+}
+
 smoke_model_config_drift_after_doctor_is_remediated() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/model-config-drift.XXXXXX")"
@@ -1341,6 +1449,7 @@ main() {
   smoke_telegram_commands_are_remediated
   smoke_config_version_drift_forces_update
   smoke_config_version_drift_update_failure_is_failed
+  smoke_openclaw_user_plugin_drift_is_remediated
   smoke_model_config_drift_after_doctor_is_remediated
   smoke_json_preamble_is_accepted
   smoke_update_retry_success_is_not_failed

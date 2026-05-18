@@ -59,6 +59,10 @@ Common settings:
 - `RUN_PROFILE`: `light` for the normal daily run, or `heavy` for full doctor/security maintenance.
 - `openclawnurse-heavy`: installed wrapper/trigger key for agents to request the heavy profile explicitly.
 - `AUTO_UPDATE`: whether the Nurse should apply available updates.
+- `AUTO_ALIGN_OPENCLAW_USER_PLUGINS`: whether the Nurse should align user-installed
+  `@openclaw/*` packages under `~/.openclaw/npm` with the active OpenClaw runtime.
+- `OPENCLAW_PLUGIN_ALIGN_PACKAGES`: `auto` to align every `@openclaw/*`
+  dependency in `~/.openclaw/npm/package.json`, or a space-separated package list.
 - `AUTO_SELF_UPDATE`: whether the Nurse should pull its own git upstream, validate it, install the refreshed runtime scripts, and use the new version on the next run.
 - `SELF_UPDATE_REPO_DIR`: local OpenClawNurse git checkout used for self-update. The installer writes this automatically.
 - `SELF_UPDATE_POLICY`: `reset-to-remote` for aggressive upstream convergence with a clean-worktree guard, or `fast-forward` for stricter history preservation.
@@ -104,6 +108,9 @@ indirectly or not report on its own:
   the Nurse run as failed, while warnings become follow-up items.
 - package drift: looks for local hotfix markers inside the active OpenClaw
   package so operators know updates may overwrite local repairs.
+- user plugin drift: compares user-installed `@openclaw/*` plugins under
+  `~/.openclaw/npm` with the active OpenClaw runtime and can align them after
+  updates or drift.
 - gateway logs: scans recent journal output for provider errors, config issues,
   stuck sessions, and update provenance warnings.
 
@@ -119,6 +126,7 @@ During a live run it can:
 
 - create a config backup
 - update OpenClaw
+- align user-installed `@openclaw/*` plugins with the updated runtime
 - run doctor repair
 - quarantine stale OpenClaw paths under `~/.local/state/openclawnurse/quarantine/`
 - clean missing or orphaned session transcript references

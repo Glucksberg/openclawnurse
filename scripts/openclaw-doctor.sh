@@ -260,6 +260,10 @@ OPENCLAW_LAUNCHER_PATH="${OPENCLAW_LAUNCHER_PATH:-$HOME/.local/share/pnpm/opencl
 AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="${AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING:-true}"
 AUTO_REMEDIATE_CONFIG_VERSION_DRIFT="${AUTO_REMEDIATE_CONFIG_VERSION_DRIFT:-true}"
 AUTO_REFRESH_GATEWAY_SERVICE_AFTER_UPDATE="${AUTO_REFRESH_GATEWAY_SERVICE_AFTER_UPDATE:-true}"
+AUTO_ALIGN_OPENCLAW_USER_PLUGINS="${AUTO_ALIGN_OPENCLAW_USER_PLUGINS:-true}"
+OPENCLAW_USER_NPM_DIR="${OPENCLAW_USER_NPM_DIR:-$OPENCLAW_STATE_HOME/npm}"
+OPENCLAW_PLUGIN_ALIGN_PACKAGES="${OPENCLAW_PLUGIN_ALIGN_PACKAGES:-auto}"
+OPENCLAW_PLUGIN_ALIGN_TIMEOUT="${OPENCLAW_PLUGIN_ALIGN_TIMEOUT:-600}"
 RESTART_MODE="${RESTART_MODE:-systemd_user}"
 SYSTEMD_UNIT_NAME="${SYSTEMD_UNIT_NAME:-openclaw-gateway.service}"
 RESTART_COMMAND="${RESTART_COMMAND:-}"
@@ -745,6 +749,7 @@ GATEWAY_LOG_SUMMARY=""
 COMMITMENTS_SUMMARY=""
 SECURITY_AUDIT_SUMMARY=""
 PACKAGE_DRIFT_SUMMARY=""
+OPENCLAW_USER_PLUGINS_SUMMARY=""
 DOCTOR_WARNING_SUMMARY=""
 PROVIDER_EMPTY_INPUT_COUNT=0
 PROVIDER_AUTH_ERROR_COUNT=0
@@ -756,6 +761,9 @@ MODEL_ACCESS_ERROR_COUNT=0
 SECURITY_AUDIT_CRITICAL_COUNT=0
 SECURITY_AUDIT_WARN_COUNT=0
 LOCAL_HOTFIX_COUNT=0
+OPENCLAW_USER_PLUGIN_DRIFT_COUNT=0
+OPENCLAW_USER_PLUGIN_ALIGN_ATTEMPTED=0
+OPENCLAW_USER_PLUGIN_ALIGN_SUCCEEDED=0
 CONFIG_LAST_TOUCHED_VERSION=""
 CONFIG_VERSION_DRIFT=0
 CONFIG_VERSION_DRIFT_FINDING=""
@@ -910,6 +918,7 @@ persist_json() {
     --arg commitmentsSummary "$COMMITMENTS_SUMMARY" \
     --arg securityAuditSummary "$SECURITY_AUDIT_SUMMARY" \
     --arg packageDriftSummary "$PACKAGE_DRIFT_SUMMARY" \
+    --arg openclawUserPluginsSummary "$OPENCLAW_USER_PLUGINS_SUMMARY" \
     --arg doctorWarningSummary "$DOCTOR_WARNING_SUMMARY" \
     --arg diskSummary "$DISK_FINDINGS_SUMMARY" \
     --arg cronSummary "$CRON_FINDINGS_SUMMARY" \
@@ -958,6 +967,9 @@ persist_json() {
     --argjson securityAuditCriticalCount "$(json_int "$SECURITY_AUDIT_CRITICAL_COUNT")" \
     --argjson securityAuditWarnCount "$(json_int "$SECURITY_AUDIT_WARN_COUNT")" \
     --argjson localHotfixCount "$(json_int "$LOCAL_HOTFIX_COUNT")" \
+    --argjson openclawUserPluginDriftCount "$(json_int "$OPENCLAW_USER_PLUGIN_DRIFT_COUNT")" \
+    --argjson openclawUserPluginAlignAttempted "$(json_bool "$OPENCLAW_USER_PLUGIN_ALIGN_ATTEMPTED")" \
+    --argjson openclawUserPluginAlignSucceeded "$(json_bool "$OPENCLAW_USER_PLUGIN_ALIGN_SUCCEEDED")" \
     --argjson sanityFindings "$sanity_findings_json" \
     '{
       timestamp: $timestamp,
@@ -1030,6 +1042,7 @@ persist_json() {
         commitmentsSummary: $commitmentsSummary,
         securityAuditSummary: $securityAuditSummary,
         packageDriftSummary: $packageDriftSummary,
+        openclawUserPluginsSummary: $openclawUserPluginsSummary,
         doctorWarningSummary: $doctorWarningSummary,
         diskSummary: $diskSummary,
         cronSummary: $cronSummary,
@@ -1043,7 +1056,10 @@ persist_json() {
         modelAccessErrorCount: $modelAccessErrorCount,
         securityAuditCriticalCount: $securityAuditCriticalCount,
         securityAuditWarnCount: $securityAuditWarnCount,
-        localHotfixCount: $localHotfixCount
+        localHotfixCount: $localHotfixCount,
+        openclawUserPluginDriftCount: $openclawUserPluginDriftCount,
+        openclawUserPluginAlignAttempted: $openclawUserPluginAlignAttempted,
+        openclawUserPluginAlignSucceeded: $openclawUserPluginAlignSucceeded
       },
       outputs: {
         update: $updateOutput,
@@ -1463,6 +1479,125 @@ mark_config_version_drift_remediated_if_current() {
   fi
 }
 
+collect_openclaw_user_plugin_packages() {
+  if [[ "$OPENCLAW_PLUGIN_ALIGN_PACKAGES" != "auto" ]]; then
+    printf '%s\n' $OPENCLAW_PLUGIN_ALIGN_PACKAGES | sed '/^$/d'
+    return 0
+  fi
+
+  local package_json="$OPENCLAW_USER_NPM_DIR/package.json"
+  if [[ -f "$package_json" ]] && command_exists jq; then
+    jq -r '(.dependencies // {}) | keys[] | select(startswith("@openclaw/"))' "$package_json" 2>/dev/null
+    return 0
+  fi
+
+  if [[ -d "$OPENCLAW_USER_NPM_DIR/node_modules/@openclaw" ]]; then
+    find "$OPENCLAW_USER_NPM_DIR/node_modules/@openclaw" -mindepth 1 -maxdepth 1 -type d -printf '@openclaw/%f\n' 2>/dev/null | sort
+  fi
+}
+
+scan_openclaw_user_plugin_versions() {
+  OPENCLAW_USER_PLUGINS_SUMMARY=""
+  OPENCLAW_USER_PLUGIN_DRIFT_COUNT=0
+
+  [[ -d "$OPENCLAW_USER_NPM_DIR" ]] || return 0
+
+  local current_version="$CURRENT_VERSION_AFTER"
+  [[ -n "$current_version" ]] || current_version="$CURRENT_VERSION_BEFORE"
+  if [[ -z "$current_version" ]]; then
+    current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+  fi
+  [[ -n "$current_version" ]] || return 0
+
+  local packages=()
+  local package_name
+  while IFS= read -r package_name; do
+    [[ -n "$package_name" ]] && append_unique_array packages "$package_name"
+  done < <(collect_openclaw_user_plugin_packages)
+
+  ((${#packages[@]} > 0)) || return 0
+
+  local summary_lines=()
+  local package_json version wanted
+  for package_name in "${packages[@]}"; do
+    wanted="$current_version"
+    package_json="$OPENCLAW_USER_NPM_DIR/node_modules/$package_name/package.json"
+    if [[ -f "$package_json" ]]; then
+      version="$(jq -r '.version // empty' "$package_json" 2>/dev/null || true)"
+    else
+      version="missing"
+    fi
+    [[ -n "$version" ]] || version="unknown"
+    summary_lines+=("$package_name=$version")
+    if [[ "$version" != "$wanted" ]]; then
+      OPENCLAW_USER_PLUGIN_DRIFT_COUNT=$((OPENCLAW_USER_PLUGIN_DRIFT_COUNT + 1))
+      append_sanity_finding "OpenClaw user plugin version drift: $package_name reports $version while active CLI reports $wanted."
+      append_array ACTIONS "Align OpenClaw user plugins with the active OpenClaw runtime version."
+    fi
+  done
+
+  OPENCLAW_USER_PLUGINS_SUMMARY="$(printf '%s\n' "${summary_lines[@]}" | paste -sd ';' - 2>/dev/null || printf '%s\n' "${summary_lines[@]}")"
+}
+
+align_openclaw_user_plugins() {
+  [[ "$AUTO_ALIGN_OPENCLAW_USER_PLUGINS" == "true" ]] || return 0
+  [[ -d "$OPENCLAW_USER_NPM_DIR" ]] || return 0
+
+  local target_version="$CURRENT_VERSION_AFTER"
+  [[ -n "$target_version" ]] || target_version="$CURRENT_VERSION_BEFORE"
+  if [[ -z "$target_version" ]]; then
+    target_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+  fi
+  [[ -n "$target_version" ]] || return 0
+
+  local packages=()
+  local package_name
+  while IFS= read -r package_name; do
+    [[ -n "$package_name" ]] && append_unique_array packages "$package_name"
+  done < <(collect_openclaw_user_plugin_packages)
+
+  ((${#packages[@]} > 0)) || return 0
+
+  OPENCLAW_USER_PLUGIN_ALIGN_ATTEMPTED=1
+
+  local specs=()
+  for package_name in "${packages[@]}"; do
+    specs+=("${package_name}@${target_version}")
+  done
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would align OpenClaw user plugins to $target_version: ${packages[*]}."
+    record_remediation "openclaw_user_plugin_drift" "would_apply" "would npm install --save-exact ${specs[*]}"
+    return 0
+  fi
+
+  if ! command_exists npm; then
+    append_array ERRORS "Cannot align OpenClaw user plugins because npm is missing."
+    append_array ACTIONS "Install npm or align $OPENCLAW_USER_NPM_DIR dependencies manually."
+    record_remediation "openclaw_user_plugin_drift" "blocked_missing_npm" "npm not found"
+    return 1
+  fi
+
+  local output status
+  run_capture_with_heartbeat output status "Aligning OpenClaw user plugins to $target_version" 30 \
+    timeout "${OPENCLAW_PLUGIN_ALIGN_TIMEOUT}s" npm --prefix "$OPENCLAW_USER_NPM_DIR" install --save-exact "${specs[@]}"
+
+  if [[ "$status" -eq 0 ]]; then
+    OPENCLAW_USER_PLUGIN_ALIGN_SUCCEEDED=1
+    REMEDIATION_APPLIED=1
+    append_array FIXES "Aligned OpenClaw user plugins to $target_version: ${packages[*]}."
+    record_remediation "openclaw_user_plugin_drift" "applied" "npm --prefix $OPENCLAW_USER_NPM_DIR install --save-exact ${specs[*]}"
+    scan_openclaw_user_plugin_versions || true
+    return 0
+  fi
+
+  append_array ERRORS "Failed to align OpenClaw user plugins to $target_version."
+  append_array ACTIONS "Review $OPENCLAW_USER_NPM_DIR/package.json and run npm install --save-exact for @openclaw packages manually."
+  record_remediation "openclaw_user_plugin_drift" "apply_failed" "$output"
+  classify_update_failure "$output"
+  return 1
+}
+
 resolve_expected_model_from_config() {
   [[ -n "$EXPECTED_OPENCLAW_MODEL" ]] && return 0
   local cfg_file="$OPENCLAW_STATE_HOME/openclaw.json"
@@ -1470,11 +1605,6 @@ resolve_expected_model_from_config() {
 
   local current_model
   current_model="$(jq -r '.agents.defaults.model.primary // .models.default // .model // empty' "$cfg_file" 2>/dev/null)"
-  if [[ "$current_model" == openai-codex/* ]]; then
-    EXPECTED_OPENCLAW_MODEL="openai/${current_model#openai-codex/}"
-    return 0
-  fi
-
   EXPECTED_OPENCLAW_MODEL="$current_model"
 }
 
@@ -1594,6 +1724,7 @@ reset_sanity_state_for_final_pass() {
   COMMITMENTS_SUMMARY=""
   SECURITY_AUDIT_SUMMARY=""
   PACKAGE_DRIFT_SUMMARY=""
+  OPENCLAW_USER_PLUGINS_SUMMARY=""
   DOCTOR_WARNING_SUMMARY=""
   PROVIDER_EMPTY_INPUT_COUNT=0
   PROVIDER_AUTH_ERROR_COUNT=0
@@ -1605,6 +1736,7 @@ reset_sanity_state_for_final_pass() {
   SECURITY_AUDIT_CRITICAL_COUNT=0
   SECURITY_AUDIT_WARN_COUNT=0
   LOCAL_HOTFIX_COUNT=0
+  OPENCLAW_USER_PLUGIN_DRIFT_COUNT=0
 
   remove_array_value ACTIONS "Inspect shell openclaw aliases/functions if CLI and gateway versions diverge."
   remove_array_value ACTIONS "Remove or update stale OpenClaw installations that can shadow the current CLI."
@@ -1621,6 +1753,7 @@ reset_sanity_state_for_final_pass() {
   remove_array_value ACTIONS "OpenClawNurse will restore the expected OpenClaw model config after doctor repair."
   remove_array_value ACTIONS "Set agents.defaults.model.primary to $EXPECTED_OPENCLAW_MODEL and remove incompatible runtime overrides manually."
   remove_array_value ACTIONS "Restore Codex OAuth model config or provide OPENAI_API_KEY for direct OpenAI models."
+  remove_array_value ACTIONS "Align OpenClaw user plugins with the active OpenClaw runtime version."
 }
 
 run_final_sanity_pass() {
@@ -1825,6 +1958,7 @@ run_runtime_sanity() {
   resolve_expected_model_from_config
   validate_openclaw_config_contracts || true
   detect_openclaw_model_config_drift || true
+  scan_openclaw_user_plugin_versions || true
   scan_shell_openclaw_aliases || true
 
   local current_version
@@ -3924,11 +4058,12 @@ EOF
     printf '\nDoctor highlights:\n%s\n' "$summary_lines"
   fi
 
-  if [[ -n "$COMMITMENTS_SUMMARY" || -n "$SECURITY_AUDIT_SUMMARY" || -n "$PACKAGE_DRIFT_SUMMARY" || -n "$DOCTOR_WARNING_SUMMARY" ]]; then
+  if [[ -n "$COMMITMENTS_SUMMARY" || -n "$SECURITY_AUDIT_SUMMARY" || -n "$PACKAGE_DRIFT_SUMMARY" || -n "$OPENCLAW_USER_PLUGINS_SUMMARY" || -n "$DOCTOR_WARNING_SUMMARY" ]]; then
     printf '\nSanity probes:\n'
     [[ -n "$COMMITMENTS_SUMMARY" ]] && printf -- '- commitments: %s\n' "$COMMITMENTS_SUMMARY"
     [[ -n "$SECURITY_AUDIT_SUMMARY" ]] && printf -- '- security audit: %s\n' "$SECURITY_AUDIT_SUMMARY"
     [[ -n "$PACKAGE_DRIFT_SUMMARY" ]] && printf -- '- package drift: %s\n' "$PACKAGE_DRIFT_SUMMARY"
+    [[ -n "$OPENCLAW_USER_PLUGINS_SUMMARY" ]] && printf -- '- OpenClaw user plugins: %s\n' "$OPENCLAW_USER_PLUGINS_SUMMARY"
     [[ -n "$DOCTOR_WARNING_SUMMARY" ]] && printf -- '- doctor warnings: %s\n' "$DOCTOR_WARNING_SUMMARY"
   fi
 
@@ -4139,6 +4274,11 @@ main() {
     run_update || true
   fi
   if [[ "$UPDATE_SUCCEEDED" -eq 1 ]]; then
+    align_openclaw_user_plugins || true
+  elif (( OPENCLAW_USER_PLUGIN_DRIFT_COUNT > 0 )); then
+    align_openclaw_user_plugins || true
+  fi
+  if [[ "$UPDATE_SUCCEEDED" -eq 1 ]]; then
     refresh_gateway_service_after_update || true
   else
     refresh_stale_gateway_service || true
@@ -4165,7 +4305,7 @@ main() {
     DOCTOR_SUMMARY="skipped in light profile"
   fi
 
-  if [[ "$UPDATE_SUCCEEDED" -eq 1 || "$CONFIG_RESTORED" -eq 1 || "$MODEL_CONFIG_REMEDIATED" -eq 1 ]]; then
+  if [[ "$UPDATE_SUCCEEDED" -eq 1 || "$CONFIG_RESTORED" -eq 1 || "$MODEL_CONFIG_REMEDIATED" -eq 1 || "$OPENCLAW_USER_PLUGIN_ALIGN_SUCCEEDED" -eq 1 ]]; then
     if restart_gateway; then
       record_gateway_restart
       wait_for_gateway_health || true
