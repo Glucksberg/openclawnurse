@@ -1479,6 +1479,20 @@ mark_config_version_drift_remediated_if_current() {
   fi
 }
 
+collect_openclaw_user_plugin_peer_packages() {
+  [[ -d "$OPENCLAW_USER_NPM_DIR/node_modules/@openclaw" ]] || return 0
+  command_exists jq || return 0
+
+  local plugin_dir package_json
+  while IFS= read -r plugin_dir; do
+    package_json="$plugin_dir/package.json"
+    [[ -f "$package_json" ]] || continue
+    if jq -e '(.peerDependencies // {}) | has("openclaw")' "$package_json" >/dev/null 2>&1; then
+      printf 'openclaw\n'
+    fi
+  done < <(find "$OPENCLAW_USER_NPM_DIR/node_modules/@openclaw" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+}
+
 collect_openclaw_user_plugin_packages() {
   if [[ "$OPENCLAW_PLUGIN_ALIGN_PACKAGES" != "auto" ]]; then
     printf '%s\n' $OPENCLAW_PLUGIN_ALIGN_PACKAGES | sed '/^$/d'
@@ -1487,12 +1501,17 @@ collect_openclaw_user_plugin_packages() {
 
   local package_json="$OPENCLAW_USER_NPM_DIR/package.json"
   if [[ -f "$package_json" ]] && command_exists jq; then
-    jq -r '(.dependencies // {}) | keys[] | select(startswith("@openclaw/"))' "$package_json" 2>/dev/null
+    jq -r '(.dependencies // {}) | keys[] | select(. == "openclaw" or startswith("@openclaw/"))' "$package_json" 2>/dev/null
+    collect_openclaw_user_plugin_peer_packages
     return 0
   fi
 
+  if [[ -d "$OPENCLAW_USER_NPM_DIR/node_modules/openclaw" ]]; then
+    printf 'openclaw\n'
+  fi
   if [[ -d "$OPENCLAW_USER_NPM_DIR/node_modules/@openclaw" ]]; then
     find "$OPENCLAW_USER_NPM_DIR/node_modules/@openclaw" -mindepth 1 -maxdepth 1 -type d -printf '@openclaw/%f\n' 2>/dev/null | sort
+    collect_openclaw_user_plugin_peer_packages
   fi
 }
 

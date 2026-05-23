@@ -805,7 +805,7 @@ while [[ \$# -gt 0 ]]; do
     install|--save-exact)
       shift
       ;;
-    @openclaw/*@*)
+    @openclaw/*@*|openclaw@*)
       spec="\$1"
       pkg="\${spec%@*}"
       version="\${spec##*@}"
@@ -827,7 +827,7 @@ EOF
 {"dependencies":{"@openclaw/codex":"2026.0.9"}}
 EOF
   cat >"$tmp/home/.openclaw/npm/node_modules/@openclaw/codex/package.json" <<'EOF'
-{"name":"@openclaw/codex","version":"2026.0.9"}
+{"name":"@openclaw/codex","version":"2026.0.9","peerDependencies":{"openclaw":">=2026.0.9"}}
 EOF
   cat >"$tmp/cfg/openclawnurse.env" <<EOF
 EXTRA_PATH="$tmp/bin"
@@ -857,12 +857,15 @@ EOF
     and .sanity.openclawUserPluginAlignAttempted == true
     and .sanity.openclawUserPluginAlignSucceeded == true
     and (.sanity.openclawUserPluginsSummary | contains("@openclaw/codex=2026.1.0"))
+    and (.sanity.openclawUserPluginsSummary | contains("openclaw=2026.1.0"))
     and any(.remediations[]; .code == "openclaw_user_plugin_drift" and .result == "applied")
   ' "$tmp/state/doctor-state.json" >/dev/null ||
     fail "OpenClaw user plugin drift was not remediated"
 
   "$JQ_BIN" -e '.version == "2026.1.0"' "$tmp/home/.openclaw/npm/node_modules/@openclaw/codex/package.json" >/dev/null ||
     fail "plugin package was not aligned"
+  "$JQ_BIN" -e '.version == "2026.1.0"' "$tmp/home/.openclaw/npm/node_modules/openclaw/package.json" >/dev/null ||
+    fail "openclaw peer package was not aligned"
 
   pass "OpenClaw user plugin drift is remediated"
 }
