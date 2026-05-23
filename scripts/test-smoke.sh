@@ -5,7 +5,26 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 JQ_BIN="${JQ_BIN:-jq}"
 SMOKE_TMP_ROOT="$(mktemp -d)"
-trap 'rm -rf "$SMOKE_TMP_ROOT"' EXIT
+
+cleanup_smoke_tmp() {
+  local pids
+  pids="$(
+    ps -eo pid=,cmd= |
+      awk -v root="$SMOKE_TMP_ROOT" 'index($0, "PM2 v") && index($0, root) { print $1 }'
+  )"
+  if [[ -n "$pids" ]]; then
+    printf '%s\n' "$pids" | xargs -r kill 2>/dev/null || true
+    sleep 1
+    pids="$(
+      ps -eo pid=,cmd= |
+        awk -v root="$SMOKE_TMP_ROOT" 'index($0, "PM2 v") && index($0, root) { print $1 }'
+    )"
+    [[ -z "$pids" ]] || printf '%s\n' "$pids" | xargs -r kill -9 2>/dev/null || true
+  fi
+  rm -rf "$SMOKE_TMP_ROOT"
+}
+
+trap cleanup_smoke_tmp EXIT
 export RUN_PROFILE=heavy
 
 require_cmd() {
