@@ -6,6 +6,13 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 JQ_BIN="${JQ_BIN:-jq}"
 SMOKE_TMP_ROOT="$(mktemp -d)"
 
+# Keep smoke runs hermetic even when they are launched by a live Nurse process
+# during self-update validation.
+unset CONFIG_DIR DATA_DIR STATE_DIR LOG_DIR LOCK_FILE STATE_FILE
+unset GATEWAY_RESTART_STATE_FILE PENDING_TEXT_FILE PENDING_JSON_FILE
+unset CONFIG_BACKUP_DIR ORPHAN_TRANSCRIPT_ARCHIVE_DIR
+unset OPENCLAW_CONFIG_FILE OPENCLAW_STATE_HOME
+
 cleanup_smoke_tmp() {
   local pids
   pids="$(
@@ -534,6 +541,47 @@ EOF
     fail "commitments model access trace was not reported"
 
   pass "commitments trace model access errors are reported"
+}
+
+smoke_commitments_successful_traces_do_not_degrade() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/commitments-success.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw/commitments/extractor-sessions/main"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"commitments":{"enabled":true,"maxPerDay":2},"agents":{"defaults":{"model":{"primary":"openai/gpt-5.5"}}}}
+EOF
+  cat >"$tmp/home/.openclaw/commitments/extractor-sessions/main/success.trajectory.jsonl" <<'EOF'
+{"traceSchema":"openclaw-trajectory","type":"session.started","ts":"2026-01-01T00:00:00Z","provider":"openai-codex","modelId":"gpt-5.5","data":{"status":""}}
+{"traceSchema":"openclaw-trajectory","type":"model.completed","ts":"2026-01-01T00:00:01Z","provider":"openai-codex","modelId":"gpt-5.5","data":{"timedOut":false,"aborted":false,"promptError":null,"assistantTexts":["{\"candidates\":[],\"note\":\"user mentioned error 226\"}"]}}
+{"traceSchema":"openclaw-trajectory","type":"session.ended","ts":"2026-01-01T00:00:02Z","provider":"openai-codex","modelId":"gpt-5.5","data":{"status":"success","promptError":null}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_COMMITMENTS_SANITY="true"
+CONFIG_BACKUP_ENABLED="false"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify --dry-run >/dev/null
+
+  "$JQ_BIN" -e '
+    .status == "OK"
+    and .sanity.commitmentsErrorCount == 0
+    and .sanity.modelAccessErrorCount == 0
+    and (.incidentCodes | index("commitments_extractor_failed") | not)
+    and (.incidentCodes | index("commitments_extractor_model_mismatch") | not)
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "successful commitments traces degraded the run"
+
+  pass "successful commitments traces do not degrade sanity"
 }
 
 smoke_security_audit_critical_is_reported() {
@@ -1780,6 +1828,7 @@ main() {
   smoke_array_cron_jobs_are_supported
   smoke_model_auth_notice_does_not_degrade
   smoke_commitments_trace_model_access_is_reported
+  smoke_commitments_successful_traces_do_not_degrade
   smoke_security_audit_critical_is_reported
   smoke_telegram_commands_are_remediated
   smoke_config_version_drift_forces_update

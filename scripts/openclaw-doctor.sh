@@ -2336,19 +2336,59 @@ run_commitments_sanity() {
   max_per_day="$(jq -r '.commitments.maxPerDay // empty' "$OPENCLAW_CONFIG_FILE" 2>/dev/null || true)"
 
   local trace_dir="$OPENCLAW_STATE_HOME/commitments/extractor-sessions"
-  local trace_logs=""
+  local trace_events="" trace_errors=""
   if [[ -d "$trace_dir" ]]; then
-    trace_logs="$(find "$trace_dir" -type f -mtime "-$COMMITMENTS_TRACE_SCAN_DAYS" -print0 2>/dev/null \
-      | xargs -0 grep -IhE 'errorMessage|does not have access to model|model_not_found|unsupported model|Unauthorized|provider|modelId|openai/gpt-5\.5' 2>/dev/null || true)"
+    trace_events="$(find "$trace_dir" -type f -name '*.trajectory.jsonl' -mtime "-$COMMITMENTS_TRACE_SCAN_DAYS" -print0 2>/dev/null \
+      | xargs -0 -r jq -r '
+          select(type == "object")
+          | [
+              (.type // ""),
+              (.provider // ""),
+              (.modelId // ""),
+              (.data.status // ""),
+              ((.data.promptError // "") | tostring),
+              ((.data.errorMessage // .errorMessage // "") | tostring),
+              ((.data.aborted // false) | tostring),
+              ((.data.timedOut // false) | tostring)
+            ]
+          | @tsv
+        ' 2>/dev/null || true)"
+    trace_errors="$(find "$trace_dir" -type f \( -name '*.jsonl' -o -name '*.json' \) ! -name '*.trajectory.jsonl' -mtime "-$COMMITMENTS_TRACE_SCAN_DAYS" -print0 2>/dev/null \
+      | xargs -0 -r jq -r '
+          select(type == "object")
+          | (.data.errorMessage // .errorMessage // .data.promptError // empty)
+          | select(. != null and . != "")
+          | tostring
+        ' 2>/dev/null || true)"
   fi
 
-  COMMITMENTS_ERROR_COUNT="$(printf '%s\n' "$trace_logs" | grep -Ei 'errorMessage|failed|error' | wc -l | tr -d ' ')"
-  MODEL_ACCESS_ERROR_COUNT="$(printf '%s\n' "$trace_logs" | grep -Ei 'does not have access to model|model_not_found|unsupported model|unauthorized|permission denied' | wc -l | tr -d ' ')"
+  local structured_error_count explicit_error_count
+  structured_error_count="$(
+    printf '%s\n' "$trace_events" \
+      | awk -F '\t' '
+          ($1 == "session.ended" && $4 != "" && $4 != "success") ||
+          ($1 == "model.completed" && ($5 != "" || $7 == "true" || $8 == "true")) ||
+          ($6 != "") { n++ }
+          END { print n + 0 }
+        '
+  )"
+  explicit_error_count="$(printf '%s\n' "$trace_errors" | sed '/^$/d' | wc -l | tr -d ' ')"
+  COMMITMENTS_ERROR_COUNT=$((structured_error_count + explicit_error_count))
+  MODEL_ACCESS_ERROR_COUNT="$(printf '%s\n' "$trace_errors" | grep -Ei 'does not have access to model|model_not_found|unsupported model|unauthorized|permission denied' | wc -l | tr -d ' ')"
 
   resolve_expected_model_from_config
   local mismatch_count=0
-  if [[ -n "$EXPECTED_OPENCLAW_MODEL" && -n "$trace_logs" ]]; then
-    mismatch_count="$(printf '%s\n' "$trace_logs" | grep -E 'modelId|provider|openai/gpt-5\.5' | grep -Fv "$EXPECTED_OPENCLAW_MODEL" | wc -l | tr -d ' ')"
+  if [[ -n "$EXPECTED_OPENCLAW_MODEL" && -n "$trace_events" ]]; then
+    local provider model_id observed_model
+    while IFS=$'\t' read -r event_type provider model_id _rest; do
+      [[ "$event_type" == "session.started" && -n "$provider" && -n "$model_id" ]] || continue
+      if [[ "$provider" == "openai-codex" ]]; then
+        observed_model="openai/$model_id"
+      else
+        observed_model="$provider/$model_id"
+      fi
+      [[ "$observed_model" == "$EXPECTED_OPENCLAW_MODEL" ]] || mismatch_count=$((mismatch_count + 1))
+    done <<<"$trace_events"
   fi
 
   COMMITMENTS_SUMMARY="enabled=true; count=${count:-0}; maxPerDay=${max_per_day:-unknown}; store=${store_path:-unknown}; traceErrors=$COMMITMENTS_ERROR_COUNT; modelAccessErrors=$MODEL_ACCESS_ERROR_COUNT"
