@@ -253,11 +253,15 @@ detect_openclaw_bin() {
     printf '%s' "$OPENCLAW_BIN"
     return 0
   fi
+  if command -v openclaw >/dev/null 2>&1; then
+    command -v openclaw
+    return 0
+  fi
   if [[ -x "$HOME/openclaw/node_modules/.bin/openclaw" ]]; then
     printf '%s' "$HOME/openclaw/node_modules/.bin/openclaw"
     return 0
   fi
-  command -v openclaw 2>/dev/null || printf 'openclaw'
+  printf 'openclaw'
 }
 
 detect_openclaw_alert_target() {
@@ -327,7 +331,7 @@ detect_scheduler() {
 detect_telegram_target() {
   local cron_jobs="${OPENCLAW_STATE_HOME:-$HOME/.openclaw}/cron/jobs.json"
   if [[ -f "$cron_jobs" ]]; then
-    jq -r '.jobs[]? | .delivery.to // empty' "$cron_jobs" 2>/dev/null | head -n 1
+    jq -r '(if type == "array" then . else (.jobs // []) end)[]? | .delivery.to // empty' "$cron_jobs" 2>/dev/null | head -n 1
   fi
 }
 
@@ -514,7 +518,7 @@ ensure_openclaw_alert_cron_job() {
     return 0
   fi
 
-  existing_id="$(printf '%s' "$existing_json" | jq -r --arg name "$OPENCLAW_ALERT_JOB_NAME" '.jobs[]? | select(.name == $name) | .id' | head -n 1)"
+  existing_id="$(printf '%s' "$existing_json" | jq -r --arg name "$OPENCLAW_ALERT_JOB_NAME" '(if type == "array" then . else (.jobs // []) end)[]? | select(.name == $name) | .id' | head -n 1)"
   local cron_args=(--name "$OPENCLAW_ALERT_JOB_NAME" --description "$OPENCLAW_ALERT_JOB_DESCRIPTION" --agent "$OPENCLAW_ALERT_AGENT_ID" --session isolated --light-context --tools exec --timeout-seconds 120 --message "$message" --channel telegram --to "$OPENCLAW_ALERT_TARGET" --no-deliver)
   if [[ -n "${OPENCLAW_ALERT_CRON:-}" ]]; then
     cron_args+=(--cron "$OPENCLAW_ALERT_CRON")

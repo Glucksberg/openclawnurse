@@ -415,6 +415,37 @@ EOF
   pass "disabled high-frequency cron jobs are ignored"
 }
 
+smoke_array_cron_jobs_are_supported() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/cron-array.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw/cron"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/home/.openclaw/cron/jobs.json" <<'EOF'
+[{"id":"fast","name":"fast isolated","enabled":true,"sessionTarget":"isolated","schedule":{"everyMs":30000}}]
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="true"
+CONFIG_BACKUP_ENABLED="false"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e '.sanity.cronSummary | contains("fast fast isolated every=30s")' \
+    "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "array-form cron jobs were not inspected"
+
+  pass "array-form cron jobs are supported"
+}
+
 smoke_model_auth_notice_does_not_degrade() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/model-auth.XXXXXX")"
@@ -1319,6 +1350,56 @@ EOF
   pass "default deduplicates local OpenClaw shim and shell function"
 }
 
+smoke_missing_local_openclaw_bin_is_remediated() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/missing-local-bin.XXXXXX")"
+
+  mkdir -p \
+    "$tmp/home/.npm-global/bin" \
+    "$tmp/home/openclaw/node_modules/.bin" \
+    "$tmp/home/openclaw/node_modules/.pnpm/openclaw@2026.0.8/node_modules/openclaw" \
+    "$tmp/state" \
+    "$tmp/cfg"
+
+  make_fake_openclaw "$tmp/home/.npm-global/bin/openclaw"
+  cat >"$tmp/home/openclaw/package.json" <<'EOF'
+{"dependencies":{"openclaw":"2026.0.8"}}
+EOF
+  cat >"$tmp/home/openclaw/node_modules/.pnpm/openclaw@2026.0.8/node_modules/openclaw/package.json" <<'EOF'
+{"name":"openclaw","version":"2026.0.8"}
+EOF
+  ln -s .pnpm/openclaw@2026.0.8/node_modules/openclaw "$tmp/home/openclaw/node_modules/openclaw"
+  cat >"$tmp/home/.bashrc" <<'EOF'
+alias openclaw="$HOME/openclaw/node_modules/.bin/openclaw"
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/home/.npm-global/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  [[ ! -e "$tmp/home/openclaw/node_modules/openclaw" ]] ||
+    fail "local OpenClaw package root for missing shim was not quarantined"
+  grep -Fq '# openclawnurse disabled shell alias shadowing:' "$tmp/home/.bashrc" ||
+    fail "OpenClaw shell alias to missing local shim was not disabled"
+  "$JQ_BIN" -e '
+    .status == "OK"
+    and any(.fixes[]; contains("broken local shim"))
+    and any(.remediations[]; .code == "openclaw_installation_drift" and .result == "applied")
+    and any(.remediations[]; .code == "openclaw_shell_shadowing" and .result == "applied")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "missing local OpenClaw bin remediation was not recorded"
+
+  pass "missing local OpenClaw bin is remediated"
+}
+
 write_minimal_self_update_tree() {
   local tree="$1"
   local marker="$2"
@@ -1696,6 +1777,7 @@ main() {
   smoke_sanity_overrides_updated_status
   smoke_telegram_sanity_uses_implicit_bot_token
   smoke_disabled_high_frequency_cron_is_ignored
+  smoke_array_cron_jobs_are_supported
   smoke_model_auth_notice_does_not_degrade
   smoke_commitments_trace_model_access_is_reported
   smoke_security_audit_critical_is_reported
@@ -1708,6 +1790,7 @@ main() {
   smoke_update_retry_success_is_not_failed
   smoke_remediates_openclaw_installation_drift
   smoke_default_deduplicates_local_openclaw_shim
+  smoke_missing_local_openclaw_bin_is_remediated
   smoke_self_update_applies_valid_upstream
   smoke_removes_openclaw_related_pm2_apps
   smoke_dry_run_reports_openclaw_pm2_daemon_cleanup

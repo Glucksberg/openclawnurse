@@ -577,7 +577,7 @@ detect_telegram_target() {
   local cron_jobs="$OPENCLAW_STATE_HOME/cron/jobs.json"
   if [[ -f "$cron_jobs" ]]; then
     local detected
-    detected="$(jq -r '.jobs[]? | .delivery.to // empty' "$cron_jobs" 2>/dev/null | head -n 1)"
+    detected="$(jq -r '(if type == "array" then . else (.jobs // []) end)[]? | .delivery.to // empty' "$cron_jobs" 2>/dev/null | head -n 1)"
     if [[ -n "$detected" ]]; then
       TELEGRAM_TARGET="$detected"
       log INFO "Auto-detected TELEGRAM_TARGET from $cron_jobs: $TELEGRAM_TARGET"
@@ -1377,6 +1377,27 @@ openclaw_package_root_from_path() {
   fi
 }
 
+openclaw_local_package_root_for_bin_path() {
+  local path="$1"
+  local project_dir package_root
+
+  case "$path" in
+    */node_modules/.bin/openclaw)
+      project_dir="${path%/node_modules/.bin/openclaw}"
+      package_root="$project_dir/node_modules/openclaw"
+      if [[ -e "$package_root" || -L "$package_root" ]]; then
+        printf '%s\n' "$package_root"
+        return 0
+      fi
+      ;;
+  esac
+}
+
+openclaw_path_has_local_package_context() {
+  local path="$1"
+  [[ -n "$(openclaw_local_package_root_for_bin_path "$path")" ]]
+}
+
 collect_protected_openclaw_paths() {
   # shellcheck disable=SC2034,SC2178 # populated through append_unique_array nameref calls below.
   local -n protected_ref="$1"
@@ -1763,6 +1784,7 @@ reset_sanity_state_for_final_pass() {
 
   remove_array_value ACTIONS "Inspect shell openclaw aliases/functions if CLI and gateway versions diverge."
   remove_array_value ACTIONS "Remove or update stale OpenClaw installations that can shadow the current CLI."
+  remove_array_value ACTIONS "Refresh the current shell after OpenClaw launcher remediation: run unalias openclaw 2>/dev/null; hash -r, or open a new terminal."
   remove_array_value ACTIONS "Converge OpenClaw binaries to a single version in PATH and service definitions."
   remove_array_value ACTIONS "Reinstall or refresh the gateway service so it points to the current OpenClaw runtime."
   remove_array_value ACTIONS "Restart/reinstall the OpenClaw gateway from the active OpenClaw installation."
@@ -1872,7 +1894,9 @@ maybe_auto_remediate_openclaw_installations() {
     done < <(type -a -P "$OPENCLAW_BIN" 2>/dev/null || true)
   fi
   for candidate in $OPENCLAW_EXTRA_SCAN_PATHS $OPENCLAW_REMEDIABLE_INSTALL_PATHS; do
-    [[ -e "$candidate" || -L "$candidate" ]] && append_unique_array candidates "$candidate"
+    if [[ -e "$candidate" || -L "$candidate" ]] || openclaw_path_has_local_package_context "$candidate"; then
+      append_unique_array candidates "$candidate"
+    fi
   done
 
   local path version package_root quarantine_targets=() target stale_found=0 remediated_count=0
@@ -1896,6 +1920,14 @@ maybe_auto_remediate_openclaw_installations() {
         append_sanity_finding "OpenClaw stale installation would be remediated: $path reports $version while active CLI reports $current_version."
       else
         append_array FIXES "Remediated OpenClaw stale installation: $path reported $version while active CLI reports $current_version."
+      fi
+    elif openclaw_path_has_local_package_context "$path"; then
+      package_root="$(openclaw_local_package_root_for_bin_path "$path")"
+      quarantine_targets=("$package_root")
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        append_sanity_finding "OpenClaw broken local shim would be remediated: $path is missing or not executable while local package root $package_root exists."
+      else
+        append_array FIXES "Remediated OpenClaw broken local shim: $path was missing or not executable while local package root $package_root existed."
       fi
     else
       if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -2002,15 +2034,26 @@ run_runtime_sanity() {
   fi
 
   for candidate in $OPENCLAW_EXTRA_SCAN_PATHS; do
-    [[ -x "$candidate" ]] && append_unique_array paths "$candidate"
+    if [[ -x "$candidate" ]] || openclaw_path_has_local_package_context "$candidate"; then
+      append_unique_array paths "$candidate"
+    fi
   done
 
   local install_lines=()
   local versions=()
   local path version_line version
   for path in "${paths[@]:-}"; do
-    version_line="$(timeout 5s "$path" --version 2>/dev/null | head -n 1 || true)"
-    version="$(printf '%s' "$version_line" | extract_openclaw_version)"
+    if [[ -x "$path" ]]; then
+      version_line="$(timeout 5s "$path" --version 2>/dev/null | head -n 1 || true)"
+      version="$(printf '%s' "$version_line" | extract_openclaw_version)"
+    else
+      package_root="$(openclaw_local_package_root_for_bin_path "$path")"
+      version="$(detect_openclaw_path_version "$package_root")"
+      version_line="missing local shim${version:+ for OpenClaw $version}"
+      append_sanity_finding "OpenClaw local shim is missing or not executable: $path while local package root $package_root exists."
+      append_array ACTIONS "Remove or update stale OpenClaw installations that can shadow the current CLI."
+      append_array ACTIONS "Refresh the current shell after OpenClaw launcher remediation: run unalias openclaw 2>/dev/null; hash -r, or open a new terminal."
+    fi
     [[ -n "$version" ]] && append_unique_array versions "$version"
     install_lines+=("$path -> ${version_line:-unknown}")
     if [[ -n "$current_version" && -n "$version" && "$version" != "$current_version" ]]; then
@@ -2503,7 +2546,7 @@ run_cron_sanity() {
   local threshold_ms=$((CRON_ISOLATED_MIN_INTERVAL_SECONDS * 1000))
   local risky
   risky="$(jq -r --argjson threshold "$threshold_ms" '
-    .jobs[]?
+    (if type == "array" then . else (.jobs // []) end)[]?
     | select((if has("enabled") then .enabled else true end) == true)
     | select((.sessionTarget // "") == "isolated")
     | select((.schedule.everyMs // 0) > 0 and (.schedule.everyMs // 0) < $threshold)
