@@ -12,6 +12,7 @@ It is designed to be installed next to an OpenClaw runtime and run unattended fr
 - repairs common local state issues without interactive prompts
 - backs up and restores `openclaw.json` when the config is invalid
 - deduplicates stale OpenClaw installations that can shadow the active CLI
+- removes OpenClaw-related PM2 apps/temporary daemons while preserving unrelated PM2 apps
 - repairs local launcher/path drift for common npm/pnpm installs
 - checks commitments, security audit output, package drift and local hotfix markers
 - restarts the OpenClaw gateway when maintenance requires it
@@ -74,6 +75,9 @@ Common settings:
 - `TELEGRAM_BOT_TOKEN`: optional dedicated token. If empty, the Nurse can reuse the OpenClaw Telegram token from `~/.openclaw/openclaw.json`.
 - `EXPECTED_OPENCLAW_MODEL`: optional expected primary model. If unset, the Nurse can infer `openai-codex/*` when the host has Codex OAuth but no direct OpenAI API key.
 - `AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL`: restores model config drift after `openclaw doctor --repair`.
+- `AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD`: removes PM2 apps whose name or metadata points to OpenClaw and keeps the gateway under systemd.
+- `AUTO_CLEAN_OPENCLAW_PM2_DAEMONS`: stops OpenClaw/OpenClawNurse-related PM2 daemon processes left outside the normal PM2 home.
+- `SECURITY_AUDIT_ACCEPTED_WARNINGS`: space-separated security audit warning IDs that are accepted for this host's explicit trust model.
 - `ENABLE_COMMITMENTS_SANITY`: checks enabled commitments and recent extractor traces for model/provider errors.
 - `ENABLE_SECURITY_AUDIT`: runs `openclaw security audit --json` and promotes critical findings to failed status.
 - `ENABLE_PACKAGE_DRIFT_SANITY`: detects local package hotfix markers that could be overwritten by future updates.

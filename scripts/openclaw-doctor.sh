@@ -211,6 +211,9 @@ AUTO_RESTART_UNHEALTHY_GATEWAY="${AUTO_RESTART_UNHEALTHY_GATEWAY:-true}"
 AUTO_REFRESH_STALE_GATEWAY_SERVICE="${AUTO_REFRESH_STALE_GATEWAY_SERVICE:-true}"
 AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="${AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD:-true}"
 PM2_GATEWAY_APP_NAMES="${PM2_GATEWAY_APP_NAMES:-${PM2_GATEWAY_APP_NAME:-openclaw-gateway openclaw}}"
+PM2_OPENCLAW_MATCH_TEXT="${PM2_OPENCLAW_MATCH_TEXT:-openclaw}"
+AUTO_CLEAN_OPENCLAW_PM2_DAEMONS="${AUTO_CLEAN_OPENCLAW_PM2_DAEMONS:-true}"
+PM2_OPENCLAW_DAEMON_PATTERNS="${PM2_OPENCLAW_DAEMON_PATTERNS:-openclaw openclawnurse doctor-defaults pending-report report-none missing-token sanity-status telegram-implicit telegram-commands config-version-drift model-config-drift json-preamble update-retry install-drift local-shim-drift commitments. security.}"
 MAX_GATEWAY_RESTARTS_PER_DAY="${MAX_GATEWAY_RESTARTS_PER_DAY:-1}"
 MAX_GATEWAY_RESTARTS_PER_WINDOW="${MAX_GATEWAY_RESTARTS_PER_WINDOW:-3}"
 GATEWAY_RESTART_WINDOW_SECONDS="${GATEWAY_RESTART_WINDOW_SECONDS:-300}"
@@ -230,6 +233,7 @@ ENABLE_COMMITMENTS_SANITY="${ENABLE_COMMITMENTS_SANITY:-true}"
 ENABLE_SECURITY_AUDIT="${ENABLE_SECURITY_AUDIT:-true}"
 SECURITY_AUDIT_DEEP="${SECURITY_AUDIT_DEEP:-false}"
 SECURITY_AUDIT_TIMEOUT="${SECURITY_AUDIT_TIMEOUT:-600}"
+SECURITY_AUDIT_ACCEPTED_WARNINGS="${SECURITY_AUDIT_ACCEPTED_WARNINGS:-}"
 AUTO_FIX_SECURITY_FILE_PERMS="${AUTO_FIX_SECURITY_FILE_PERMS:-true}"
 ENABLE_PACKAGE_DRIFT_SANITY="${ENABLE_PACKAGE_DRIFT_SANITY:-true}"
 COMMITMENTS_TRACE_SCAN_DAYS="${COMMITMENTS_TRACE_SCAN_DAYS:-14}"
@@ -2366,11 +2370,13 @@ run_security_audit_sanity() {
     return 0
   fi
 
+  local accepted_json accepted_warn_count top_findings
+  accepted_json="$(printf '%s\n' $SECURITY_AUDIT_ACCEPTED_WARNINGS | jq -Rsc 'split("\n") | map(select(length > 0))' 2>/dev/null || printf '[]')"
   SECURITY_AUDIT_CRITICAL_COUNT="$(printf '%s' "$output" | jq -r '[.findings[]? | select(.severity == "critical")] | length' 2>/dev/null)"
-  SECURITY_AUDIT_WARN_COUNT="$(printf '%s' "$output" | jq -r '[.findings[]? | select(.severity == "warn")] | length' 2>/dev/null)"
-  local top_findings
-  top_findings="$(printf '%s' "$output" | jq -r '.findings[]? | select(.severity == "critical" or .severity == "warn") | "\(.severity):\(.checkId)"' 2>/dev/null | head -n 5 | paste -sd ',' -)"
-  SECURITY_AUDIT_SUMMARY="critical=$SECURITY_AUDIT_CRITICAL_COUNT; warn=$SECURITY_AUDIT_WARN_COUNT${top_findings:+; top=$top_findings}"
+  SECURITY_AUDIT_WARN_COUNT="$(printf '%s' "$output" | jq -r --argjson accepted "$accepted_json" '[.findings[]? | select(.severity == "warn" and ((.checkId as $id | $accepted | index($id)) | not))] | length' 2>/dev/null)"
+  accepted_warn_count="$(printf '%s' "$output" | jq -r --argjson accepted "$accepted_json" '[.findings[]? | select(.severity == "warn" and (.checkId as $id | $accepted | index($id)))] | length' 2>/dev/null)"
+  top_findings="$(printf '%s' "$output" | jq -r --argjson accepted "$accepted_json" '.findings[]? | select(.severity == "critical" or (.severity == "warn" and ((.checkId as $id | $accepted | index($id)) | not))) | "\(.severity):\(.checkId)"' 2>/dev/null | head -n 5 | paste -sd ',' -)"
+  SECURITY_AUDIT_SUMMARY="critical=$SECURITY_AUDIT_CRITICAL_COUNT; warn=$SECURITY_AUDIT_WARN_COUNT; acceptedWarn=${accepted_warn_count:-0}${top_findings:+; top=$top_findings}"
 
   if (( SECURITY_AUDIT_CRITICAL_COUNT > 0 )); then
     add_incident_code "security_audit_critical"
@@ -2401,7 +2407,7 @@ parse_doctor_output_signals() {
     append_unique_array ACTIONS "Verify whether claude-mem should provide OpenClaw memory search in this profile."
   fi
 
-  if printf '%s' "$lowered" | grep -Eq 'missing requirements[[:space:]]+[1-9]|missing requirements'; then
+  if printf '%s' "$lowered" | grep -Eq 'missing requirements[^0-9]*[1-9][0-9]*'; then
     signals+=("skills-missing-requirements")
     append_sanity_finding "Doctor reports skills with missing requirements."
     append_unique_array ACTIONS "Review OpenClaw doctor skills output and install only the skill requirements that are actually needed."
@@ -3330,20 +3336,117 @@ pm2_gateway_app_names_json() {
 pm2_gateway_apps_json() {
   command_exists pm2 || return 1
 
-  local output status names_json
+  local output status names_json match_text
   names_json="$(pm2_gateway_app_names_json)"
-  run_capture_allow_fail output status "Inspecting PM2 for legacy OpenClaw gateway app" pm2 jlist
-  [[ "$status" -eq 0 ]] || return 1
+  match_text="$(printf '%s' "$PM2_OPENCLAW_MATCH_TEXT" | tr '[:upper:]' '[:lower:]')"
+  log INFO "Inspecting PM2 for OpenClaw-related app" >&2
+  output="$(pm2 jlist 2>&1)"
+  status=$?
+  if [[ "$status" -eq 0 ]]; then
+    log INFO "Inspecting PM2 for OpenClaw-related app succeeded" >&2
+  else
+    log ERROR "Inspecting PM2 for OpenClaw-related app failed with exit $status" >&2
+    return 1
+  fi
 
-  printf '%s' "$output" | jq -c --argjson names "$names_json" '
-    [.[]? | select(.name as $name | $names | index($name)) | .name] | unique
+  printf '%s' "$output" | jq -c --argjson names "$names_json" --arg needle "$match_text" '
+    def stringify:
+      if . == null then ""
+      elif type == "array" then map(tostring) | join(" ")
+      elif type == "object" then tojson
+      else tostring
+      end;
+
+    [
+      .[]? as $app
+      | ($app.pm2_env // {}) as $env
+      | ($app.name // $env.name // "") as $app_name
+      | ($names | index($app_name)) as $exact_name
+      | ([
+          $app_name,
+          $env.name,
+          $env.pm_exec_path,
+          $env.pm_cwd,
+          $env.exec_interpreter,
+          $env.script,
+          $env.args,
+          $env.node_args
+        ] | map(stringify) | join(" ") | ascii_downcase) as $metadata
+      | select($exact_name or (($needle | length) > 0 and ($metadata | contains($needle))))
+      | {
+          id: ($app.pm_id // empty),
+          name: $app_name,
+          match: (if $exact_name then "name" else "metadata" end)
+        }
+    ] | unique_by(.id, .name)
   ' 2>/dev/null
 }
 
 pm2_gateway_app_exists() {
   local apps_json
-  apps_json="$(pm2_gateway_apps_json 2>/dev/null || printf '[]')"
+  apps_json="$(pm2_gateway_apps_json || printf '[]')"
   printf '%s' "$apps_json" | jq -e 'length > 0' >/dev/null 2>&1
+}
+
+pm2_openclaw_daemon_lines() {
+  command_exists ps || return 1
+
+  local pid args lowered pattern
+  while read -r pid args; do
+    [[ -n "${pid:-}" && -n "${args:-}" ]] || continue
+    [[ "$args" == *"PM2 v"* && "$args" == *"God Daemon"* ]] || continue
+    lowered="$(printf '%s' "$args" | tr '[:upper:]' '[:lower:]')"
+    for pattern in $PM2_OPENCLAW_DAEMON_PATTERNS; do
+      [[ -n "$pattern" ]] || continue
+      pattern="$(printf '%s' "$pattern" | tr '[:upper:]' '[:lower:]')"
+      if [[ "$lowered" == *"$pattern"* ]]; then
+        printf '%s\t%s\n' "$pid" "$args"
+        break
+      fi
+    done
+  done < <(ps -eo pid=,args= 2>/dev/null || true)
+}
+
+maybe_cleanup_openclaw_pm2_daemons() {
+  [[ "$AUTO_CLEAN_OPENCLAW_PM2_DAEMONS" == "true" ]] || return 0
+
+  local daemon_lines=()
+  mapfile -t daemon_lines < <(pm2_openclaw_daemon_lines 2>/dev/null || true)
+  ((${#daemon_lines[@]} > 0)) || return 0
+
+  add_incident_code "pm2_openclaw_daemon"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would stop ${#daemon_lines[@]} OpenClaw-related PM2 daemon(s)."
+    record_remediation "pm2_openclaw_daemon" "would_apply" "would stop ${#daemon_lines[@]} matching PM2 daemon process(es)"
+    return 0
+  fi
+
+  local line pid args stopped_count=0 failed_count=0
+  for line in "${daemon_lines[@]}"; do
+    pid="${line%%$'\t'*}"
+    args="${line#*$'\t'}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    if kill "$pid" 2>/dev/null; then
+      stopped_count=$((stopped_count + 1))
+      log INFO "Stopped OpenClaw-related PM2 daemon pid=$pid ($args)"
+    else
+      failed_count=$((failed_count + 1))
+      log WARN "Failed to stop OpenClaw-related PM2 daemon pid=$pid ($args)"
+    fi
+  done
+
+  if ((stopped_count > 0)); then
+    REMEDIATION_APPLIED=1
+    append_array FIXES "Stopped $stopped_count OpenClaw-related PM2 daemon(s)."
+    record_remediation "pm2_openclaw_daemon" "applied" "stopped $stopped_count matching PM2 daemon process(es)"
+  fi
+  if ((failed_count > 0)); then
+    append_array ACTIONS "Some OpenClaw-related PM2 daemon processes could not be stopped; inspect 'ps -eo pid,args | grep PM2'."
+    record_remediation "pm2_openclaw_daemon" "apply_failed" "$failed_count matching PM2 daemon process(es) could not be stopped"
+    return 1
+  fi
+  return 0
 }
 
 ensure_systemd_gateway_enabled() {
@@ -3369,43 +3472,43 @@ ensure_systemd_gateway_enabled() {
 maybe_migrate_pm2_gateway_to_systemd() {
   [[ "$AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD" == "true" ]] || return 0
 
-  local pm2_apps_json pm2_apps_text pm2_app
-  pm2_apps_json="$(pm2_gateway_apps_json 2>/dev/null || printf '[]')"
+  local pm2_apps_json pm2_apps_text pm2_delete_ref pm2_app_label
+  pm2_apps_json="$(pm2_gateway_apps_json || printf '[]')"
   if ! printf '%s' "$pm2_apps_json" | jq -e 'length > 0' >/dev/null 2>&1; then
     return 0
   fi
-  pm2_apps_text="$(printf '%s' "$pm2_apps_json" | jq -r 'join(", ")')"
+  pm2_apps_text="$(printf '%s' "$pm2_apps_json" | jq -r 'map("\(.name) [\(.match)]") | join(", ")')"
 
   add_incident_code "pm2_gateway_legacy"
 
   if [[ "$RESTART_MODE" != "systemd_user" ]]; then
-    append_array ACTIONS "PM2 has an OpenClaw gateway app, but RESTART_MODE=$RESTART_MODE; set RESTART_MODE=systemd_user before automatic PM2 migration."
+    append_array ACTIONS "PM2 has OpenClaw-related app(s), but RESTART_MODE=$RESTART_MODE; set RESTART_MODE=systemd_user before automatic PM2 migration."
     record_remediation "pm2_gateway_legacy" "blocked_by_policy" "restart mode is not systemd_user"
     return 1
   fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    append_array FIXES "Dry-run: would remove PM2 gateway app(s) '$pm2_apps_text' and ensure systemd user gateway service is enabled/running."
-    record_remediation "pm2_gateway_legacy" "would_apply" "would delete exact PM2 app(s) $pm2_apps_text and start $SYSTEMD_UNIT_NAME"
+    append_array FIXES "Dry-run: would remove PM2 OpenClaw app(s) '$pm2_apps_text' and ensure systemd user gateway service is enabled/running."
+    record_remediation "pm2_gateway_legacy" "would_apply" "would delete PM2 OpenClaw app(s) $pm2_apps_text and start $SYSTEMD_UNIT_NAME"
     return 0
   fi
 
   local output status
-  while IFS= read -r pm2_app; do
-    [[ -n "$pm2_app" ]] || continue
-    run_capture output status "Removing legacy PM2 gateway app '$pm2_app'" pm2 delete "$pm2_app"
+  while IFS=$'\t' read -r pm2_delete_ref pm2_app_label; do
+    [[ -n "$pm2_delete_ref" ]] || continue
+    run_capture output status "Removing PM2 OpenClaw app '$pm2_app_label'" pm2 delete "$pm2_delete_ref"
     if [[ "$status" -ne 0 ]]; then
       RESTART_ERROR="$output"
-      append_array ERRORS "Failed to remove legacy PM2 gateway app '$pm2_app'."
-      record_remediation "pm2_gateway_legacy" "apply_failed" "pm2 delete failed for exact app $pm2_app"
+      append_array ERRORS "Failed to remove PM2 OpenClaw app '$pm2_app_label'."
+      record_remediation "pm2_gateway_legacy" "apply_failed" "pm2 delete failed for $pm2_app_label"
       return 1
     fi
-  done < <(printf '%s' "$pm2_apps_json" | jq -r '.[]')
+  done < <(printf '%s' "$pm2_apps_json" | jq -r '.[] | [(.id // .name), (.name + " [" + .match + "]")] | @tsv')
 
   if pm2 save >/dev/null 2>&1; then
-    append_array FIXES "PM2 process list saved after removing legacy OpenClaw gateway app."
+    append_array FIXES "PM2 process list saved after removing OpenClaw-related app(s)."
   else
-    append_array ACTIONS "Legacy PM2 gateway app was removed, but 'pm2 save' failed; verify PM2 startup state manually if PM2 is used for other apps."
+    append_array ACTIONS "OpenClaw-related PM2 app(s) were removed, but 'pm2 save' failed; verify PM2 startup state manually if PM2 is used for other apps."
   fi
 
   if ! ensure_systemd_gateway_enabled; then
@@ -3414,8 +3517,8 @@ maybe_migrate_pm2_gateway_to_systemd() {
   fi
 
   REMEDIATION_APPLIED=1
-  append_array FIXES "Removed legacy PM2 OpenClaw gateway app(s) and ensured systemd user gateway service is enabled/running."
-  record_remediation "pm2_gateway_legacy" "applied" "deleted exact PM2 app(s) $pm2_apps_text and started $SYSTEMD_UNIT_NAME"
+  append_array FIXES "Removed PM2 OpenClaw app(s) and ensured systemd user gateway service is enabled/running."
+  record_remediation "pm2_gateway_legacy" "applied" "deleted PM2 OpenClaw app(s) $pm2_apps_text and started $SYSTEMD_UNIT_NAME"
   return 0
 }
 
@@ -4272,6 +4375,7 @@ main() {
 
   maybe_restore_broken_config || true
   maybe_migrate_pm2_gateway_to_systemd || true
+  maybe_cleanup_openclaw_pm2_daemons || true
 
   run_update_status || true
   maybe_auto_remediate_openclaw_installations || true

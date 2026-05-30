@@ -1452,6 +1452,237 @@ EOF
   pass "self-update applies valid upstream and installs refreshed runtime"
 }
 
+smoke_removes_openclaw_related_pm2_apps() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/pm2-openclaw-apps.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$tmp/bin/systemctl"
+  cat >"$tmp/bin/pm2" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+case "\${1:-}" in
+  jlist)
+    cat <<'JSON'
+[
+  {
+    "pm_id": 1,
+    "name": "telegram-audio-transcriber",
+    "pm2_env": {
+      "pm_exec_path": "/srv/telegram-audio-transcriber/index.js",
+      "pm_cwd": "/srv/telegram-audio-transcriber"
+    }
+  },
+  {
+    "pm_id": 2,
+    "name": "legacy-worker",
+    "pm2_env": {
+      "pm_exec_path": "/home/dev/.npm-global/lib/node_modules/openclaw/dist/index.js",
+      "pm_cwd": "/home/dev/.npm-global/lib/node_modules/openclaw",
+      "args": ["gateway", "--port", "18789"]
+    }
+  },
+  {
+    "pm_id": 3,
+    "name": "openclaw-helper",
+    "pm2_env": {
+      "pm_exec_path": "/opt/tools/helper.js",
+      "pm_cwd": "/opt/tools"
+    }
+  }
+]
+JSON
+    ;;
+  delete)
+    printf 'delete %s\n' "\${2:-}" >>"$tmp/pm2.log"
+    ;;
+  save)
+    printf 'save\n' >>"$tmp/pm2.log"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/pm2"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+EXTRA_PATH="$tmp/bin"
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="systemd_user"
+SYSTEMD_UNIT_NAME="openclaw-gateway.service"
+AUTO_CLEAN_OPENCLAW_PM2_DAEMONS="false"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  grep -Fq 'delete 2' "$tmp/pm2.log" ||
+    fail "PM2 app with OpenClaw metadata was not deleted by id"
+  grep -Fq 'delete 3' "$tmp/pm2.log" ||
+    fail "PM2 app with OpenClaw name was not deleted by id"
+  ! grep -Fq 'delete 1' "$tmp/pm2.log" ||
+    fail "unrelated PM2 app was deleted"
+  grep -Fq 'save' "$tmp/pm2.log" ||
+    fail "PM2 process list was not saved after OpenClaw app cleanup"
+  "$JQ_BIN" -e '
+    .status == "OK"
+    and any(.remediations[]; .code == "pm2_gateway_legacy" and .result == "applied")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "PM2 OpenClaw app cleanup was not recorded"
+
+  pass "OpenClaw-related PM2 apps are removed while unrelated apps remain"
+}
+
+smoke_dry_run_reports_openclaw_pm2_daemon_cleanup() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/pm2-daemon-cleanup.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/bin/pm2" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  jlist)
+    printf '[]\n'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/pm2"
+  cat >"$tmp/bin/ps" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == "-eo pid=,args=" ]]; then
+  cat <<'PS'
+111 PM2 v6.0.14: God Daemon (/home/dev/.pm2)
+222 PM2 v6.0.14: God Daemon (/tmp/tmp.example/doctor-defaults.abcd/home/.pm2)
+333 PM2 v6.0.14: God Daemon (/tmp/tmp.example/openclaw-runtime/home/.pm2)
+PS
+else
+  /usr/bin/ps "$@"
+fi
+EOF
+  chmod +x "$tmp/bin/ps"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+EXTRA_PATH="$tmp/bin"
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify --dry-run >/dev/null
+
+  "$JQ_BIN" -e '
+    .status == "OK"
+    and any(.remediations[]; .code == "pm2_openclaw_daemon" and .result == "would_apply")
+    and any(.fixes[]; contains("would stop 2 OpenClaw-related PM2 daemon"))
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "OpenClaw-related PM2 daemon cleanup was not reported in dry-run"
+
+  pass "dry-run reports OpenClaw-related PM2 daemon cleanup"
+}
+
+smoke_accepts_configured_security_warnings() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/security-accepted-warnings.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  cat >"$tmp/bin/openclaw" <<'EOF'
+#!/usr/bin/env bash
+
+case "${1:-}" in
+  --version)
+    printf 'OpenClaw 2026.1.0\n'
+    ;;
+  update)
+    printf '{"availability":{"available":false,"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
+    ;;
+  doctor)
+    cat <<'DOC'
+Doctor warnings
+Skills status
+Eligible: 18
+Missing requirements: 0
+Blocked by allowlist: 0
+Doctor complete.
+DOC
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  status)
+    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
+    ;;
+  security)
+    if [[ "${2:-}" == "audit" ]]; then
+      cat <<'JSON'
+{
+  "summary": {"critical": 0, "warn": 1, "info": 0},
+  "findings": [
+    {
+      "checkId": "security.trust_model.multi_user_heuristic",
+      "severity": "warn",
+      "title": "Potential multi-user setup detected"
+    }
+  ]
+}
+JSON
+    else
+      printf '{}\n'
+    fi
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_SECURITY_AUDIT="true"
+SECURITY_AUDIT_ACCEPTED_WARNINGS="security.trust_model.multi_user_heuristic"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e '
+    .status == "OK"
+    and all(.incidentCodes[]; . != "security_audit_warn" and . != "doctor_warnings")
+    and .sanity.securityAuditWarnCount == 0
+    and (.sanity.securityAuditSummary | contains("acceptedWarn=1"))
+    and (.sanity.doctorWarningSummary == "" or .sanity.doctorWarningSummary == "none")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "accepted security warning or Missing requirements: 0 handling regressed"
+
+  pass "configured security warnings are accepted without hiding new warnings"
+}
+
 main() {
   require_cmd "$JQ_BIN"
   require_cmd git
@@ -1478,6 +1709,9 @@ main() {
   smoke_remediates_openclaw_installation_drift
   smoke_default_deduplicates_local_openclaw_shim
   smoke_self_update_applies_valid_upstream
+  smoke_removes_openclaw_related_pm2_apps
+  smoke_dry_run_reports_openclaw_pm2_daemon_cleanup
+  smoke_accepts_configured_security_warnings
 }
 
 main "$@"
