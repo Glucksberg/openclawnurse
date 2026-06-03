@@ -184,9 +184,29 @@ case "$RUN_PROFILE" in
     ;;
 esac
 AUTO_UPDATE="${AUTO_UPDATE:-true}"
+OPENCLAW_UPDATE_MODE="${OPENCLAW_UPDATE_MODE:-standard}"
 UPDATE_CHANNEL="${UPDATE_CHANNEL:-stable}"
 UPDATE_TAG="${UPDATE_TAG:-}"
 UPDATE_TIMEOUT="${UPDATE_TIMEOUT:-900}"
+FORK_MANAGER_REPO_DIR="${FORK_MANAGER_REPO_DIR:-$HOME/openclaw-fork-manager}"
+FORK_MANAGER_PRODUCTION_BRANCH="${FORK_MANAGER_PRODUCTION_BRANCH:-main-with-all-prs}"
+FORK_MANAGER_SYNC_COMMAND="${FORK_MANAGER_SYNC_COMMAND-}"
+FORK_MANAGER_BUILD_COMMAND="${FORK_MANAGER_BUILD_COMMAND-pnpm install --frozen-lockfile && pnpm build}"
+FORK_MANAGER_GATEWAY_INSTALL_COMMAND="${FORK_MANAGER_GATEWAY_INSTALL_COMMAND-node openclaw.mjs gateway install --force --port ${OPENCLAW_GATEWAY_PORT:-18789} --json}"
+FORK_MANAGER_COMMAND_TIMEOUT="${FORK_MANAGER_COMMAND_TIMEOUT:-1800}"
+FORK_MANAGER_DEPLOY_REVISION_FILE="${FORK_MANAGER_DEPLOY_REVISION_FILE:-$STATE_DIR/fork-manager-deployed.rev}"
+FORK_MANAGER_OPENCLAW_BIN="${FORK_MANAGER_OPENCLAW_BIN:-$FORK_MANAGER_REPO_DIR/openclaw.mjs}"
+FORK_MANAGER_CHECKOUT_PRODUCTION_BRANCH="${FORK_MANAGER_CHECKOUT_PRODUCTION_BRANCH:-true}"
+case "$OPENCLAW_UPDATE_MODE" in
+  standard|fork_manager) ;;
+  *)
+    echo "Unsupported OPENCLAW_UPDATE_MODE=$OPENCLAW_UPDATE_MODE; expected standard or fork_manager." >&2
+    exit 2
+    ;;
+esac
+if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
+  OPENCLAW_BIN="$FORK_MANAGER_OPENCLAW_BIN"
+fi
 AUTO_SELF_UPDATE="${AUTO_SELF_UPDATE:-false}"
 SELF_UPDATE_REPO_DIR="${SELF_UPDATE_REPO_DIR:-}"
 SELF_UPDATE_REMOTE="${SELF_UPDATE_REMOTE:-origin}"
@@ -706,6 +726,9 @@ UPDATE_OUTPUT=""
 DOCTOR_OUTPUT=""
 HEALTH_OUTPUT=""
 UPDATE_ERROR=""
+FORK_MANAGER_PRODUCTION_REVISION=""
+FORK_MANAGER_DEPLOYED_REVISION=""
+FORK_MANAGER_UPDATE_SUMMARY=""
 RESTART_ERROR=""
 HEALTH_ERROR=""
 SELF_UPDATE_ATTEMPTED=0
@@ -822,6 +845,10 @@ json_remediations_from_name() {
       })' 2>/dev/null || printf '[]'
 }
 
+remediation_detail_from_output() {
+  printf '%s' "$1" | tr '\n|' '  ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | cut -c1-500
+}
+
 load_gateway_restart_state() {
   GATEWAY_RESTARTS_TODAY=0
   GATEWAY_RESTARTS_IN_WINDOW=0
@@ -900,6 +927,13 @@ persist_json() {
     --arg doctorOutput "$DOCTOR_OUTPUT" \
     --arg healthOutput "$HEALTH_OUTPUT" \
     --arg updateError "$UPDATE_ERROR" \
+    --arg openclawUpdateMode "$OPENCLAW_UPDATE_MODE" \
+    --arg forkManagerRepoDir "$FORK_MANAGER_REPO_DIR" \
+    --arg forkManagerProductionBranch "$FORK_MANAGER_PRODUCTION_BRANCH" \
+    --arg forkManagerProductionRevision "$FORK_MANAGER_PRODUCTION_REVISION" \
+    --arg forkManagerDeployedRevision "$FORK_MANAGER_DEPLOYED_REVISION" \
+    --arg forkManagerOpenclawBin "$FORK_MANAGER_OPENCLAW_BIN" \
+    --arg forkManagerUpdateSummary "$FORK_MANAGER_UPDATE_SUMMARY" \
     --arg restartError "$RESTART_ERROR" \
     --arg healthError "$HEALTH_ERROR" \
     --arg selfUpdateFrom "$SELF_UPDATE_FROM" \
@@ -987,9 +1021,18 @@ persist_json() {
       availableVersion: $availableVersion,
       updateAvailable: $updateAvailable,
       channel: $channel,
+      updateMode: $openclawUpdateMode,
       dryRun: $dryRun,
       updateAttempted: $updateAttempted,
       updateSucceeded: $updateSucceeded,
+      forkManager: {
+        repoDir: $forkManagerRepoDir,
+        productionBranch: $forkManagerProductionBranch,
+        productionRevision: $forkManagerProductionRevision,
+        deployedRevision: $forkManagerDeployedRevision,
+        openclawBin: $forkManagerOpenclawBin,
+        summary: $forkManagerUpdateSummary
+      },
       selfUpdate: {
         attempted: $selfUpdateAttempted,
         available: $selfUpdateAvailable,
@@ -3391,6 +3434,11 @@ run_preflight_checks() {
     append_unique_array required systemctl
   fi
 
+  if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
+    append_unique_array required git
+    append_unique_array required bash
+  fi
+
   if [[ "$NO_NOTIFY" -eq 0 && "$REPORT_CHANNEL" == "telegram" && -n "$TELEGRAM_TARGET" && -n "$TELEGRAM_BOT_TOKEN" ]]; then
     append_unique_array required curl
   fi
@@ -3412,6 +3460,17 @@ run_preflight_checks() {
 
   if [[ "$NO_NOTIFY" -eq 0 && "$REPORT_CHANNEL" == "telegram" && -z "$TELEGRAM_BOT_TOKEN" ]]; then
     append_unique_array ACTIONS "Configure TELEGRAM_BOT_TOKEN so OpenClawNurse can deliver reports."
+  fi
+
+  if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
+    if [[ ! -d "$FORK_MANAGER_REPO_DIR/.git" ]]; then
+      append_array ERRORS "Fork-manager update mode is enabled, but FORK_MANAGER_REPO_DIR is not a git checkout: $FORK_MANAGER_REPO_DIR"
+      missing_required=1
+    fi
+    if [[ ! -x "$FORK_MANAGER_OPENCLAW_BIN" ]]; then
+      append_array ERRORS "Fork-manager update mode is enabled, but FORK_MANAGER_OPENCLAW_BIN is not executable: $FORK_MANAGER_OPENCLAW_BIN"
+      missing_required=1
+    fi
   fi
 
   return "$missing_required"
@@ -3613,7 +3672,168 @@ maybe_migrate_pm2_gateway_to_systemd() {
   return 0
 }
 
+fork_manager_production_revision() {
+  git -C "$FORK_MANAGER_REPO_DIR" rev-parse --verify "$FORK_MANAGER_PRODUCTION_BRANCH^{commit}" 2>/dev/null
+}
+
+fork_manager_production_version() {
+  git -C "$FORK_MANAGER_REPO_DIR" show "$FORK_MANAGER_PRODUCTION_BRANCH:package.json" 2>/dev/null |
+    jq -r '.version // empty' 2>/dev/null
+}
+
+fork_manager_load_deployed_revision() {
+  FORK_MANAGER_DEPLOYED_REVISION=""
+  [[ -f "$FORK_MANAGER_DEPLOY_REVISION_FILE" ]] || return 0
+  FORK_MANAGER_DEPLOYED_REVISION="$(head -n 1 "$FORK_MANAGER_DEPLOY_REVISION_FILE" 2>/dev/null | tr -cd '0-9a-fA-F' | cut -c1-40)"
+}
+
+fork_manager_validate_runtime_source() {
+  if [[ ! -d "$FORK_MANAGER_REPO_DIR/.git" ]]; then
+    UPDATE_ERROR="FORK_MANAGER_REPO_DIR is not a git checkout: $FORK_MANAGER_REPO_DIR"
+    append_array ERRORS "$UPDATE_ERROR"
+    return 1
+  fi
+  if [[ ! -x "$FORK_MANAGER_OPENCLAW_BIN" ]]; then
+    UPDATE_ERROR="FORK_MANAGER_OPENCLAW_BIN is not executable: $FORK_MANAGER_OPENCLAW_BIN"
+    append_array ERRORS "$UPDATE_ERROR"
+    return 1
+  fi
+  if ! FORK_MANAGER_PRODUCTION_REVISION="$(fork_manager_production_revision)"; then
+    UPDATE_ERROR="Could not resolve fork-manager production branch $FORK_MANAGER_PRODUCTION_BRANCH in $FORK_MANAGER_REPO_DIR."
+    append_array ERRORS "$UPDATE_ERROR"
+    return 1
+  fi
+  return 0
+}
+
+run_fork_manager_update_status() {
+  fork_manager_load_deployed_revision
+  CURRENT_VERSION_BEFORE="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+  CURRENT_VERSION_AFTER="$CURRENT_VERSION_BEFORE"
+  CHANNEL_VALUE="fork_manager:$FORK_MANAGER_PRODUCTION_BRANCH"
+  UPDATE_AVAILABLE=0
+
+  fork_manager_validate_runtime_source || return 1
+
+  AVAILABLE_VERSION="$(fork_manager_production_version)"
+  if [[ -z "$AVAILABLE_VERSION" ]]; then
+    UPDATE_ERROR="Could not read package.json version from $FORK_MANAGER_PRODUCTION_BRANCH."
+    append_array ERRORS "$UPDATE_ERROR"
+    return 1
+  fi
+
+  if [[ "$FORK_MANAGER_DEPLOYED_REVISION" != "$FORK_MANAGER_PRODUCTION_REVISION" ]]; then
+    UPDATE_AVAILABLE=1
+  fi
+
+  FORK_MANAGER_UPDATE_SUMMARY="production=${FORK_MANAGER_PRODUCTION_REVISION:0:12}; deployed=${FORK_MANAGER_DEPLOYED_REVISION:-none}; version=$AVAILABLE_VERSION"
+  return 0
+}
+
+run_fork_manager_shell_command() {
+  local command_text="$1"
+  local label="$2"
+  local output_var="$3"
+  local status_var="$4"
+
+  run_capture_with_heartbeat "$output_var" "$status_var" "$label" 30 \
+    env \
+      FORK_MANAGER_REPO_DIR="$FORK_MANAGER_REPO_DIR" \
+      FORK_MANAGER_COMMAND="$command_text" \
+      timeout "${FORK_MANAGER_COMMAND_TIMEOUT}s" \
+      bash -lc 'cd "$FORK_MANAGER_REPO_DIR" && eval "$FORK_MANAGER_COMMAND"'
+}
+
+persist_fork_manager_deployed_revision() {
+  mkdir -p "$(dirname "$FORK_MANAGER_DEPLOY_REVISION_FILE")"
+  printf '%s\n' "$FORK_MANAGER_PRODUCTION_REVISION" >"$FORK_MANAGER_DEPLOY_REVISION_FILE"
+  FORK_MANAGER_DEPLOYED_REVISION="$FORK_MANAGER_PRODUCTION_REVISION"
+}
+
+run_fork_manager_update() {
+  UPDATE_ATTEMPTED=1
+
+  fork_manager_validate_runtime_source || return 1
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would deploy OpenClaw fork-manager production branch $FORK_MANAGER_PRODUCTION_BRANCH at ${FORK_MANAGER_PRODUCTION_REVISION:0:12}."
+    record_remediation "openclaw_fork_manager_update" "would_apply" "would deploy $FORK_MANAGER_PRODUCTION_BRANCH ${FORK_MANAGER_PRODUCTION_REVISION:0:12}"
+    UPDATE_SUCCEEDED=0
+    return 0
+  fi
+
+  local output status
+  UPDATE_OUTPUT=""
+
+  if [[ -n "$FORK_MANAGER_SYNC_COMMAND" ]]; then
+    run_fork_manager_shell_command "$FORK_MANAGER_SYNC_COMMAND" "Running fork-manager sync command" output status
+    UPDATE_OUTPUT="$output"
+    if [[ "$status" -ne 0 ]]; then
+      UPDATE_ERROR="$output"
+      append_array ERRORS "Fork-manager sync command failed."
+      record_remediation "openclaw_fork_manager_update" "sync_failed" "$(remediation_detail_from_output "$output")"
+      return 1
+    fi
+    if ! FORK_MANAGER_PRODUCTION_REVISION="$(fork_manager_production_revision)"; then
+      UPDATE_ERROR="Could not resolve fork-manager production branch after sync."
+      append_array ERRORS "$UPDATE_ERROR"
+      return 1
+    fi
+  fi
+
+  if [[ "$FORK_MANAGER_CHECKOUT_PRODUCTION_BRANCH" == "true" ]]; then
+    run_capture output status "Checking out fork-manager production branch" \
+      git -C "$FORK_MANAGER_REPO_DIR" checkout "$FORK_MANAGER_PRODUCTION_BRANCH"
+    UPDATE_OUTPUT="${UPDATE_OUTPUT}${UPDATE_OUTPUT:+$'\n\n'}$output"
+    if [[ "$status" -ne 0 ]]; then
+      UPDATE_ERROR="$output"
+      append_array ERRORS "Could not check out fork-manager production branch."
+      record_remediation "openclaw_fork_manager_update" "checkout_failed" "$(remediation_detail_from_output "$output")"
+      return 1
+    fi
+  fi
+
+  if [[ -n "$FORK_MANAGER_BUILD_COMMAND" ]]; then
+    run_fork_manager_shell_command "$FORK_MANAGER_BUILD_COMMAND" "Building OpenClaw fork-manager runtime" output status
+    UPDATE_OUTPUT="${UPDATE_OUTPUT}${UPDATE_OUTPUT:+$'\n\n'}$output"
+    if [[ "$status" -ne 0 ]]; then
+      UPDATE_ERROR="$output"
+      append_array ERRORS "Fork-manager runtime build failed."
+      classify_update_failure "$output"
+      record_remediation "openclaw_fork_manager_update" "build_failed" "$(remediation_detail_from_output "$output")"
+      return 1
+    fi
+  fi
+
+  if [[ -n "$FORK_MANAGER_GATEWAY_INSTALL_COMMAND" ]]; then
+    run_fork_manager_shell_command "$FORK_MANAGER_GATEWAY_INSTALL_COMMAND" "Installing fork-manager gateway service" output status
+    UPDATE_OUTPUT="${UPDATE_OUTPUT}${UPDATE_OUTPUT:+$'\n\n'}$output"
+    if [[ "$status" -ne 0 ]]; then
+      UPDATE_ERROR="$output"
+      append_array ERRORS "Fork-manager gateway service install failed."
+      record_remediation "openclaw_fork_manager_update" "gateway_install_failed" "$(remediation_detail_from_output "$output")"
+      return 1
+    fi
+  fi
+
+  persist_fork_manager_deployed_revision
+  UPDATE_SUCCEEDED=1
+  UPDATE_AVAILABLE=0
+  CONSECUTIVE_FAILURES=0
+  CURRENT_VERSION_AFTER="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+  [[ -n "$CURRENT_VERSION_AFTER" ]] || CURRENT_VERSION_AFTER="$AVAILABLE_VERSION"
+  FORK_MANAGER_UPDATE_SUMMARY="deployed $FORK_MANAGER_PRODUCTION_BRANCH ${FORK_MANAGER_PRODUCTION_REVISION:0:12}"
+  append_array FIXES "Deployed OpenClaw fork-manager production branch $FORK_MANAGER_PRODUCTION_BRANCH at ${FORK_MANAGER_PRODUCTION_REVISION:0:12}."
+  record_remediation "openclaw_fork_manager_update" "applied" "$FORK_MANAGER_PRODUCTION_BRANCH ${FORK_MANAGER_PRODUCTION_REVISION:0:12}"
+  return 0
+}
+
 run_update_status() {
+  if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
+    run_fork_manager_update_status
+    return
+  fi
+
   local output status json_output
   local cmd
   build_openclaw_cmd cmd
@@ -3651,6 +3871,13 @@ should_attempt_update() {
   [[ "$AUTO_UPDATE" == "true" ]] || return 1
   [[ "$CONFIG_HEALTH" != "invalid" ]] || return 1
   (( CONSECUTIVE_FAILURES < MAX_CONSECUTIVE_UPDATE_FAILURES )) || return 1
+
+  if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
+    [[ "$UPDATE_AVAILABLE" -eq 1 ]] || return 1
+    [[ -n "$FORK_MANAGER_PRODUCTION_REVISION" ]] || return 1
+    [[ "$FORK_MANAGER_DEPLOYED_REVISION" != "$FORK_MANAGER_PRODUCTION_REVISION" ]] || return 1
+    return 0
+  fi
 
   if [[ "$CONFIG_VERSION_DRIFT" -eq 1 && "$AUTO_REMEDIATE_CONFIG_VERSION_DRIFT" == "true" ]]; then
     return 0
@@ -3709,6 +3936,11 @@ classify_update_failure() {
 }
 
 run_update() {
+  if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
+    run_fork_manager_update
+    return
+  fi
+
   UPDATE_ATTEMPTED=1
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -3784,6 +4016,7 @@ run_update() {
 }
 
 refresh_stale_gateway_service() {
+  [[ "$OPENCLAW_UPDATE_MODE" != "fork_manager" ]] || return 0
   [[ "$AUTO_REFRESH_STALE_GATEWAY_SERVICE" == "true" ]] || return 0
   [[ "$DRY_RUN" -eq 0 ]] || return 0
   [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] || return 0
@@ -3921,6 +4154,7 @@ remediate_expected_openclaw_model_config() {
 }
 
 refresh_gateway_service_after_update() {
+  [[ "$OPENCLAW_UPDATE_MODE" != "fork_manager" ]] || return 0
   [[ "$AUTO_REFRESH_GATEWAY_SERVICE_AFTER_UPDATE" == "true" ]] || return 0
   [[ "$RESTART_MODE" == "systemd_user" ]] || return 0
   command_exists "$SYSTEMCTL_BIN" || return 0
@@ -4244,13 +4478,21 @@ build_report() {
 
   local update_line="not attempted"
   if [[ "$UPDATE_ATTEMPTED" -eq 1 && "$UPDATE_SUCCEEDED" -eq 1 ]]; then
-    update_line="applied successfully"
+    if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
+      update_line="fork-manager applied successfully"
+    else
+      update_line="applied successfully"
+    fi
   elif [[ "$UPDATE_ATTEMPTED" -eq 1 && "$DRY_RUN" -eq 1 ]]; then
     update_line="eligible but skipped because dry-run is active"
   elif [[ "$UPDATE_ATTEMPTED" -eq 1 ]]; then
     update_line="failed"
   elif [[ "$CURRENT_VERSION_BEFORE" == "$AVAILABLE_VERSION" && -n "$CURRENT_VERSION_BEFORE" ]]; then
-    update_line="already on the latest version"
+    if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
+      update_line="fork-manager production branch already deployed"
+    else
+      update_line="already on the latest version"
+    fi
   fi
 
   local self_update_line="not attempted"

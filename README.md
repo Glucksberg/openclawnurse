@@ -60,6 +60,10 @@ Common settings:
 - `RUN_PROFILE`: `light` for the normal daily run, or `heavy` for full doctor/security maintenance.
 - `openclawnurse-heavy`: installed wrapper/trigger key for agents to request the heavy profile explicitly.
 - `AUTO_UPDATE`: whether the Nurse should apply available updates.
+- `OPENCLAW_UPDATE_MODE`: `standard` for the default `openclaw update` flow, or `fork_manager` for hosts that run OpenClaw from a fork-manager production branch.
+- `FORK_MANAGER_REPO_DIR`: local OpenClaw checkout used when `OPENCLAW_UPDATE_MODE=fork_manager`.
+- `FORK_MANAGER_PRODUCTION_BRANCH`: branch to deploy in fork-manager mode, usually `main-with-all-prs`.
+- `FORK_MANAGER_SYNC_COMMAND`, `FORK_MANAGER_BUILD_COMMAND`, `FORK_MANAGER_GATEWAY_INSTALL_COMMAND`: optional host policy commands for syncing, building, and installing the fork-manager runtime.
 - `AUTO_ALIGN_OPENCLAW_USER_PLUGINS`: whether the Nurse should align user-installed
   `@openclaw/*` packages under `~/.openclaw/npm` with the active OpenClaw runtime.
 - `OPENCLAW_PLUGIN_ALIGN_PACKAGES`: `auto` to align every `@openclaw/*`
@@ -130,6 +134,7 @@ During a live run it can:
 
 - create a config backup
 - update OpenClaw
+- deploy a configured fork-manager production branch instead of running `openclaw update`
 - align user-installed `@openclaw/*` plugins with the updated runtime
 - run doctor repair
 - quarantine stale OpenClaw paths under `~/.local/state/openclawnurse/quarantine/`

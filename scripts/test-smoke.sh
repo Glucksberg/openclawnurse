@@ -350,6 +350,8 @@ OPENCLAW_EXTRA_SCAN_PATHS="$tmp/bin/stale-openclaw"
 ENABLE_TELEGRAM_SANITY="false"
 ENABLE_GATEWAY_LOG_SCAN="false"
 CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+RESTART_COMMAND="true"
 EOF
 
   HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
@@ -1974,6 +1976,87 @@ EOF
   pass "configured security warnings are accepted without hiding new warnings"
 }
 
+smoke_fork_manager_update_mode_deploys_revision() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/fork-manager-mode.XXXXXX")"
+
+  mkdir -p "$tmp/repo" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  cat >"$tmp/repo/package.json" <<'EOF'
+{"name":"openclaw","version":"2026.6.2"}
+EOF
+  cat >"$tmp/repo/openclaw.mjs" <<'EOF'
+#!/usr/bin/env bash
+
+case "${1:-}" in
+  --version)
+    printf 'OpenClaw 2026.6.2\n'
+    ;;
+  update)
+    printf 'standard update must not run in fork-manager mode\n' >&2
+    exit 42
+    ;;
+  doctor)
+    printf 'doctor complete\n'
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  status)
+    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/repo/openclaw.mjs"
+  git -C "$tmp/repo" init -q
+  git -C "$tmp/repo" config user.email test@example.invalid
+  git -C "$tmp/repo" config user.name 'Test User'
+  git -C "$tmp/repo" add package.json openclaw.mjs
+  git -C "$tmp/repo" commit -q -m 'fake openclaw runtime'
+  git -C "$tmp/repo" branch main-with-all-prs
+  local revision
+  revision="$(git -C "$tmp/repo" rev-parse HEAD)"
+
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_UPDATE_MODE="fork_manager"
+FORK_MANAGER_REPO_DIR="$tmp/repo"
+FORK_MANAGER_PRODUCTION_BRANCH="main-with-all-prs"
+FORK_MANAGER_BUILD_COMMAND=""
+FORK_MANAGER_GATEWAY_INSTALL_COMMAND=""
+FORK_MANAGER_DEPLOY_REVISION_FILE="$tmp/state/fork-manager-deployed.rev"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="true"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+RESTART_COMMAND="true"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e --arg revision "$revision" '
+    .status == "UPDATED"
+    and .updateMode == "fork_manager"
+    and .updateAttempted == true
+    and .updateSucceeded == true
+    and .forkManager.productionRevision == $revision
+    and .forkManager.deployedRevision == $revision
+    and (.outputs.update | contains("standard update must not run") | not)
+    and any(.remediations[]; .code == "openclaw_fork_manager_update" and .result == "applied")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "fork-manager update mode did not deploy the production revision"
+
+  [[ "$(cat "$tmp/state/fork-manager-deployed.rev")" == "$revision" ]] ||
+    fail "fork-manager deployed revision file was not written"
+
+  pass "fork-manager update mode deploys the production revision"
+}
+
 main() {
   require_cmd "$JQ_BIN"
   require_cmd git
@@ -2008,6 +2091,7 @@ main() {
   smoke_dry_run_reports_openclaw_pm2_daemon_cleanup
   smoke_blocks_gateway_restart_when_pm2_daemon_is_in_gateway_cgroup
   smoke_accepts_configured_security_warnings
+  smoke_fork_manager_update_mode_deploys_revision
 }
 
 main "$@"
