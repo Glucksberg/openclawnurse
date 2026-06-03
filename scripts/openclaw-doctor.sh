@@ -3718,6 +3718,7 @@ run_fork_manager_update_status() {
   UPDATE_AVAILABLE=0
 
   fork_manager_validate_runtime_source || return 1
+  sync_fork_manager_production_branch || return 1
 
   AVAILABLE_VERSION="$(fork_manager_production_version)"
   if [[ -z "$AVAILABLE_VERSION" ]]; then
@@ -3748,6 +3749,37 @@ run_fork_manager_shell_command() {
       bash -lc 'cd "$FORK_MANAGER_REPO_DIR" && eval "$FORK_MANAGER_COMMAND"'
 }
 
+should_sync_fork_manager_before_status() {
+  [[ -n "$FORK_MANAGER_SYNC_COMMAND" ]] || return 1
+  [[ "$AUTO_UPDATE" == "true" ]] || return 1
+  [[ "$DRY_RUN" -eq 0 ]] || return 1
+  [[ "$CONFIG_HEALTH" != "invalid" ]] || return 1
+  (( CONSECUTIVE_FAILURES < MAX_CONSECUTIVE_UPDATE_FAILURES )) || return 1
+  return 0
+}
+
+sync_fork_manager_production_branch() {
+  should_sync_fork_manager_before_status || return 0
+
+  local output status
+  run_fork_manager_shell_command "$FORK_MANAGER_SYNC_COMMAND" "Running fork-manager sync command" output status
+  UPDATE_OUTPUT="$output"
+  if [[ "$status" -ne 0 ]]; then
+    UPDATE_ERROR="$output"
+    append_array ERRORS "Fork-manager sync command failed."
+    record_remediation "openclaw_fork_manager_update" "sync_failed" "$(remediation_detail_from_output "$output")"
+    return 1
+  fi
+
+  if ! FORK_MANAGER_PRODUCTION_REVISION="$(fork_manager_production_revision)"; then
+    UPDATE_ERROR="Could not resolve fork-manager production branch after sync."
+    append_array ERRORS "$UPDATE_ERROR"
+    return 1
+  fi
+
+  return 0
+}
+
 persist_fork_manager_deployed_revision() {
   mkdir -p "$(dirname "$FORK_MANAGER_DEPLOY_REVISION_FILE")"
   printf '%s\n' "$FORK_MANAGER_PRODUCTION_REVISION" >"$FORK_MANAGER_DEPLOY_REVISION_FILE"
@@ -3767,23 +3799,7 @@ run_fork_manager_update() {
   fi
 
   local output status
-  UPDATE_OUTPUT=""
-
-  if [[ -n "$FORK_MANAGER_SYNC_COMMAND" ]]; then
-    run_fork_manager_shell_command "$FORK_MANAGER_SYNC_COMMAND" "Running fork-manager sync command" output status
-    UPDATE_OUTPUT="$output"
-    if [[ "$status" -ne 0 ]]; then
-      UPDATE_ERROR="$output"
-      append_array ERRORS "Fork-manager sync command failed."
-      record_remediation "openclaw_fork_manager_update" "sync_failed" "$(remediation_detail_from_output "$output")"
-      return 1
-    fi
-    if ! FORK_MANAGER_PRODUCTION_REVISION="$(fork_manager_production_revision)"; then
-      UPDATE_ERROR="Could not resolve fork-manager production branch after sync."
-      append_array ERRORS "$UPDATE_ERROR"
-      return 1
-    fi
-  fi
+  [[ -n "$UPDATE_OUTPUT" ]] || UPDATE_OUTPUT=""
 
   if [[ "$FORK_MANAGER_CHECKOUT_PRODUCTION_BRANCH" == "true" ]]; then
     run_capture output status "Checking out fork-manager production branch" \
