@@ -1618,6 +1618,9 @@ scan_openclaw_user_plugin_versions() {
     fi
     [[ -n "$version" ]] || version="unknown"
     summary_lines+=("$package_name=$version")
+    if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
+      continue
+    fi
     if [[ "$version" != "$wanted" ]]; then
       OPENCLAW_USER_PLUGIN_DRIFT_COUNT=$((OPENCLAW_USER_PLUGIN_DRIFT_COUNT + 1))
       append_sanity_finding "OpenClaw user plugin version drift: $package_name reports $version while active CLI reports $wanted."
@@ -1630,6 +1633,7 @@ scan_openclaw_user_plugin_versions() {
 
 align_openclaw_user_plugins() {
   [[ "$AUTO_ALIGN_OPENCLAW_USER_PLUGINS" == "true" ]] || return 0
+  [[ "$OPENCLAW_UPDATE_MODE" != "fork_manager" ]] || return 0
   [[ -d "$OPENCLAW_USER_NPM_DIR" ]] || return 0
 
   local target_version="$CURRENT_VERSION_AFTER"

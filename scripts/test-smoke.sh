@@ -1980,7 +1980,7 @@ smoke_fork_manager_update_mode_deploys_revision() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/fork-manager-mode.XXXXXX")"
 
-  mkdir -p "$tmp/repo" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  mkdir -p "$tmp/repo" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw/npm/node_modules/@openclaw/codex"
   cat >"$tmp/repo/package.json" <<'EOF'
 {"name":"openclaw","version":"2026.6.2"}
 EOF
@@ -2010,6 +2010,12 @@ case "${1:-}" in
 esac
 EOF
   chmod +x "$tmp/repo/openclaw.mjs"
+  cat >"$tmp/home/.openclaw/npm/package.json" <<'EOF'
+{"dependencies":{"@openclaw/codex":"2026.5.28"}}
+EOF
+  cat >"$tmp/home/.openclaw/npm/node_modules/@openclaw/codex/package.json" <<'EOF'
+{"name":"@openclaw/codex","version":"2026.5.28","peerDependencies":{"openclaw":">=2026.5.28"}}
+EOF
   git -C "$tmp/repo" init -q
   git -C "$tmp/repo" config user.email test@example.invalid
   git -C "$tmp/repo" config user.name 'Test User'
@@ -2029,7 +2035,7 @@ FORK_MANAGER_DEPLOY_REVISION_FILE="$tmp/state/fork-manager-deployed.rev"
 STATE_DIR="$tmp/state"
 REPORT_CHANNEL="none"
 AUTO_UPDATE="true"
-ENABLE_RUNTIME_SANITY="false"
+ENABLE_RUNTIME_SANITY="true"
 ENABLE_TELEGRAM_SANITY="false"
 ENABLE_GATEWAY_LOG_SCAN="false"
 CONFIG_BACKUP_ENABLED="false"
@@ -2046,6 +2052,9 @@ EOF
     and .updateSucceeded == true
     and .forkManager.productionRevision == $revision
     and .forkManager.deployedRevision == $revision
+    and .sanity.openclawUserPluginDriftCount == 0
+    and .sanity.openclawUserPluginAlignAttempted == false
+    and (.sanity.openclawUserPluginsSummary | contains("@openclaw/codex=2026.5.28"))
     and (.outputs.update | contains("standard update must not run") | not)
     and any(.remediations[]; .code == "openclaw_fork_manager_update" and .result == "applied")
   ' "$tmp/state/doctor-state.json" >/dev/null ||

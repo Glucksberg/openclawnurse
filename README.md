@@ -65,7 +65,9 @@ Common settings:
 - `FORK_MANAGER_PRODUCTION_BRANCH`: branch to deploy in fork-manager mode, usually `main-with-all-prs`.
 - `FORK_MANAGER_SYNC_COMMAND`, `FORK_MANAGER_BUILD_COMMAND`, `FORK_MANAGER_GATEWAY_INSTALL_COMMAND`: optional host policy commands for syncing, building, and installing the fork-manager runtime.
 - `AUTO_ALIGN_OPENCLAW_USER_PLUGINS`: whether the Nurse should align user-installed
-  `@openclaw/*` packages under `~/.openclaw/npm` with the active OpenClaw runtime.
+  `@openclaw/*` packages under `~/.openclaw/npm` with the active OpenClaw runtime
+  in standard update mode. Fork-manager mode reports installed plugin versions
+  without trying to install matching npm versions for local OpenClaw revisions.
 - `OPENCLAW_PLUGIN_ALIGN_PACKAGES`: `auto` to align every `@openclaw/*`
   dependency in `~/.openclaw/npm/package.json`, or a space-separated package list.
 - `AUTO_SELF_UPDATE`: whether the Nurse should pull its own git upstream, validate it, install the refreshed runtime scripts, and use the new version on the next run.
