@@ -1729,6 +1729,94 @@ EOF
   pass "dry-run reports OpenClaw-related PM2 daemon cleanup"
 }
 
+smoke_blocks_gateway_restart_when_pm2_daemon_is_in_gateway_cgroup() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/pm2-cgroup-guard.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.pm2" "$tmp/proc/4242"
+  cat >"$tmp/bin/openclaw" <<'EOF'
+#!/usr/bin/env bash
+
+case "${1:-}" in
+  --version)
+    printf 'OpenClaw 2026.1.0\n'
+    ;;
+  update)
+    case "${2:-}" in
+      status)
+        printf '{"availability":{"available":true,"latestVersion":"2026.2.0"},"channel":{"value":"stable"}}\n'
+        ;;
+      *)
+        printf '{"ok":true}\n'
+        ;;
+    esac
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  printf '4242\n' >"$tmp/home/.pm2/pm2.pid"
+  printf '0::/user.slice/user-1000.slice/user@1000.service/app.slice/openclaw-gateway.service\n' >"$tmp/proc/4242/cgroup"
+  cat >"$tmp/bin/systemctl" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--user" && "\${2:-}" == "show" ]]; then
+  printf '/user.slice/user-1000.slice/user@1000.service/app.slice/openclaw-gateway.service\n'
+  exit 0
+fi
+if [[ "\${1:-}" == "--user" && "\${2:-}" == "restart" ]]; then
+  printf 'restart %s\n' "\${3:-}" >>"$tmp/systemctl.log"
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "$tmp/bin/systemctl"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+EXTRA_PATH="$tmp/bin"
+OPENCLAW_BIN="$tmp/bin/openclaw"
+SYSTEMCTL_BIN="$tmp/bin/systemctl"
+STATE_DIR="$tmp/state"
+PROCFS_DIR="$tmp/proc"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="true"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="systemd_user"
+SYSTEMD_UNIT_NAME="openclaw-gateway.service"
+AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="false"
+AUTO_CLEAN_OPENCLAW_PM2_DAEMONS="false"
+AUTO_REFRESH_STALE_GATEWAY_SERVICE="false"
+AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS="false"
+AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="false"
+AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL="false"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  [[ ! -f "$tmp/systemctl.log" ]] ||
+    fail "gateway restart was attempted while PM2 daemon was inside gateway cgroup"
+  "$JQ_BIN" -e '
+    .status == "FAILED"
+    and any(.incidentCodes[]; . == "pm2_daemon_in_gateway_cgroup")
+    and any(.errors[]; contains("Refusing to restart openclaw-gateway.service"))
+    and any(.remediations[]; .code == "gateway_restart" and .result == "blocked_pm2_cgroup")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "PM2 cgroup restart guard was not reported"
+
+  pass "gateway restart is blocked when PM2 daemon is inside gateway cgroup"
+}
+
 smoke_accepts_configured_security_warnings() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/security-accepted-warnings.XXXXXX")"
@@ -1843,6 +1931,7 @@ main() {
   smoke_self_update_applies_valid_upstream
   smoke_removes_openclaw_related_pm2_apps
   smoke_dry_run_reports_openclaw_pm2_daemon_cleanup
+  smoke_blocks_gateway_restart_when_pm2_daemon_is_in_gateway_cgroup
   smoke_accepts_configured_security_warnings
 }
 

@@ -156,6 +156,7 @@ bootstrap_path() {
 bootstrap_path
 
 OPENCLAW_BIN="${OPENCLAW_BIN:-openclaw}"
+SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 OPENCLAW_PROFILE="${OPENCLAW_PROFILE:-}"
 OPENCLAW_STATE_HOME="${OPENCLAW_STATE_HOME:-$HOME/.openclaw}"
 REPORT_CHANNEL="${REPORT_CHANNEL:-telegram}"
@@ -214,6 +215,7 @@ PM2_GATEWAY_APP_NAMES="${PM2_GATEWAY_APP_NAMES:-${PM2_GATEWAY_APP_NAME:-openclaw
 PM2_OPENCLAW_MATCH_TEXT="${PM2_OPENCLAW_MATCH_TEXT:-openclaw}"
 AUTO_CLEAN_OPENCLAW_PM2_DAEMONS="${AUTO_CLEAN_OPENCLAW_PM2_DAEMONS:-true}"
 PM2_OPENCLAW_DAEMON_PATTERNS="${PM2_OPENCLAW_DAEMON_PATTERNS:-openclaw openclawnurse doctor-defaults pending-report report-none missing-token sanity-status telegram-implicit telegram-commands config-version-drift model-config-drift json-preamble update-retry install-drift local-shim-drift commitments. security.}"
+PROCFS_DIR="${PROCFS_DIR:-/proc}"
 MAX_GATEWAY_RESTARTS_PER_DAY="${MAX_GATEWAY_RESTARTS_PER_DAY:-1}"
 MAX_GATEWAY_RESTARTS_PER_WINDOW="${MAX_GATEWAY_RESTARTS_PER_WINDOW:-3}"
 GATEWAY_RESTART_WINDOW_SECONDS="${GATEWAY_RESTART_WINDOW_SECONDS:-300}"
@@ -1417,8 +1419,8 @@ collect_protected_openclaw_paths() {
     append_unique_array protected_ref "$root"
   fi
 
-  if [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] && command_exists systemctl; then
-    unit_text="$(systemctl --user cat "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
+  if [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] && command_exists "$SYSTEMCTL_BIN"; then
+    unit_text="$("$SYSTEMCTL_BIN" --user cat "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
     exec_start="$(printf '%s\n' "$unit_text" | sed -n 's/^ExecStart=//p' | head -n 1)"
     if [[ -n "$exec_start" ]]; then
       entrypoint="$(printf '%s\n' "$exec_start" | awk '{for (i=1; i<=NF; i++) if (index($i, "openclaw/dist/") > 0) {print $i; exit}}')"
@@ -2068,9 +2070,9 @@ run_runtime_sanity() {
     append_array ACTIONS "Converge OpenClaw binaries to a single version in PATH and service definitions."
   fi
 
-  if [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] && command_exists systemctl; then
+  if [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] && command_exists "$SYSTEMCTL_BIN"; then
     local unit_text
-    unit_text="$(systemctl --user cat "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
+    unit_text="$("$SYSTEMCTL_BIN" --user cat "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
     GATEWAY_EXECSTART="$(printf '%s\n' "$unit_text" | sed -n 's/^ExecStart=//p' | head -n 1)"
     GATEWAY_SERVICE_VERSION="$(printf '%s\n' "$unit_text" | sed -nE 's/^Description=.*\(v([^)]*)\).*/\1/p' | head -n 1)"
     GATEWAY_PACKAGE_VERSION="$(printf '%s\n' "$GATEWAY_EXECSTART" | sed -nE 's/.*openclaw@([0-9]{4}\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?).*/\1/p' | head -n 1)"
@@ -3158,8 +3160,8 @@ install_self_update_runtime_files() {
   install -m 0755 "$repo/scripts/openclawnurse-openclaw-alert.sh" "$DATA_DIR/bin/openclawnurse-openclaw-alert.sh"
   install -m 0644 "$repo/systemd/openclawnurse.service" "$DATA_DIR/systemd/openclawnurse.service.template"
   install -m 0644 "$repo/systemd/openclawnurse.timer" "$DATA_DIR/systemd/openclawnurse.timer.template"
-  if command_exists systemctl; then
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  if command_exists "$SYSTEMCTL_BIN"; then
+    "$SYSTEMCTL_BIN" --user daemon-reload >/dev/null 2>&1 || true
   fi
 }
 
@@ -3535,14 +3537,14 @@ maybe_cleanup_openclaw_pm2_daemons() {
 ensure_systemd_gateway_enabled() {
   local output status
 
-  run_capture output status "Enabling systemd user gateway service" systemctl --user enable "$SYSTEMD_UNIT_NAME"
+  run_capture output status "Enabling systemd user gateway service" "$SYSTEMCTL_BIN" --user enable "$SYSTEMD_UNIT_NAME"
   if [[ "$status" -ne 0 ]]; then
     RESTART_ERROR="$output"
     append_array ERRORS "Could not enable systemd user gateway service."
     return 1
   fi
 
-  run_capture output status "Starting systemd user gateway service" systemctl --user start "$SYSTEMD_UNIT_NAME"
+  run_capture output status "Starting systemd user gateway service" "$SYSTEMCTL_BIN" --user start "$SYSTEMD_UNIT_NAME"
   if [[ "$status" -ne 0 ]]; then
     RESTART_ERROR="$output"
     append_array ERRORS "Could not start systemd user gateway service."
@@ -3779,14 +3781,14 @@ refresh_stale_gateway_service() {
   [[ "$AUTO_REFRESH_STALE_GATEWAY_SERVICE" == "true" ]] || return 0
   [[ "$DRY_RUN" -eq 0 ]] || return 0
   [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] || return 0
-  command_exists systemctl || return 0
+  command_exists "$SYSTEMCTL_BIN" || return 0
 
   local active_version="$CURRENT_VERSION_AFTER"
   [[ -n "$active_version" ]] || active_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
   [[ -n "$active_version" ]] || return 0
 
   local unit_text service_version output status
-  unit_text="$(systemctl --user cat "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
+  unit_text="$("$SYSTEMCTL_BIN" --user cat "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
   service_version="$(printf '%s\n' "$unit_text" | sed -nE 's/^Description=.*\(v([^)]*)\).*/\1/p' | head -n 1)"
 
   [[ -n "$service_version" && "$service_version" != "$active_version" ]] || return 0
@@ -3798,7 +3800,7 @@ refresh_stale_gateway_service() {
 
   if [[ "$status" -eq 0 ]]; then
     append_array FIXES "Refreshed gateway systemd service metadata from version $service_version to $active_version."
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    "$SYSTEMCTL_BIN" --user daemon-reload >/dev/null 2>&1 || true
     return 0
   fi
 
@@ -3915,7 +3917,7 @@ remediate_expected_openclaw_model_config() {
 refresh_gateway_service_after_update() {
   [[ "$AUTO_REFRESH_GATEWAY_SERVICE_AFTER_UPDATE" == "true" ]] || return 0
   [[ "$RESTART_MODE" == "systemd_user" ]] || return 0
-  command_exists systemctl || return 0
+  command_exists "$SYSTEMCTL_BIN" || return 0
 
   local port
   port="$(jq -r '.gateway.port // empty' "$OPENCLAW_CONFIG_FILE" 2>/dev/null)"
@@ -3956,7 +3958,10 @@ restart_gateway() {
 
   local output status
   if [[ "$RESTART_MODE" == "systemd_user" ]]; then
-    run_capture output status "Restarting gateway service" systemctl --user restart "$SYSTEMD_UNIT_NAME"
+    if ! guard_pm2_daemon_outside_gateway_cgroup; then
+      return 1
+    fi
+    run_capture output status "Restarting gateway service" "$SYSTEMCTL_BIN" --user restart "$SYSTEMD_UNIT_NAME"
   elif [[ "$RESTART_MODE" == "custom" && -n "$RESTART_COMMAND" ]]; then
     run_capture output status "Restarting gateway with custom command" bash -lc "$RESTART_COMMAND"
   else
@@ -3974,6 +3979,64 @@ restart_gateway() {
   RESTART_ERROR="$output"
   append_array ERRORS "Gateway restart failed."
   append_array ACTIONS "Check the gateway service status before the next run."
+  return 1
+}
+
+systemd_user_unit_cgroup() {
+  command_exists "$SYSTEMCTL_BIN" || return 1
+  "$SYSTEMCTL_BIN" --user show "$SYSTEMD_UNIT_NAME" -p ControlGroup --value 2>/dev/null
+}
+
+pid_cgroup_path() {
+  local pid="$1"
+  local file="$PROCFS_DIR/$pid/cgroup"
+  [[ -r "$file" ]] || return 1
+  awk -F: 'NF >= 3 { print $3; exit }' "$file"
+}
+
+pm2_daemon_pids() {
+  local pm2_home="${PM2_HOME:-$HOME/.pm2}"
+  local pid_file="$pm2_home/pm2.pid"
+  local pid
+
+  if [[ -r "$pid_file" ]]; then
+    pid="$(tr -cd '0-9' <"$pid_file" 2>/dev/null || true)"
+    if [[ -n "$pid" ]]; then
+      printf '%s\n' "$pid"
+    fi
+  fi
+
+  if command_exists ps; then
+    ps -eo pid=,args= 2>/dev/null |
+      awk '/PM2 v/ && /God Daemon/ { print $1 }'
+  fi
+}
+
+guard_pm2_daemon_outside_gateway_cgroup() {
+  local unit_cgroup
+  unit_cgroup="$(systemd_user_unit_cgroup || true)"
+  [[ -n "$unit_cgroup" ]] || return 0
+
+  local pid pid_cgroup
+  local -a trapped_pids=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    pid_cgroup="$(pid_cgroup_path "$pid" || true)"
+    [[ -n "$pid_cgroup" ]] || continue
+    if [[ "$pid_cgroup" == "$unit_cgroup" || "$pid_cgroup" == "$unit_cgroup/"* ]]; then
+      trapped_pids+=("$pid")
+    fi
+  done < <(pm2_daemon_pids | sort -u)
+
+  if ((${#trapped_pids[@]} == 0)); then
+    return 0
+  fi
+
+  RESTART_ERROR="Refusing to restart $SYSTEMD_UNIT_NAME because PM2 daemon pid(s) ${trapped_pids[*]} are inside its systemd cgroup; restarting the gateway would stop PM2-managed apps."
+  add_incident_code "pm2_daemon_in_gateway_cgroup"
+  append_array ERRORS "$RESTART_ERROR"
+  append_array ACTIONS "Move the PM2 daemon out of $SYSTEMD_UNIT_NAME before restarting the gateway; verify with: cat /proc/\$(cat ~/.pm2/pm2.pid)/cgroup"
+  record_remediation "gateway_restart" "blocked_pm2_cgroup" "pm2 pid(s) ${trapped_pids[*]} are under $unit_cgroup"
   return 1
 }
 
