@@ -3289,6 +3289,12 @@ maybe_self_update() {
     record_remediation "openclawnurse_self_update" "not_needed" "$current"
     return 0
   fi
+
+  if git -C "$repo" merge-base --is-ancestor "$target" "$current"; then
+    SELF_UPDATE_SUMMARY="local checkout is ahead of upstream"
+    record_remediation "openclawnurse_self_update" "not_needed_local_ahead" "${current:0:12} ahead of ${target:0:12}"
+    return 0
+  fi
   SELF_UPDATE_AVAILABLE=1
 
   if ! output="$(validate_self_update_candidate "$repo" "$target" 2>&1)"; then

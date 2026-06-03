@@ -1581,6 +1581,80 @@ EOF
   pass "self-update applies valid upstream and installs refreshed runtime"
 }
 
+smoke_self_update_skips_when_local_is_ahead() {
+  local tmp remote repo local_head remote_head
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/self-update-local-ahead.XXXXXX")"
+  remote="$tmp/remote.git"
+  repo="$tmp/repo"
+
+  mkdir -p "$tmp/bin" "$tmp/home" "$tmp/state" "$tmp/data" "$tmp/cfg"
+  make_fake_openclaw "$tmp/bin/openclaw"
+
+  git -c init.defaultBranch=main init --bare "$remote" >/dev/null
+  git -c init.defaultBranch=main init "$repo" >/dev/null
+  write_minimal_self_update_tree "$repo" "self-update-base"
+  git_commit_all "$repo" "initial"
+  git -C "$repo" branch -M main
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -u origin main >/dev/null 2>&1
+  remote_head="$(git -C "$repo" rev-parse HEAD)"
+
+  write_minimal_self_update_tree "$repo" "self-update-local"
+  git_commit_all "$repo" "local update"
+  local_head="$(git -C "$repo" rev-parse HEAD)"
+
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+EXTRA_PATH="$tmp/bin"
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+DATA_DIR="$tmp/data"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+AUTO_SELF_UPDATE="true"
+SELF_UPDATE_REPO_DIR="$repo"
+SELF_UPDATE_REMOTE="origin"
+SELF_UPDATE_BRANCH="main"
+SELF_UPDATE_POLICY="reset-to-remote"
+SELF_UPDATE_RUN_TESTS="false"
+SELF_UPDATE_ROLLBACK_ON_FAILURE="true"
+SELF_UPDATE_RESTART_GATEWAY="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="false"
+AUTO_REFRESH_STALE_GATEWAY_SERVICE="false"
+AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS="false"
+AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="false"
+AUTO_RESTART_UNHEALTHY_GATEWAY="false"
+AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  [[ "$(git -C "$repo" rev-parse HEAD)" == "$local_head" ]] ||
+    fail "self-update reset a local checkout that was ahead of upstream"
+  "$JQ_BIN" -e --arg current "$local_head" --arg target "$remote_head" '
+    .status == "OK"
+    and .selfUpdate.attempted == true
+    and .selfUpdate.available == false
+    and .selfUpdate.applied == false
+    and .selfUpdate.from == $current
+    and .selfUpdate.to == $target
+    and .selfUpdate.summary == "local checkout is ahead of upstream"
+    and any(.remediations[]; .code == "openclawnurse_self_update" and .result == "not_needed_local_ahead")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "local-ahead self-update state was not persisted as not needed"
+
+  pass "self-update skips when local checkout is ahead of upstream"
+}
+
 smoke_removes_openclaw_related_pm2_apps() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/pm2-openclaw-apps.XXXXXX")"
@@ -1929,6 +2003,7 @@ main() {
   smoke_default_deduplicates_local_openclaw_shim
   smoke_missing_local_openclaw_bin_is_remediated
   smoke_self_update_applies_valid_upstream
+  smoke_self_update_skips_when_local_is_ahead
   smoke_removes_openclaw_related_pm2_apps
   smoke_dry_run_reports_openclaw_pm2_daemon_cleanup
   smoke_blocks_gateway_restart_when_pm2_daemon_is_in_gateway_cgroup
