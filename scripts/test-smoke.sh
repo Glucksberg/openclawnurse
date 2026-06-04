@@ -1281,6 +1281,247 @@ EOF
   pass "successful update retry is not reported as failed"
 }
 
+smoke_gateway_env_file_feeds_openclaw_commands() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/gateway-env.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw"
+  printf '2026.1.0\n' >"$tmp/version"
+  cat >"$tmp/bin/openclaw" <<EOF
+#!/usr/bin/env bash
+
+if [[ "\${1:-}" == "--version" ]]; then
+  printf 'OpenClaw %s\n' "\$(cat "$tmp/version")"
+  exit 0
+fi
+
+case "\${1:-}" in
+  update)
+    case "\${2:-}" in
+      status)
+        printf '{"availability":{"available":true,"latestVersion":"2026.1.1"},"channel":{"value":"stable"}}\n'
+        ;;
+      *)
+        printf '2026.1.1\n' >"$tmp/version"
+        printf '{"ok":true}\n'
+        ;;
+    esac
+    ;;
+  gateway)
+    if [[ "\${2:-}" == "install" ]]; then
+      if [[ "\${OPENCLAW_GATEWAY_TOKEN:-}" == "gateway-from-env" && "\${OPENAI_API_KEY:-}" == "openai-from-env" ]]; then
+        printf 'saw-env\n' >"$tmp/gateway-install-env"
+        printf '{"ok":true}\n'
+      else
+        printf 'missing gateway env\n' >&2
+        exit 1
+      fi
+    fi
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  status)
+    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/bin/systemctl" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--user" && "\${2:-}" == "restart" ]]; then
+  printf restarted >"$tmp/restarted"
+fi
+exit 0
+EOF
+  chmod +x "$tmp/bin/systemctl"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"gateway":{"port":18789}}
+EOF
+  cat >"$tmp/home/.openclaw/gateway.systemd.env" <<EOF
+OPENCLAW_GATEWAY_TOKEN=gateway-from-env
+OPENAI_API_KEY=openai-from-env
+EVIL_COMMAND="\$(printf executed >"$tmp/env-executed")"
+PATH=/should-not-be-imported
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+SYSTEMCTL_BIN="$tmp/bin/systemctl"
+OPENCLAW_GATEWAY_ENV_FILE="$tmp/home/.openclaw/gateway.systemd.env"
+OPENCLAW_CONFIG_FILE="$tmp/home/.openclaw/openclaw.json"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="true"
+AUTO_ALIGN_OPENCLAW_USER_PLUGINS="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="systemd_user"
+SYSTEMD_UNIT_NAME="openclaw-gateway.service"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  [[ "$(cat "$tmp/gateway-install-env" 2>/dev/null)" == "saw-env" ]] ||
+    fail "gateway install did not receive values from OPENCLAW_GATEWAY_ENV_FILE"
+  [[ ! -f "$tmp/env-executed" ]] ||
+    fail "gateway env file executed shell code"
+  "$JQ_BIN" -e '
+    .status == "UPDATED"
+    and .updateSucceeded == true
+    and .restartAttempted == true
+    and any(.remediations[]; .code == "gateway_service_refresh" and .result == "applied")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "gateway env file refresh path was not recorded as applied"
+
+  pass "gateway env file feeds OpenClaw maintenance commands"
+}
+
+smoke_gateway_refresh_failure_skips_restart() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/gateway-refresh-fail.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw"
+  printf '2026.1.0\n' >"$tmp/version"
+  cat >"$tmp/bin/openclaw" <<EOF
+#!/usr/bin/env bash
+
+if [[ "\${1:-}" == "--version" ]]; then
+  printf 'OpenClaw %s\n' "\$(cat "$tmp/version")"
+  exit 0
+fi
+
+case "\${1:-}" in
+  update)
+    case "\${2:-}" in
+      status)
+        printf '{"availability":{"available":true,"latestVersion":"2026.1.1"},"channel":{"value":"stable"}}\n'
+        ;;
+      *)
+        printf '2026.1.1\n' >"$tmp/version"
+        printf '{"ok":true}\n'
+        ;;
+    esac
+    ;;
+  gateway)
+    if [[ "\${2:-}" == "install" ]]; then
+      printf '{"ok":false,"error":"Gateway install blocked: gateway.auth.token SecretRef is configured but unresolved"}\n' >&2
+      exit 1
+    fi
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  status)
+    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/bin/systemctl" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--user" && "\${2:-}" == "restart" ]]; then
+  printf restarted >"$tmp/restarted"
+fi
+exit 0
+EOF
+  chmod +x "$tmp/bin/systemctl"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"gateway":{"port":18789}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+SYSTEMCTL_BIN="$tmp/bin/systemctl"
+OPENCLAW_CONFIG_FILE="$tmp/home/.openclaw/openclaw.json"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="true"
+AUTO_ALIGN_OPENCLAW_USER_PLUGINS="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="systemd_user"
+SYSTEMD_UNIT_NAME="openclaw-gateway.service"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  [[ ! -f "$tmp/restarted" ]] ||
+    fail "gateway was restarted after service refresh failed"
+  "$JQ_BIN" -e '
+    .status == "FAILED"
+    and .updateSucceeded == true
+    and .restartAttempted == false
+    and .gatewayHealthy == true
+    and any(.errors[]; contains("Failed to refresh OpenClaw gateway service install after update"))
+    and any(.fixes[]; contains("Skipped gateway restart because the service refresh failed"))
+    and any(.actions[]; contains("Automatic gateway restart was skipped"))
+    and any(.remediations[]; .code == "gateway_service_refresh" and .result == "apply_failed")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "gateway refresh failure did not skip restart cleanly"
+
+  pass "gateway refresh failure skips automatic restart"
+}
+
+smoke_gateway_log_scan_reports_oom() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/gateway-oom.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/bin/journalctl" <<'EOF'
+#!/usr/bin/env bash
+cat <<'LOGS'
+Jun 04 16:52:14 host node[1]: [diagnostic] liveness warning: reasons=event_loop_delay,event_loop_utilization eventLoopDelayP99Ms=39896.2
+Jun 04 17:16:38 host systemd[1]: openclaw-gateway.service: A process of this unit has been killed by the OOM killer.
+Jun 04 17:16:51 host systemd[1]: openclaw-gateway.service: Failed with result 'oom-kill'.
+LOGS
+EOF
+  chmod +x "$tmp/bin/journalctl"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+EXTRA_PATH="$tmp/bin"
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="true"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+RESTART_COMMAND="true"
+GATEWAY_LOG_SINCE="1 hour ago"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  "$JQ_BIN" -e '
+    .status == "FAILED"
+    and .sanity.critical == true
+    and .sanity.gatewayOomKillCount == 1
+    and .sanity.gatewayEventLoopWarningCount == 1
+    and any(.incidentCodes[]; . == "gateway_oom_kill")
+    and any(.incidentCodes[]; . == "gateway_event_loop_pressure")
+    and any(.errors[]; contains("Gateway logs show an OOM kill"))
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "gateway OOM log scan was not reported as critical"
+
+  pass "gateway log scan reports OOM and event-loop pressure"
+}
+
 smoke_remediates_openclaw_installation_drift() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/install-drift.XXXXXX")"
@@ -2196,6 +2437,9 @@ main() {
   smoke_model_config_drift_after_doctor_is_remediated
   smoke_json_preamble_is_accepted
   smoke_update_retry_success_is_not_failed
+  smoke_gateway_env_file_feeds_openclaw_commands
+  smoke_gateway_refresh_failure_skips_restart
+  smoke_gateway_log_scan_reports_oom
   smoke_remediates_openclaw_installation_drift
   smoke_default_deduplicates_local_openclaw_shim
   smoke_missing_local_openclaw_bin_is_remediated

@@ -242,6 +242,7 @@ GATEWAY_RESTART_WINDOW_SECONDS="${GATEWAY_RESTART_WINDOW_SECONDS:-300}"
 MAX_DOCTOR_REMEDIATION_PASSES="${MAX_DOCTOR_REMEDIATION_PASSES:-3}"
 MAX_ORPHAN_TRANSCRIPTS_PER_RUN="${MAX_ORPHAN_TRANSCRIPTS_PER_RUN:-20}"
 OPENCLAW_CONFIG_FILE="${OPENCLAW_CONFIG_FILE:-$OPENCLAW_STATE_HOME/openclaw.json}"
+OPENCLAW_GATEWAY_ENV_FILE="${OPENCLAW_GATEWAY_ENV_FILE:-$OPENCLAW_STATE_HOME/gateway.systemd.env}"
 CONFIG_BACKUP_ENABLED="${CONFIG_BACKUP_ENABLED:-true}"
 CONFIG_BACKUP_DIR="${CONFIG_BACKUP_DIR:-$STATE_DIR/config-backups/openclaw}"
 CONFIG_BACKUP_RETENTION="${CONFIG_BACKUP_RETENTION:-20}"
@@ -309,6 +310,47 @@ GATEWAY_RESTART_STATE_FILE="${GATEWAY_RESTART_STATE_FILE:-$STATE_DIR/gateway-res
 PENDING_TEXT_FILE="${PENDING_TEXT_FILE:-$STATE_DIR/pending-report.txt}"
 PENDING_JSON_FILE="${PENDING_JSON_FILE:-$STATE_DIR/pending-report.json}"
 
+load_openclaw_gateway_env_file() {
+  [[ -n "$OPENCLAW_GATEWAY_ENV_FILE" && -f "$OPENCLAW_GATEWAY_ENV_FILE" ]] || return 0
+
+  local had_telegram=0 telegram_value=""
+  if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+    had_telegram=1
+    telegram_value="$TELEGRAM_BOT_TOKEN"
+  fi
+
+  local line key value first last
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*($|#) ]] && continue
+    [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]] || continue
+
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if (( ${#value} >= 2 )); then
+      first="${value:0:1}"
+      last="${value: -1}"
+      if [[ "$first" == "$last" && ( "$first" == "'" || "$first" == '"' ) ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+
+    case "$key" in
+      OPENAI_API_KEY|OPENCLAW_GATEWAY_TOKEN|NODE_COMPILE_CACHE|OPENCLAW_NO_RESPAWN|TELEGRAM_BOT_TOKEN)
+        printf -v "$key" '%s' "$value"
+        export "$key"
+        ;;
+    esac
+  done <"$OPENCLAW_GATEWAY_ENV_FILE"
+
+  if [[ "$had_telegram" -eq 1 ]]; then
+    TELEGRAM_BOT_TOKEN="$telegram_value"
+    export TELEGRAM_BOT_TOKEN
+  fi
+}
+
 prepare_openclaw_env() {
   if [[ -n "$NODE_COMPILE_CACHE" ]]; then
     mkdir -p "$NODE_COMPILE_CACHE" >/dev/null 2>&1 || true
@@ -320,6 +362,7 @@ prepare_openclaw_env() {
   fi
 }
 
+load_openclaw_gateway_env_file
 prepare_openclaw_env
 
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$STATE_DIR" "$LOG_DIR"
@@ -785,6 +828,8 @@ PROVIDER_AUTH_ERROR_COUNT=0
 STUCK_SESSION_COUNT=0
 CONFIG_INVALID_COUNT=0
 UPDATE_PROVENANCE_WARNING_COUNT=0
+GATEWAY_OOM_KILL_COUNT=0
+GATEWAY_EVENT_LOOP_WARNING_COUNT=0
 COMMITMENTS_ERROR_COUNT=0
 MODEL_ACCESS_ERROR_COUNT=0
 SECURITY_AUDIT_CRITICAL_COUNT=0
@@ -797,6 +842,8 @@ CONFIG_LAST_TOUCHED_VERSION=""
 CONFIG_VERSION_DRIFT=0
 CONFIG_VERSION_DRIFT_FINDING=""
 CONFIG_VERSION_DRIFT_ACTION=""
+GATEWAY_SERVICE_REFRESH_FAILED=0
+GATEWAY_SERVICE_REFRESH_BLOCKS_RESTART=0
 
 load_previous_state() {
   if [[ -f "$STATE_FILE" ]] && jq empty "$STATE_FILE" >/dev/null 2>&1; then
@@ -1002,6 +1049,8 @@ persist_json() {
     --argjson stuckSessionCount "$(json_int "$STUCK_SESSION_COUNT")" \
     --argjson configInvalidCount "$(json_int "$CONFIG_INVALID_COUNT")" \
     --argjson updateProvenanceWarningCount "$(json_int "$UPDATE_PROVENANCE_WARNING_COUNT")" \
+    --argjson gatewayOomKillCount "$(json_int "$GATEWAY_OOM_KILL_COUNT")" \
+    --argjson gatewayEventLoopWarningCount "$(json_int "$GATEWAY_EVENT_LOOP_WARNING_COUNT")" \
     --argjson commitmentsErrorCount "$(json_int "$COMMITMENTS_ERROR_COUNT")" \
     --argjson modelAccessErrorCount "$(json_int "$MODEL_ACCESS_ERROR_COUNT")" \
     --argjson securityAuditCriticalCount "$(json_int "$SECURITY_AUDIT_CRITICAL_COUNT")" \
@@ -1101,6 +1150,8 @@ persist_json() {
         stuckSessionCount: $stuckSessionCount,
         configInvalidCount: $configInvalidCount,
         updateProvenanceWarningCount: $updateProvenanceWarningCount,
+        gatewayOomKillCount: $gatewayOomKillCount,
+        gatewayEventLoopWarningCount: $gatewayEventLoopWarningCount,
         commitmentsErrorCount: $commitmentsErrorCount,
         modelAccessErrorCount: $modelAccessErrorCount,
         securityAuditCriticalCount: $securityAuditCriticalCount,
@@ -2258,8 +2309,17 @@ run_gateway_log_scan() {
   STUCK_SESSION_COUNT="$(count_fixed_lines "$logs" '[diagnostic] stuck session')"
   CONFIG_INVALID_COUNT="$(count_regex_lines "$logs" 'Config invalid|Invalid config')"
   UPDATE_PROVENANCE_WARNING_COUNT="$(count_regex_lines "$logs" 'not-git-install|Gateway restart update skipped|unknown update provenance')"
+  local oom_result_count oom_killer_count
+  oom_result_count="$(count_regex_lines "$logs" 'Failed with result .oom-kill|result=.oom-kill')"
+  oom_killer_count="$(count_fixed_lines "$logs" 'killed by the OOM killer')"
+  if (( oom_result_count > 0 )); then
+    GATEWAY_OOM_KILL_COUNT="$oom_result_count"
+  else
+    GATEWAY_OOM_KILL_COUNT="$oom_killer_count"
+  fi
+  GATEWAY_EVENT_LOOP_WARNING_COUNT="$(count_regex_lines "$logs" 'liveness warning: reasons=.*event_loop|eventLoopDelay|event_loop_delay|event_loop_utilization')"
   GATEWAY_MODEL_DETECTED="$(printf '%s\n' "$logs" | grep -Eo 'agent model: [^[:space:]]+' | sed 's/^agent model: //' | tail -n 1)"
-  GATEWAY_LOG_SUMMARY="since=$since; emptyInput=$PROVIDER_EMPTY_INPUT_COUNT; providerAuth=$PROVIDER_AUTH_ERROR_COUNT; stuckSessions=$STUCK_SESSION_COUNT; configInvalid=$CONFIG_INVALID_COUNT; updateProvenanceWarnings=$UPDATE_PROVENANCE_WARNING_COUNT"
+  GATEWAY_LOG_SUMMARY="since=$since; emptyInput=$PROVIDER_EMPTY_INPUT_COUNT; providerAuth=$PROVIDER_AUTH_ERROR_COUNT; stuckSessions=$STUCK_SESSION_COUNT; configInvalid=$CONFIG_INVALID_COUNT; updateProvenanceWarnings=$UPDATE_PROVENANCE_WARNING_COUNT; oomKills=$GATEWAY_OOM_KILL_COUNT; eventLoopWarnings=$GATEWAY_EVENT_LOOP_WARNING_COUNT"
 
   if (( PROVIDER_EMPTY_INPUT_COUNT > 0 )); then
     append_sanity_finding "Gateway logs contain $PROVIDER_EMPTY_INPUT_COUNT provider empty-input error(s) since $since."
@@ -2298,6 +2358,19 @@ run_gateway_log_scan() {
   if (( UPDATE_PROVENANCE_WARNING_COUNT > 0 )); then
     append_sanity_finding "Gateway logs contain $UPDATE_PROVENANCE_WARNING_COUNT update provenance warning(s) since $since."
     append_array ACTIONS "Review OpenClaw install provenance if updates or gateway restarts are skipped."
+  fi
+
+  if (( GATEWAY_OOM_KILL_COUNT > 0 )); then
+    add_incident_code "gateway_oom_kill"
+    append_sanity_critical "Gateway was OOM-killed $GATEWAY_OOM_KILL_COUNT time(s) since $since."
+    append_array ERRORS "Gateway logs show an OOM kill."
+    append_array ACTIONS "Review gateway memory pressure, stuck sessions and Codex sidecar memory; consider a systemd MemoryHigh/MemoryMax guard after approval."
+  fi
+
+  if (( GATEWAY_EVENT_LOOP_WARNING_COUNT > 0 )); then
+    add_incident_code "gateway_event_loop_pressure"
+    append_sanity_finding "Gateway logs contain $GATEWAY_EVENT_LOOP_WARNING_COUNT event-loop pressure warning(s) since $since."
+    append_array ACTIONS "Inspect active sessions and long-running plugin hooks if event-loop warnings continue."
   fi
 
   resolve_expected_model_from_config
@@ -4058,13 +4131,18 @@ refresh_stale_gateway_service() {
   run_capture output status "Refreshing stale gateway service metadata" "${cmd[@]}"
 
   if [[ "$status" -eq 0 ]]; then
+    GATEWAY_SERVICE_REFRESH_FAILED=0
+    GATEWAY_SERVICE_REFRESH_BLOCKS_RESTART=0
     append_array FIXES "Refreshed gateway systemd service metadata from version $service_version to $active_version."
     "$SYSTEMCTL_BIN" --user daemon-reload >/dev/null 2>&1 || true
     return 0
   fi
 
+  GATEWAY_SERVICE_REFRESH_FAILED=1
+  GATEWAY_SERVICE_REFRESH_BLOCKS_RESTART=1
   append_array ERRORS "Could not refresh stale gateway service metadata."
   append_array ACTIONS "Run openclaw gateway install --force and restart $SYSTEMD_UNIT_NAME."
+  append_array ACTIONS "Automatic gateway restart was skipped because the service refresh failed; keeping the current gateway process avoids relaunching stale metadata."
   return 1
 }
 
@@ -4196,14 +4274,19 @@ refresh_gateway_service_after_update() {
   run_capture output status "Refreshing gateway service install" "${cmd[@]}"
 
   if [[ "$status" -eq 0 ]]; then
+    GATEWAY_SERVICE_REFRESH_FAILED=0
+    GATEWAY_SERVICE_REFRESH_BLOCKS_RESTART=0
     REMEDIATION_APPLIED=1
     append_array FIXES "Refreshed OpenClaw gateway service install after update."
     record_remediation "gateway_service_refresh" "applied" "ran gateway install --force on port $port"
     return 0
   fi
 
+  GATEWAY_SERVICE_REFRESH_FAILED=1
+  GATEWAY_SERVICE_REFRESH_BLOCKS_RESTART=1
   append_array ERRORS "Failed to refresh OpenClaw gateway service install after update."
   append_array ACTIONS "Run openclaw gateway install --force --port $port manually and restart $SYSTEMD_UNIT_NAME."
+  append_array ACTIONS "Automatic gateway restart was skipped because gateway service install failed after update."
   record_remediation "gateway_service_refresh" "apply_failed" "$output"
   return 1
 }
@@ -4842,7 +4925,10 @@ main() {
     DOCTOR_SUMMARY="skipped in light profile"
   fi
 
-  if [[ "$UPDATE_SUCCEEDED" -eq 1 || "$CONFIG_RESTORED" -eq 1 || "$MODEL_CONFIG_REMEDIATED" -eq 1 || "$OPENCLAW_USER_PLUGIN_ALIGN_SUCCEEDED" -eq 1 ]]; then
+  if [[ "$GATEWAY_SERVICE_REFRESH_BLOCKS_RESTART" -eq 1 ]]; then
+    append_array FIXES "Skipped gateway restart because the service refresh failed; the existing gateway process was left running."
+    check_gateway_health_once || true
+  elif [[ "$UPDATE_SUCCEEDED" -eq 1 || "$CONFIG_RESTORED" -eq 1 || "$MODEL_CONFIG_REMEDIATED" -eq 1 || "$OPENCLAW_USER_PLUGIN_ALIGN_SUCCEEDED" -eq 1 ]]; then
     if restart_gateway; then
       record_gateway_restart
       wait_for_gateway_health || true
