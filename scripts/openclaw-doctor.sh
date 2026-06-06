@@ -692,7 +692,7 @@ detect_telegram_bot_token() {
   [[ -f "$cfg_file" ]] || return 0
 
   local detected
-  detected="$(jq -r '.channels.telegram.botToken // empty' "$cfg_file" 2>/dev/null || true)"
+  detected="$(jq -r '(.channels.telegram.botToken // empty) | strings' "$cfg_file" 2>/dev/null || true)"
   if [[ -n "$detected" && "$detected" != "null" ]]; then
     TELEGRAM_BOT_TOKEN="$detected"
     log INFO "Auto-detected TELEGRAM_BOT_TOKEN from $cfg_file"
@@ -2228,7 +2228,10 @@ run_telegram_sanity() {
   [[ -f "$cfg_file" ]] || return 0
   local telegram_enabled token
   telegram_enabled="$(jq -r '.channels.telegram.enabled // empty' "$cfg_file" 2>/dev/null)"
-  token="$(jq -r '.channels.telegram.botToken // empty' "$cfg_file" 2>/dev/null)"
+  token="$(jq -r '(.channels.telegram.botToken // empty) | strings' "$cfg_file" 2>/dev/null)"
+  if [[ -z "$token" && -n "$TELEGRAM_BOT_TOKEN" ]]; then
+    token="$TELEGRAM_BOT_TOKEN"
+  fi
   [[ "$telegram_enabled" != "false" || -n "$token" ]] || return 0
 
   if ! command_exists curl; then
