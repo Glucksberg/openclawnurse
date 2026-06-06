@@ -87,7 +87,7 @@ Common settings:
 - `ENABLE_COMMITMENTS_SANITY`: checks enabled commitments and recent extractor traces for model/provider errors.
 - `ENABLE_SECURITY_AUDIT`: runs `openclaw security audit --json` and promotes critical findings to failed status.
 - `ENABLE_PACKAGE_DRIFT_SANITY`: detects local package hotfix markers that could be overwritten by future updates.
-- `EXTRA_PATH`: extra executable paths for environments such as Linuxbrew or custom package managers.
+- `EXTRA_PATH`: extra executable paths for environments such as Linuxbrew or custom package managers. Standard pnpm and nvm Node installs are auto-detected.
 
 See `config/openclaw-doctor.env.example` for the complete set of runtime options.
 

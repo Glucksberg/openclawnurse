@@ -2221,7 +2221,12 @@ smoke_fork_manager_update_mode_deploys_revision() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/fork-manager-mode.XXXXXX")"
 
-  mkdir -p "$tmp/repo" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw/npm/node_modules/@openclaw/codex"
+  mkdir -p "$tmp/repo" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw/npm/node_modules/@openclaw/codex" "$tmp/home/.nvm/versions/node/v22.0.0/bin"
+  cat >"$tmp/home/.nvm/versions/node/v22.0.0/bin/pnpm" <<EOF
+#!/usr/bin/env bash
+printf 'fake pnpm %s\n' "\$*" >>"$tmp/pnpm-calls"
+EOF
+  chmod +x "$tmp/home/.nvm/versions/node/v22.0.0/bin/pnpm"
   cat >"$tmp/repo/package.json" <<'EOF'
 {"name":"openclaw","version":"2026.6.2"}
 EOF
@@ -2270,7 +2275,7 @@ EOF
 OPENCLAW_UPDATE_MODE="fork_manager"
 FORK_MANAGER_REPO_DIR="$tmp/repo"
 FORK_MANAGER_PRODUCTION_BRANCH="main-with-all-prs"
-FORK_MANAGER_BUILD_COMMAND=""
+FORK_MANAGER_BUILD_COMMAND="pnpm install --frozen-lockfile && pnpm build"
 FORK_MANAGER_GATEWAY_INSTALL_COMMAND=""
 FORK_MANAGER_DEPLOY_REVISION_FILE="$tmp/state/fork-manager-deployed.rev"
 STATE_DIR="$tmp/state"
@@ -2284,7 +2289,7 @@ RESTART_MODE="custom"
 RESTART_COMMAND="true"
 EOF
 
-  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+  PATH="/usr/local/bin:/usr/bin:/bin" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
 
   "$JQ_BIN" -e --arg revision "$revision" '
     .status == "UPDATED"
@@ -2300,6 +2305,11 @@ EOF
     and any(.remediations[]; .code == "openclaw_fork_manager_update" and .result == "applied")
   ' "$tmp/state/doctor-state.json" >/dev/null ||
     fail "fork-manager update mode did not deploy the production revision"
+
+  grep -Fq 'install --frozen-lockfile' "$tmp/pnpm-calls" ||
+    fail "fork-manager build did not find pnpm from the nvm install"
+  grep -Fq 'build' "$tmp/pnpm-calls" ||
+    fail "fork-manager build did not run the pnpm build step"
 
   [[ "$(cat "$tmp/state/fork-manager-deployed.rev")" == "$revision" ]] ||
     fail "fork-manager deployed revision file was not written"
