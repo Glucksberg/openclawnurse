@@ -119,9 +119,35 @@ prepend_path() {
   esac
 }
 
+promote_path() {
+  local dir="$1"
+  [[ -n "$dir" && -d "$dir" ]] || return 0
+
+  local old_ifs="$IFS"
+  local path_parts=()
+  local part
+  local next_path=""
+  IFS=':'
+  read -r -a path_parts <<<"${PATH:-}"
+  IFS="$old_ifs"
+
+  for part in "${path_parts[@]}"; do
+    [[ -z "$part" || "$part" == "$dir" ]] && continue
+    if [[ -n "$next_path" ]]; then
+      next_path="$next_path:$part"
+    else
+      next_path="$part"
+    fi
+  done
+  PATH="$dir${next_path:+:$next_path}"
+}
+
 bootstrap_path() {
   local extra_dir
   local default_pnpm_home="$HOME/.local/share/pnpm"
+  local nvm_dirs=()
+  [[ -n "${NVM_DIR:-}" ]] && nvm_dirs+=("$NVM_DIR")
+  nvm_dirs+=("$HOME/.nvm")
   local candidates=(
     "$default_pnpm_home"
     "$HOME/.npm-global/bin"
@@ -132,20 +158,27 @@ bootstrap_path() {
     "/bin"
   )
 
+  local dir
+  for dir in "${candidates[@]}"; do
+    prepend_path "$dir"
+  done
+  local nvm_dir
+  for nvm_dir in "${nvm_dirs[@]}"; do
+    if [[ -d "$nvm_dir/versions/node" ]]; then
+      while IFS= read -r dir; do
+        prepend_path "$dir"
+      done < <(find "$nvm_dir/versions/node" -mindepth 2 -maxdepth 2 -type d -name bin 2>/dev/null | sort -r)
+    fi
+  done
   if [[ -n "${EXTRA_PATH:-}" ]]; then
     local old_ifs="$IFS"
     IFS=':'
     read -r -a extra_dirs <<<"${EXTRA_PATH}"
     IFS="$old_ifs"
     for extra_dir in "${extra_dirs[@]}"; do
-      prepend_path "$extra_dir"
+      promote_path "$extra_dir"
     done
   fi
-
-  local dir
-  for dir in "${candidates[@]}"; do
-    prepend_path "$dir"
-  done
   if [[ -z "${PNPM_HOME:-}" && -d "$default_pnpm_home" ]]; then
     PNPM_HOME="$default_pnpm_home"
     export PNPM_HOME
@@ -3188,9 +3221,15 @@ self_update_capture() {
 
 self_update_validation_error() {
   local detail="$1"
+  local output="${2:-}"
+  local output_detail
   SELF_UPDATE_ERROR="$detail"
   add_incident_code "self_update_failed"
   append_array ERRORS "$detail"
+  if [[ -n "$output" ]]; then
+    output_detail="$(remediation_detail_from_output "$output")"
+    [[ -n "$output_detail" ]] && append_array ERRORS "OpenClawNurse self-update validation output: $output_detail"
+  fi
 }
 
 validate_self_update_tree() {
@@ -3418,9 +3457,9 @@ maybe_self_update() {
   SELF_UPDATE_AVAILABLE=1
 
   if ! output="$(validate_self_update_candidate "$repo" "$target" 2>&1)"; then
-    self_update_validation_error "OpenClawNurse self-update target failed validation."
+    self_update_validation_error "OpenClawNurse self-update target failed validation." "$output"
     append_array ACTIONS "Review upstream OpenClawNurse tests before applying $target."
-    record_remediation "openclawnurse_self_update" "validation_failed" "${target:0:12}"
+    record_remediation "openclawnurse_self_update" "validation_failed" "${target:0:12}: $(remediation_detail_from_output "$output")"
     return 1
   fi
 
