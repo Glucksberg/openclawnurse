@@ -629,6 +629,7 @@ ENABLE_TELEGRAM_SANITY="false"
 ENABLE_GATEWAY_LOG_SCAN="false"
 ENABLE_COMMITMENTS_SANITY="false"
 ENABLE_SECURITY_AUDIT="true"
+RUN_PROFILE="heavy"
 CONFIG_BACKUP_ENABLED="false"
 EOF
 
@@ -639,6 +640,64 @@ EOF
     fail "security audit critical finding was not reported"
 
   pass "security audit critical findings are reported"
+}
+
+smoke_security_audit_json_with_stderr_preamble_is_accepted() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/security-preamble.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home"
+  cat >"$tmp/bin/openclaw" <<'EOF'
+#!/usr/bin/env bash
+
+case "${1:-}" in
+  --version)
+    printf 'OpenClaw 2026.1.0\n'
+    ;;
+  update)
+    printf '{"availability":{"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
+    ;;
+  doctor)
+    printf 'doctor complete\n'
+    ;;
+  health)
+    printf '{"ok":true}\n'
+    ;;
+  security)
+    printf '[state-migrations] Legacy state migration warnings:\n' >&2
+    printf '{"findings":[{"severity":"warn","checkId":"plugins.installs_unpinned_npm_specs","title":"unpinned"}],"summary":{"critical":0,"warn":1,"info":0}}\n'
+    ;;
+  *)
+    printf '{}\n'
+    ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="true"
+RUN_PROFILE="heavy"
+CONFIG_BACKUP_ENABLED="false"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify --dry-run >/dev/null
+
+  "$JQ_BIN" -e '
+    .status == "DEGRADED"
+    and (.incidentCodes | index("security_audit_failed") | not)
+    and any(.incidentCodes[]; . == "security_audit_warn")
+    and .sanity.securityAuditWarnCount == 1
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "security audit JSON with stderr preamble was not accepted"
+
+  pass "security audit JSON with stderr preamble is accepted"
 }
 
 smoke_telegram_commands_are_remediated() {
@@ -2443,6 +2502,7 @@ main() {
   smoke_commitments_trace_model_access_is_reported
   smoke_commitments_successful_traces_do_not_degrade
   smoke_security_audit_critical_is_reported
+  smoke_security_audit_json_with_stderr_preamble_is_accepted
   smoke_telegram_commands_are_remediated
   smoke_config_version_drift_forces_update
   smoke_config_version_drift_update_failure_is_failed

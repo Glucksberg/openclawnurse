@@ -2597,13 +2597,14 @@ run_security_audit_sanity() {
 
   fix_security_file_permissions || true
 
-  local cmd output status
+  local cmd output status audit_json
   build_openclaw_cmd cmd
   cmd+=(security audit --json)
   [[ "$SECURITY_AUDIT_DEEP" == "true" ]] && cmd+=(--deep)
 
   run_capture_allow_fail output status "Running OpenClaw security audit" timeout "${SECURITY_AUDIT_TIMEOUT}s" "${cmd[@]}"
-  if [[ "$status" -ne 0 ]] || ! printf '%s' "$output" | jq empty >/dev/null 2>&1; then
+  audit_json="$(printf '%s' "$output" | awk 'found || $0 ~ /^[[:space:]]*\{/ { found=1; print }')"
+  if [[ "$status" -ne 0 ]] || ! printf '%s' "$audit_json" | jq empty >/dev/null 2>&1; then
     add_incident_code "security_audit_failed"
     SECURITY_AUDIT_SUMMARY="failed"
     append_sanity_finding "OpenClaw security audit failed or returned invalid JSON."
@@ -2613,10 +2614,10 @@ run_security_audit_sanity() {
 
   local accepted_json accepted_warn_count top_findings
   accepted_json="$(printf '%s\n' $SECURITY_AUDIT_ACCEPTED_WARNINGS | jq -Rsc 'split("\n") | map(select(length > 0))' 2>/dev/null || printf '[]')"
-  SECURITY_AUDIT_CRITICAL_COUNT="$(printf '%s' "$output" | jq -r '[.findings[]? | select(.severity == "critical")] | length' 2>/dev/null)"
-  SECURITY_AUDIT_WARN_COUNT="$(printf '%s' "$output" | jq -r --argjson accepted "$accepted_json" '[.findings[]? | select(.severity == "warn" and ((.checkId as $id | $accepted | index($id)) | not))] | length' 2>/dev/null)"
-  accepted_warn_count="$(printf '%s' "$output" | jq -r --argjson accepted "$accepted_json" '[.findings[]? | select(.severity == "warn" and (.checkId as $id | $accepted | index($id)))] | length' 2>/dev/null)"
-  top_findings="$(printf '%s' "$output" | jq -r --argjson accepted "$accepted_json" '.findings[]? | select(.severity == "critical" or (.severity == "warn" and ((.checkId as $id | $accepted | index($id)) | not))) | "\(.severity):\(.checkId)"' 2>/dev/null | head -n 5 | paste -sd ',' -)"
+  SECURITY_AUDIT_CRITICAL_COUNT="$(printf '%s' "$audit_json" | jq -r '[.findings[]? | select(.severity == "critical")] | length' 2>/dev/null)"
+  SECURITY_AUDIT_WARN_COUNT="$(printf '%s' "$audit_json" | jq -r --argjson accepted "$accepted_json" '[.findings[]? | select(.severity == "warn" and ((.checkId as $id | $accepted | index($id)) | not))] | length' 2>/dev/null)"
+  accepted_warn_count="$(printf '%s' "$audit_json" | jq -r --argjson accepted "$accepted_json" '[.findings[]? | select(.severity == "warn" and (.checkId as $id | $accepted | index($id)))] | length' 2>/dev/null)"
+  top_findings="$(printf '%s' "$audit_json" | jq -r --argjson accepted "$accepted_json" '.findings[]? | select(.severity == "critical" or (.severity == "warn" and ((.checkId as $id | $accepted | index($id)) | not))) | "\(.severity):\(.checkId)"' 2>/dev/null | head -n 5 | paste -sd ',' -)"
   SECURITY_AUDIT_SUMMARY="critical=$SECURITY_AUDIT_CRITICAL_COUNT; warn=$SECURITY_AUDIT_WARN_COUNT; acceptedWarn=${accepted_warn_count:-0}${top_findings:+; top=$top_findings}"
 
   if (( SECURITY_AUDIT_CRITICAL_COUNT > 0 )); then
