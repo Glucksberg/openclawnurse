@@ -1050,7 +1050,7 @@ smoke_model_config_drift_after_doctor_is_remediated() {
   "agents": {
     "defaults": {
       "model": {
-        "primary": "openai/gpt-5.5",
+        "primary": "openai-codex/gpt-5.5",
         "fallbacks": [
           "claude-cli/claude-opus-4-6"
         ]
@@ -1059,8 +1059,7 @@ smoke_model_config_drift_after_doctor_is_remediated() {
         "claude-cli/claude-opus-4-6": {
           "alias": "opus"
         },
-        "openai/gpt-5.4": {},
-        "openai/gpt-5.5": {}
+        "openai-codex/gpt-5.5": {}
       },
       "agentRuntime": {
         "id": "pi"

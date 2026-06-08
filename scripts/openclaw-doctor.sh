@@ -299,6 +299,9 @@ EXPECTED_OPENCLAW_MODEL="${EXPECTED_OPENCLAW_MODEL:-}"
 EXPECTED_TELEGRAM_COMMANDS="${EXPECTED_TELEGRAM_COMMANDS:-new reset}"
 AUTO_REMEDIATE_TELEGRAM_COMMANDS="${AUTO_REMEDIATE_TELEGRAM_COMMANDS:-true}"
 AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL="${AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL:-true}"
+if [[ "$EXPECTED_OPENCLAW_MODEL" == openai-codex/* ]]; then
+  EXPECTED_OPENCLAW_MODEL="openai/${EXPECTED_OPENCLAW_MODEL#openai-codex/}"
+fi
 GATEWAY_LOG_SINCE="${GATEWAY_LOG_SINCE:-last-run}"
 GATEWAY_LOG_FALLBACK_SINCE="${GATEWAY_LOG_FALLBACK_SINCE:-24 hours ago}"
 GATEWAY_LOG_MAX_LINES="${GATEWAY_LOG_MAX_LINES:-4000}"
@@ -1782,6 +1785,9 @@ resolve_expected_model_from_config() {
 
   local current_model
   current_model="$(jq -r '.agents.defaults.model.primary // .models.default // .model // empty' "$cfg_file" 2>/dev/null)"
+  if [[ "$current_model" == openai-codex/* ]]; then
+    current_model="openai/${current_model#openai-codex/}"
+  fi
   EXPECTED_OPENCLAW_MODEL="$current_model"
 }
 

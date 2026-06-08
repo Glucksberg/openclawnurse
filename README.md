@@ -79,7 +79,7 @@ Common settings:
 - `REPORT_CHANNEL`: report channel, for example `telegram` or `none`.
 - `TELEGRAM_TARGET`: chat/group id for direct reports.
 - `TELEGRAM_BOT_TOKEN`: optional dedicated token. If empty, the Nurse can reuse the OpenClaw Telegram token from `~/.openclaw/openclaw.json`.
-- `EXPECTED_OPENCLAW_MODEL`: optional expected primary model. If unset, the Nurse can infer `openai-codex/*` when the host has Codex OAuth but no direct OpenAI API key.
+- `EXPECTED_OPENCLAW_MODEL`: optional expected primary model. `openai-codex/*` values are treated as legacy aliases and normalized to canonical `openai/*` routes while preserving Codex runtime auth.
 - `AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL`: restores model config drift after `openclaw doctor --repair`.
 - `AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD`: removes PM2 apps whose name or metadata points to OpenClaw and keeps the gateway under systemd.
 - `AUTO_CLEAN_OPENCLAW_PM2_DAEMONS`: stops OpenClaw/OpenClawNurse-related PM2 daemon processes left outside the normal PM2 home.

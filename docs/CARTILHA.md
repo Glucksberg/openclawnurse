@@ -131,7 +131,7 @@ Sanidade operacional:
 - `ENABLE_RUNTIME_SANITY` detecta binarios `openclaw` divergentes, aliases de shell, schema conhecido de config e mismatch entre CLI e `openclaw-gateway.service`
 - `ENABLE_TELEGRAM_SANITY` chama `getMyCommands` no bot configurado do OpenClaw e confirma comandos como `new` e `reset`
 - `ENABLE_GATEWAY_LOG_SCAN` varre o journal desde a ultima execucao e marca sintomas como sessao travada, config invalida, warning de provenance de update e erro de provider com input vazio
-- `EXPECTED_OPENCLAW_MODEL` pode ser preenchido para exigir um modelo especifico; vazio tenta detectar pelo `~/.openclaw/openclaw.json`
+- `EXPECTED_OPENCLAW_MODEL` pode ser preenchido para exigir um modelo especifico; valores legados `openai-codex/*` sao normalizados para a rota canonica `openai/*`
 
 ## Validacao minima por VPS
 
