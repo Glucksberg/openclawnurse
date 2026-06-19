@@ -686,6 +686,50 @@ detect_telegram_target() {
   fi
 }
 
+systemd_user_unit_env_value() {
+  local env_key="$1"
+  [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] || return 0
+  command_exists "$SYSTEMCTL_BIN" || return 0
+
+  local env_text token
+  env_text="$("$SYSTEMCTL_BIN" --user show "$SYSTEMD_UNIT_NAME" -p Environment --value 2>/dev/null || true)"
+  [[ -n "$env_text" ]] || return 0
+
+  for token in $env_text; do
+    token="${token%\"}"
+    token="${token#\"}"
+    if [[ "$token" == "$env_key="* ]]; then
+      printf '%s' "${token#*=}"
+      return 0
+    fi
+  done
+}
+
+openclaw_config_telegram_bot_token() {
+  local cfg_file="$1"
+  [[ -f "$cfg_file" ]] || return 0
+  command_exists jq || return 0
+
+  local literal source env_key env_value
+  literal="$(jq -r '(.channels.telegram.botToken // empty) | strings' "$cfg_file" 2>/dev/null || true)"
+  if [[ -n "$literal" && "$literal" != "null" ]]; then
+    printf '%s' "$literal"
+    return 0
+  fi
+
+  source="$(jq -r 'if (.channels.telegram.botToken | type) == "object" then (.channels.telegram.botToken.source // empty) else empty end' "$cfg_file" 2>/dev/null || true)"
+  env_key="$(jq -r 'if (.channels.telegram.botToken | type) == "object" then (.channels.telegram.botToken.id // empty) else empty end' "$cfg_file" 2>/dev/null || true)"
+  [[ "$source" == "env" && "$env_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 0
+
+  env_value="${!env_key:-}"
+  if [[ -z "$env_value" ]]; then
+    env_value="$(systemd_user_unit_env_value "$env_key")"
+  fi
+  if [[ -n "$env_value" ]]; then
+    printf '%s' "$env_value"
+  fi
+}
+
 detect_telegram_bot_token() {
   [[ -z "$TELEGRAM_BOT_TOKEN" ]] || return 0
   [[ "$REPORT_CHANNEL" == "telegram" ]] || return 0
@@ -695,7 +739,7 @@ detect_telegram_bot_token() {
   [[ -f "$cfg_file" ]] || return 0
 
   local detected
-  detected="$(jq -r '(.channels.telegram.botToken // empty) | strings' "$cfg_file" 2>/dev/null || true)"
+  detected="$(openclaw_config_telegram_bot_token "$cfg_file")"
   if [[ -n "$detected" && "$detected" != "null" ]]; then
     TELEGRAM_BOT_TOKEN="$detected"
     log INFO "Auto-detected TELEGRAM_BOT_TOKEN from $cfg_file"
@@ -2234,7 +2278,7 @@ run_telegram_sanity() {
   [[ -f "$cfg_file" ]] || return 0
   local telegram_enabled token
   telegram_enabled="$(jq -r '.channels.telegram.enabled // empty' "$cfg_file" 2>/dev/null)"
-  token="$(jq -r '(.channels.telegram.botToken // empty) | strings' "$cfg_file" 2>/dev/null)"
+  token="$(openclaw_config_telegram_bot_token "$cfg_file")"
   if [[ -z "$token" && -n "$TELEGRAM_BOT_TOKEN" ]]; then
     token="$TELEGRAM_BOT_TOKEN"
   fi
