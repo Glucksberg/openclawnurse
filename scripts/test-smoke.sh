@@ -396,6 +396,50 @@ EOF
   pass "telegram sanity runs for implicit bot token configs"
 }
 
+smoke_telegram_sanity_resolves_env_bot_token_from_systemd() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/telegram-envref.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--user" && "${2:-}" == "show" && "${4:-}" == "-p" && "${5:-}" == "Environment" && "${6:-}" == "--value" ]]; then
+  printf 'TELEGRAM_BOT_TOKEN=fake-token OPENCLAW_GATEWAY_TOKEN=fake-gateway-token\n'
+fi
+exit 0
+EOF
+  chmod +x "$tmp/bin/systemctl"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"channels":{"telegram":{"enabled":true,"botToken":{"source":"env","provider":"default","id":"TELEGRAM_BOT_TOKEN"}}}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+SYSTEMCTL_BIN="$tmp/bin/systemctl"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="true"
+ENABLE_GATEWAY_LOG_SCAN="false"
+TELEGRAM_API_BASE_URL="http://127.0.0.1:9"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="systemd_user"
+SYSTEMD_UNIT_NAME="openclaw-gateway.service"
+EOF
+
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify --dry-run >/dev/null
+
+  "$JQ_BIN" -e '
+    .sanity.telegramCommands == "getMyCommands failed"
+    and (.sanity.findings[] | contains("Telegram getMyCommands failed"))
+    and all(.actions[]?; contains("Configure the OpenClaw Telegram bot token") | not)
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "telegram sanity did not resolve env bot token from systemd service"
+
+  pass "telegram sanity resolves env bot tokens from systemd"
+}
+
 smoke_disabled_high_frequency_cron_is_ignored() {
   local tmp
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/cron-disabled.XXXXXX")"
@@ -2495,6 +2539,7 @@ main() {
   smoke_self_test_uses_openclaw_telegram_token
   smoke_sanity_overrides_updated_status
   smoke_telegram_sanity_uses_implicit_bot_token
+  smoke_telegram_sanity_resolves_env_bot_token_from_systemd
   smoke_disabled_high_frequency_cron_is_ignored
   smoke_array_cron_jobs_are_supported
   smoke_model_auth_notice_does_not_degrade
