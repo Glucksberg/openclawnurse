@@ -4047,7 +4047,7 @@ run_update_status() {
     UPDATE_AVAILABLE=1
     AVAILABLE_VERSION="$(printf '%s' "$json_output" | jq -r '.availability.latestVersion // .update.registry.latestVersion // empty')"
   else
-    AVAILABLE_VERSION="$(printf '%s' "$json_output" | jq -r '.availability.latestVersion // empty')"
+    AVAILABLE_VERSION="$(printf '%s' "$json_output" | jq -r '.availability.latestVersion // .update.registry.latestVersion // empty')"
   fi
   CHANNEL_VALUE="$(printf '%s' "$json_output" | jq -r '.channel.value // empty')"
   return 0
