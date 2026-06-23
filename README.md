@@ -73,6 +73,7 @@ Common settings:
 - `AUTO_SELF_UPDATE`: whether the Nurse should pull its own git upstream, validate it, install the refreshed runtime scripts, and use the new version on the next run.
 - `SELF_UPDATE_REPO_DIR`: local OpenClawNurse git checkout used for self-update. The installer writes this automatically.
 - `SELF_UPDATE_POLICY`: `reset-to-remote` for aggressive upstream convergence with a clean-worktree guard, or `fast-forward` for stricter history preservation.
+- `SELF_UPDATE_TIMEOUT`: per-step timeout for self-update fetch, validation and apply operations. The default is 900 seconds to leave room for smoke tests on small hosts.
 - The systemd unit constrains Nurse runs with memory/swap/CPU limits so a stuck OpenClaw maintenance command is killed with the service instead of exhausting the host.
 - `RESTART_MODE`: gateway restart strategy, usually `systemd_user`.
 - `SYSTEMD_UNIT_NAME`: gateway service name, usually `openclaw-gateway.service`.

@@ -369,7 +369,7 @@ configure_self_update_env() {
   set_env_default SELF_UPDATE_REMOTE "origin"
   set_env_default SELF_UPDATE_BRANCH "main"
   set_env_default SELF_UPDATE_POLICY "reset-to-remote"
-  set_env_default SELF_UPDATE_TIMEOUT "300"
+  set_env_default SELF_UPDATE_TIMEOUT "900"
   set_env_default SELF_UPDATE_RUN_TESTS "true"
   set_env_default SELF_UPDATE_ROLLBACK_ON_FAILURE "true"
   set_env_default SELF_UPDATE_RESTART_GATEWAY "false"

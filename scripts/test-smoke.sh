@@ -34,7 +34,14 @@ cleanup_smoke_tmp() {
   rm -rf "$SMOKE_TMP_ROOT"
 }
 
+terminate_smoke_tmp() {
+  cleanup_smoke_tmp
+  trap - EXIT HUP INT TERM
+  exit 124
+}
+
 trap cleanup_smoke_tmp EXIT
+trap terminate_smoke_tmp HUP INT TERM
 export RUN_PROFILE=heavy
 
 require_cmd() {

@@ -245,7 +245,7 @@ SELF_UPDATE_REPO_DIR="${SELF_UPDATE_REPO_DIR:-}"
 SELF_UPDATE_REMOTE="${SELF_UPDATE_REMOTE:-origin}"
 SELF_UPDATE_BRANCH="${SELF_UPDATE_BRANCH:-main}"
 SELF_UPDATE_POLICY="${SELF_UPDATE_POLICY:-reset-to-remote}"
-SELF_UPDATE_TIMEOUT="${SELF_UPDATE_TIMEOUT:-300}"
+SELF_UPDATE_TIMEOUT="${SELF_UPDATE_TIMEOUT:-900}"
 SELF_UPDATE_RUN_TESTS="${SELF_UPDATE_RUN_TESTS:-true}"
 SELF_UPDATE_ROLLBACK_ON_FAILURE="${SELF_UPDATE_ROLLBACK_ON_FAILURE:-true}"
 SELF_UPDATE_RESTART_GATEWAY="${SELF_UPDATE_RESTART_GATEWAY:-false}"
@@ -973,7 +973,18 @@ json_remediations_from_name() {
 }
 
 remediation_detail_from_output() {
-  printf '%s' "$1" | tr '\n|' '  ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | cut -c1-500
+  local detail
+  local max_chars=1200
+  local edge_chars=550
+  detail="$(printf '%s' "$1" | tr '\n|' '  ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+  if ((${#detail} <= max_chars)); then
+    printf '%s' "$detail"
+    return 0
+  fi
+  printf '%s ... [output truncated; showing first and last %s chars] ... %s' \
+    "${detail:0:edge_chars}" \
+    "$edge_chars" \
+    "${detail: -edge_chars}"
 }
 
 load_gateway_restart_state() {
