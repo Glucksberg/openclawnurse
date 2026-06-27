@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-JQ_BIN="${JQ_BIN:-jq}"
+JQ_BIN="${JQ_BIN:-$(command -v jq 2>/dev/null || printf jq)}"
 SMOKE_TMP_ROOT="$(mktemp -d)"
 
 # Keep smoke runs hermetic even when they are launched by a live Nurse process
@@ -2401,7 +2401,12 @@ RESTART_MODE="custom"
 RESTART_COMMAND="true"
 EOF
 
-  PATH="/usr/local/bin:/usr/bin:/bin" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+  local hermetic_path="/usr/local/bin:/usr/bin:/bin"
+  if [[ "$JQ_BIN" == */* ]]; then
+    hermetic_path="$(dirname "$JQ_BIN"):$hermetic_path"
+  fi
+
+  PATH="$hermetic_path" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
 
   "$JQ_BIN" -e --arg revision "$revision" '
     .status == "UPDATED"
