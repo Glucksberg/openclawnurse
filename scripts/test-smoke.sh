@@ -1455,6 +1455,7 @@ case "\${1:-}" in
     if [[ "\${2:-}" == "status" ]]; then
       printf '{"availability":{"available":true,"latestVersion":"2026.1.1"},"update":{"registry":{"latestVersion":"2026.1.1"}},"channel":{"value":"stable"}}\\n'
     else
+      printf '%s\\n' "\$*" >"$tmp/update-args"
       printf '%s\\n' "\${FAKE_NODE_VERSION:-wrapper}" >"$tmp/update-node"
       command -v node >"$tmp/update-child-node"
       node --version >"$tmp/update-child-node-version"
@@ -1477,7 +1478,11 @@ if [[ -f "$tmp/reject-primary-npm" ]]; then
   cat "$tmp/engine"
   exit 1
 fi
-cat "$tmp/engine"
+if [[ "\${3:-}" == "version" ]]; then
+  printf '"2026.1.1"\n'
+else
+  cat "$tmp/engine"
+fi
 EOF
   chmod +x "$tmp/bin/npm"
   make_hanging_node_runtime "$tmp/node-hang"
@@ -1488,7 +1493,11 @@ EOF
   cat >"$tmp/node24/bin/npm" <<EOF
 #!/usr/bin/env bash
 printf 'fallback\n' >"$tmp/npm-fallback-used"
-cat "$tmp/engine"
+if [[ "\${3:-}" == "version" ]]; then
+  printf '"2026.1.1"\n'
+else
+  cat "$tmp/engine"
+fi
 EOF
   chmod +x "$tmp/node24/bin/npm"
   cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
@@ -1526,6 +1535,8 @@ EOF
     fail "update subprocess PATH did not prefer the compatible Node candidate"
   [[ "$(cat "$tmp/update-child-node-version")" == "v24.18.0" ]] ||
     fail "update subprocess did not execute with the compatible Node candidate"
+  grep -Fq -- '--tag 2026.1.1' "$tmp/update-args" ||
+    fail "package update was not pinned to the version whose Node engine was validated"
   [[ "$(readlink -f "$(cat "$tmp/restart-child-node")")" == "$tmp/node24/bin/node24" ]] ||
     fail "custom restart command did not inherit the compatible Node candidate"
   [[ -f "$tmp/npm-fallback-used" ]] ||
@@ -1624,7 +1635,11 @@ EOF
   printf '">=22"\n' >"$tmp/target-engine"
   cat >"$tmp/bin/npm" <<EOF
 #!/usr/bin/env bash
-cat "$tmp/target-engine"
+if [[ "\${3:-}" == "version" ]]; then
+  printf '"2026.1.1"\n'
+else
+  cat "$tmp/target-engine"
+fi
 EOF
   chmod +x "$tmp/bin/npm"
   make_fake_node_runtime "$tmp/node25" "25.8.2" 0
@@ -1856,11 +1871,11 @@ smoke_runtime_recovery_uses_effective_systemd_execstart() {
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/runtime-systemd-root.XXXXXX")"
 
   mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw" \
-    "$tmp/node_modules/openclaw/dist"
-  cat >"$tmp/node_modules/openclaw/package.json" <<'EOF'
+    "$tmp/proc/4242" "$tmp/releases/release-a/dist"
+  cat >"$tmp/releases/release-a/package.json" <<'EOF'
 {"name":"openclaw","version":"2026.1.0","engines":{"node":">=24.15.0 <25"}}
 EOF
-  cat >"$tmp/node_modules/openclaw/openclaw.mjs" <<EOF
+  cat >"$tmp/releases/release-a/dist/index.js" <<EOF
 #!/usr/bin/env bash
 if [[ "\${FAKE_NODE_VERSION:-}" != "24.18.0" ]]; then
   printf 'openclaw requires Node >=24.15.0 <25; Detected: node 25.8.2\\n' >&2
@@ -1876,17 +1891,26 @@ case "\${1:-}" in
   *) printf '{}\\n' ;;
 esac
 EOF
-  chmod +x "$tmp/node_modules/openclaw/openclaw.mjs"
-  : >"$tmp/node_modules/openclaw/dist/index.js"
-  make_fake_node_runtime "$tmp/node25" "25.8.2" 1
+  chmod +x "$tmp/releases/release-a/dist/index.js"
+  ln -s release-a "$tmp/releases/current"
   make_fake_node_runtime "$tmp/node24" "24.18.0" 0
+  cat >"$tmp/bin/openclaw-gateway-current" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$tmp/bin/openclaw-gateway-current"
+  printf '%s\0%s\0%s\0' \
+    "$tmp/node24/bin/node" "$tmp/releases/release-a/dist/index.js" gateway \
+    >"$tmp/proc/4242/cmdline"
   cat >"$tmp/bin/systemctl" <<EOF
 #!/usr/bin/env bash
+if [[ "\${2:-}" == "show" ]]; then
+  printf '4242\\n'
+  exit 0
+fi
 if [[ "\${2:-}" == "cat" ]]; then
   printf '[Service]\\n'
-  printf 'ExecStart=$tmp/node25/bin/node /old/openclaw/dist/index.js gateway\\n'
-  printf 'ExecStart=\\n'
-  printf 'ExecStart=$tmp/node24/bin/node $tmp/node_modules/openclaw/dist/index.js gateway\\n'
+  printf 'ExecStart=$tmp/bin/openclaw-gateway-current gateway\\n'
 fi
 exit 0
 EOF
@@ -1904,6 +1928,7 @@ AUTO_UPDATE="false"
 SYSTEMCTL_BIN="$tmp/bin/systemctl"
 SYSTEMD_UNIT_NAME="openclaw-gateway.service"
 RESTART_MODE="systemd_user"
+PROCFS_DIR="$tmp/proc"
 ENABLE_RUNTIME_SANITY="false"
 ENABLE_TELEGRAM_SANITY="false"
 ENABLE_GATEWAY_LOG_SCAN="false"
@@ -1921,9 +1946,29 @@ EOF
     and any(.fixes[]; contains("Node 24.18.0"))
     and all(.incidentCodes[]; . != "openclaw_node_runtime_incompatible")
   ' "$tmp/state/doctor-state.json" >/dev/null ||
-    fail "missing launcher did not recover from the effective systemd ExecStart"
+    fail "missing launcher did not recover from the live systemd process command line"
 
-  pass "runtime recovery bypasses a missing launcher through the effective systemd ExecStart"
+  rm -f "$tmp/proc/4242/cmdline"
+  cat >"$tmp/bin/openclaw-gateway-current" <<EOF
+#!/usr/bin/env bash
+current="$tmp/releases/current"
+release="\$(readlink -f "\$current")"
+exec "$tmp/node24/bin/node" "\$release/dist/index.js" "\$@"
+EOF
+  chmod +x "$tmp/bin/openclaw-gateway-current"
+  sed \
+    -e "s|STATE_DIR=\"$tmp/state\"|STATE_DIR=\"$tmp/wrapper-state\"|" \
+    -e "/AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE/a OPENCLAW_NODE_CANDIDATES=\"$tmp/node24/bin/node\"" \
+    "$tmp/cfg/openclawnurse.env" >"$tmp/cfg/wrapper.env"
+
+  PATH="$tmp/bin:$PATH" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/wrapper.env" --no-notify >/dev/null
+  "$JQ_BIN" -e '
+    any(.remediations[]; .code == "openclaw_node_runtime" and .result == "recovered_before_maintenance")
+    and all(.incidentCodes[]; . != "openclaw_node_runtime_incompatible")
+  ' "$tmp/wrapper-state/doctor-state.json" >/dev/null ||
+    fail "inactive systemd wrapper did not resolve its checkout package root"
+
+  pass "runtime recovery resolves live systemd commands and checkout wrappers"
 }
 
 smoke_update_recovery_preserves_target_engine() {
@@ -1982,7 +2027,11 @@ EOF
   ln -s ../openclaw/openclaw.mjs "$tmp/node_modules/.bin/openclaw"
   cat >"$tmp/bin/npm" <<EOF
 #!/usr/bin/env bash
-cat "$tmp/target-engine"
+if [[ "\${3:-}" == "version" ]]; then
+  printf '"2026.1.1"\n'
+else
+  cat "$tmp/target-engine"
+fi
 EOF
   chmod +x "$tmp/bin/npm"
   make_fake_node_runtime "$tmp/node25" "25.8.2" "broad-only"
@@ -2141,7 +2190,9 @@ case "\${1:-}" in
         mv "$tmp/node_modules/openclaw/dist/index.next.js" "$tmp/node_modules/openclaw/dist/index.js"
       fi
       rm -f "$tmp/node_modules/openclaw/openclaw.mjs"
-      printf '2026.1.1\\n' >"$tmp/version"
+      if [[ ! -f "$tmp/keep-old-version" ]]; then
+        printf '2026.1.1\\n' >"$tmp/version"
+      fi
       printf '{"ok":true}\\n'
     fi
     ;;
@@ -2155,7 +2206,11 @@ EOF
   ln -s ../openclaw/openclaw.mjs "$tmp/node_modules/.bin/openclaw"
   cat >"$tmp/bin/npm" <<'EOF'
 #!/usr/bin/env bash
-printf '">=24.15.0 <25"\n'
+if [[ "${3:-}" == "version" ]]; then
+  printf '"2026.1.1"\n'
+else
+  printf '">=24.15.0 <25"\n'
+fi
 EOF
   chmod +x "$tmp/bin/npm"
   make_fake_node_runtime "$tmp/node24" "24.18.0" 0
@@ -2207,12 +2262,37 @@ EOF
   chmod +x "$tmp/node_modules/openclaw/openclaw.mjs" "$tmp/node_modules/openclaw/dist/index.next.js"
   rm -f "$tmp/node_modules/openclaw/dist/index.js" "$tmp/new-entrypoint-used"
   printf '2026.1.0\n' >"$tmp/version"
+  : >"$tmp/keep-old-version"
+  sed "s|STATE_DIR=\"$tmp/state\"|STATE_DIR=\"$tmp/version-mismatch-state\"|" \
+    "$tmp/cfg/openclawnurse.env" >"$tmp/cfg/version-mismatch.env"
+
+  set +e
+  PATH="$tmp/bin:$PATH" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" \
+    --config "$tmp/cfg/version-mismatch.env" --no-notify >/dev/null
+  set -e
+  "$JQ_BIN" -e '
+    .status == "FAILED"
+    and .updateAttempted == true
+    and .updateSucceeded == false
+    and .restartAttempted == false
+    and (.errorsByPhase.update | contains("expected version 2026.1.1"))
+    and any(.incidentCodes[]; . == "post_update_cli_validation_failed")
+  ' "$tmp/version-mismatch-state/doctor-state.json" >/dev/null ||
+    fail "updater success was accepted without installing the validated target version"
+
+  cp "$tmp/old-entrypoint-template" "$tmp/node_modules/openclaw/openclaw.mjs"
+  cp "$tmp/new-entrypoint-template" "$tmp/node_modules/openclaw/dist/index.next.js"
+  chmod +x "$tmp/node_modules/openclaw/openclaw.mjs" "$tmp/node_modules/openclaw/dist/index.next.js"
+  rm -f "$tmp/node_modules/openclaw/dist/index.js" "$tmp/new-entrypoint-used" "$tmp/keep-old-version"
+  printf '2026.1.0\n' >"$tmp/version"
   : >"$tmp/break-post-update-cli"
   sed "s|STATE_DIR=\"$tmp/state\"|STATE_DIR=\"$tmp/broken-state\"|" \
     "$tmp/cfg/openclawnurse.env" >"$tmp/cfg/broken.env"
 
+  set +e
   PATH="$tmp/bin:$PATH" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" \
     --config "$tmp/cfg/broken.env" --no-notify >/dev/null
+  set -e
   "$JQ_BIN" -e '
     .status == "FAILED"
     and .updateAttempted == true
@@ -3165,216 +3245,6 @@ EOF
   pass "configured security warnings are accepted without hiding new warnings"
 }
 
-smoke_fork_manager_update_mode_deploys_revision() {
-  local tmp
-  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/fork-manager-mode.XXXXXX")"
-
-  mkdir -p "$tmp/repo" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw/npm/node_modules/@openclaw/codex" "$tmp/home/.nvm/versions/node/v22.0.0/bin"
-  cat >"$tmp/home/.nvm/versions/node/v22.0.0/bin/pnpm" <<EOF
-#!/usr/bin/env bash
-printf 'fake pnpm %s\n' "\$*" >>"$tmp/pnpm-calls"
-EOF
-  chmod +x "$tmp/home/.nvm/versions/node/v22.0.0/bin/pnpm"
-  cat >"$tmp/repo/package.json" <<'EOF'
-{"name":"openclaw","version":"2026.6.2"}
-EOF
-  cat >"$tmp/repo/openclaw.mjs" <<'EOF'
-#!/usr/bin/env bash
-
-case "${1:-}" in
-  --version)
-    printf 'OpenClaw 2026.6.2\n'
-    ;;
-  update)
-    printf 'standard update must not run in fork-manager mode\n' >&2
-    exit 42
-    ;;
-  doctor)
-    printf 'doctor complete\n'
-    ;;
-  health)
-    printf '{"ok":true}\n'
-    ;;
-  status)
-    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
-    ;;
-  *)
-    printf '{}\n'
-    ;;
-esac
-EOF
-  chmod +x "$tmp/repo/openclaw.mjs"
-  cat >"$tmp/home/.openclaw/npm/package.json" <<'EOF'
-{"dependencies":{"@openclaw/codex":"2026.5.28"}}
-EOF
-  cat >"$tmp/home/.openclaw/npm/node_modules/@openclaw/codex/package.json" <<'EOF'
-{"name":"@openclaw/codex","version":"2026.5.28","peerDependencies":{"openclaw":">=2026.5.28"}}
-EOF
-  git -C "$tmp/repo" init -q
-  git -C "$tmp/repo" config user.email test@example.invalid
-  git -C "$tmp/repo" config user.name 'Test User'
-  git -C "$tmp/repo" add package.json openclaw.mjs
-  git -C "$tmp/repo" commit -q -m 'fake openclaw runtime'
-  git -C "$tmp/repo" branch main-with-all-prs
-  local revision
-  revision="$(git -C "$tmp/repo" rev-parse HEAD)"
-
-  cat >"$tmp/cfg/openclawnurse.env" <<EOF
-OPENCLAW_UPDATE_MODE="fork_manager"
-FORK_MANAGER_REPO_DIR="$tmp/repo"
-FORK_MANAGER_PRODUCTION_BRANCH="main-with-all-prs"
-FORK_MANAGER_BUILD_COMMAND="pnpm install --frozen-lockfile && pnpm build"
-FORK_MANAGER_GATEWAY_INSTALL_COMMAND=""
-FORK_MANAGER_DEPLOY_REVISION_FILE="$tmp/state/fork-manager-deployed.rev"
-STATE_DIR="$tmp/state"
-REPORT_CHANNEL="none"
-AUTO_UPDATE="true"
-ENABLE_RUNTIME_SANITY="true"
-ENABLE_TELEGRAM_SANITY="false"
-ENABLE_GATEWAY_LOG_SCAN="false"
-CONFIG_BACKUP_ENABLED="false"
-RESTART_MODE="custom"
-RESTART_COMMAND="true"
-EOF
-
-  local hermetic_path="/usr/local/bin:/usr/bin:/bin"
-  if [[ "$JQ_BIN" == */* ]]; then
-    hermetic_path="$(dirname "$JQ_BIN"):$hermetic_path"
-  fi
-
-  PATH="$hermetic_path" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
-
-  "$JQ_BIN" -e --arg revision "$revision" '
-    .status == "UPDATED"
-    and .updateMode == "fork_manager"
-    and .updateAttempted == true
-    and .updateSucceeded == true
-    and .forkManager.productionRevision == $revision
-    and .forkManager.deployedRevision == $revision
-    and .sanity.openclawUserPluginDriftCount == 0
-    and .sanity.openclawUserPluginAlignAttempted == false
-    and (.sanity.openclawUserPluginsSummary | contains("@openclaw/codex=2026.5.28"))
-    and (.outputs.update | contains("standard update must not run") | not)
-    and any(.remediations[]; .code == "openclaw_fork_manager_update" and .result == "applied")
-  ' "$tmp/state/doctor-state.json" >/dev/null ||
-    fail "fork-manager update mode did not deploy the production revision"
-
-  grep -Fq 'install --frozen-lockfile' "$tmp/pnpm-calls" ||
-    fail "fork-manager build did not find pnpm from the nvm install"
-  grep -Fq 'build' "$tmp/pnpm-calls" ||
-    fail "fork-manager build did not run the pnpm build step"
-
-  [[ "$(cat "$tmp/state/fork-manager-deployed.rev")" == "$revision" ]] ||
-    fail "fork-manager deployed revision file was not written"
-
-  pass "fork-manager update mode deploys the production revision"
-}
-
-smoke_fork_manager_sync_runs_before_revision_compare() {
-  local tmp
-  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/fork-manager-sync.XXXXXX")"
-
-  mkdir -p "$tmp/repo" "$tmp/state" "$tmp/cfg" "$tmp/home"
-  cat >"$tmp/repo/package.json" <<'EOF'
-{"name":"openclaw","version":"2026.6.2"}
-EOF
-  cat >"$tmp/repo/openclaw.mjs" <<'EOF'
-#!/usr/bin/env bash
-
-case "${1:-}" in
-  --version)
-    printf 'OpenClaw 2026.6.2\n'
-    ;;
-  update)
-    printf 'standard update must not run in fork-manager mode\n' >&2
-    exit 42
-    ;;
-  health)
-    printf '{"ok":true}\n'
-    ;;
-  status)
-    printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\n'
-    ;;
-  *)
-    printf '{}\n'
-    ;;
-esac
-EOF
-  chmod +x "$tmp/repo/openclaw.mjs"
-  git -C "$tmp/repo" init -q
-  git -C "$tmp/repo" config user.email test@example.invalid
-  git -C "$tmp/repo" config user.name 'Test User'
-  git -C "$tmp/repo" add package.json openclaw.mjs
-  git -C "$tmp/repo" commit -q -m 'old production runtime'
-  git -C "$tmp/repo" branch -M main-with-all-prs
-  local old_revision
-  old_revision="$(git -C "$tmp/repo" rev-parse HEAD)"
-  printf '%s\n' "$old_revision" >"$tmp/state/fork-manager-deployed.rev"
-
-  cat >"$tmp/repo/sync.sh" <<'EOF'
-#!/usr/bin/env bash
-printf '{"name":"openclaw","version":"2026.6.3"}\n' >package.json
-git add package.json
-git commit -q -m 'new production runtime'
-printf 'sync advanced production\n'
-EOF
-  chmod +x "$tmp/repo/sync.sh"
-
-  cat >"$tmp/cfg/openclawnurse.env" <<EOF
-OPENCLAW_UPDATE_MODE="fork_manager"
-FORK_MANAGER_REPO_DIR="$tmp/repo"
-FORK_MANAGER_PRODUCTION_BRANCH="main-with-all-prs"
-FORK_MANAGER_SYNC_COMMAND="./sync.sh"
-FORK_MANAGER_BUILD_COMMAND=""
-FORK_MANAGER_GATEWAY_INSTALL_COMMAND=""
-FORK_MANAGER_DEPLOY_REVISION_FILE="$tmp/state/fork-manager-deployed.rev"
-STATE_DIR="$tmp/state"
-REPORT_CHANNEL="none"
-AUTO_UPDATE="true"
-ENABLE_RUNTIME_SANITY="false"
-ENABLE_TELEGRAM_SANITY="false"
-ENABLE_GATEWAY_LOG_SCAN="false"
-ENABLE_COMMITMENTS_SANITY="false"
-ENABLE_SECURITY_AUDIT="false"
-ENABLE_PACKAGE_DRIFT_SANITY="false"
-ENABLE_DISK_SANITY="false"
-ENABLE_CRON_SANITY="false"
-AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="false"
-AUTO_CLEAN_OPENCLAW_PM2_DAEMONS="false"
-AUTO_REFRESH_STALE_GATEWAY_SERVICE="false"
-AUTO_REMEDIATE_OPENCLAW_INSTALLATIONS="false"
-AUTO_REMEDIATE_SHELL_OPENCLAW_SHADOWING="false"
-AUTO_RESTART_UNHEALTHY_GATEWAY="false"
-CONFIG_BACKUP_ENABLED="false"
-RESTART_MODE="custom"
-RESTART_COMMAND="true"
-EOF
-
-  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
-
-  local new_revision
-  new_revision="$(git -C "$tmp/repo" rev-parse HEAD)"
-  [[ "$new_revision" != "$old_revision" ]] ||
-    fail "fork-manager sync command did not advance the production branch"
-  "$JQ_BIN" -e --arg old "$old_revision" --arg new "$new_revision" '
-    .status == "UPDATED"
-    and .updateMode == "fork_manager"
-    and .updateAttempted == true
-    and .updateSucceeded == true
-    and .forkManager.productionRevision == $new
-    and .forkManager.deployedRevision == $new
-    and (.forkManager.deployedRevision != $old)
-    and (.outputs.update | contains("sync advanced production"))
-    and any(.remediations[]; .code == "openclaw_fork_manager_update" and .result == "applied")
-  ' "$tmp/state/doctor-state.json" >/dev/null ||
-    fail "fork-manager sync did not run before deployed revision comparison"
-
-  [[ "$(cat "$tmp/state/fork-manager-deployed.rev")" == "$new_revision" ]] ||
-    fail "fork-manager sync revision was not persisted as deployed"
-
-  pass "fork-manager sync runs before deployed revision comparison"
-}
-
 main() {
   require_cmd "$JQ_BIN"
   require_cmd git
@@ -3421,8 +3291,6 @@ main() {
   smoke_dry_run_reports_openclaw_pm2_daemon_cleanup
   smoke_blocks_gateway_restart_when_pm2_daemon_is_in_gateway_cgroup
   smoke_accepts_configured_security_warnings
-  smoke_fork_manager_update_mode_deploys_revision
-  smoke_fork_manager_sync_runs_before_revision_compare
 }
 
 main "$@"

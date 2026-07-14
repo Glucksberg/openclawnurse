@@ -74,14 +74,8 @@ Common settings:
 - `OPENCLAW_NODE_CANDIDATES`: optional space-separated Node executables to add
   to automatic discovery (gateway service, PATH, nvm, Volta, user toolchains,
   and common Homebrew locations are already scanned).
-- `OPENCLAW_UPDATE_MODE`: `standard` for the default `openclaw update` flow, or `fork_manager` for hosts that run OpenClaw from a fork-manager production branch.
-- `FORK_MANAGER_REPO_DIR`: local OpenClaw checkout used when `OPENCLAW_UPDATE_MODE=fork_manager`.
-- `FORK_MANAGER_PRODUCTION_BRANCH`: branch to deploy in fork-manager mode, usually `main-with-all-prs`.
-- `FORK_MANAGER_SYNC_COMMAND`, `FORK_MANAGER_BUILD_COMMAND`, `FORK_MANAGER_GATEWAY_INSTALL_COMMAND`: optional host policy commands for syncing, building, and installing the fork-manager runtime.
 - `AUTO_ALIGN_OPENCLAW_USER_PLUGINS`: whether the Nurse should align user-installed
-  `@openclaw/*` packages under `~/.openclaw/npm` with the active OpenClaw runtime
-  in standard update mode. Fork-manager mode reports installed plugin versions
-  without trying to install matching npm versions for local OpenClaw revisions.
+  `@openclaw/*` packages under `~/.openclaw/npm` with the active OpenClaw runtime.
 - `OPENCLAW_PLUGIN_ALIGN_PACKAGES`: `auto` to align every `@openclaw/*`
   dependency in `~/.openclaw/npm/package.json`, or a space-separated package list.
 - `AUTO_SELF_UPDATE`: whether the Nurse should pull its own git upstream, validate it, install the refreshed runtime scripts, and use the new version on the next run.
@@ -151,7 +145,6 @@ During a live run it can:
 
 - create a config backup
 - update OpenClaw
-- deploy a configured fork-manager production branch instead of running `openclaw update`
 - align user-installed `@openclaw/*` plugins with the updated runtime
 - run doctor repair
 - quarantine stale OpenClaw paths under `~/.local/state/openclawnurse/quarantine/`

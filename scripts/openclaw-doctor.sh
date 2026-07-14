@@ -217,31 +217,11 @@ case "$RUN_PROFILE" in
     ;;
 esac
 AUTO_UPDATE="${AUTO_UPDATE:-true}"
-OPENCLAW_UPDATE_MODE="${OPENCLAW_UPDATE_MODE:-standard}"
 UPDATE_CHANNEL="${UPDATE_CHANNEL:-stable}"
 UPDATE_TAG="${UPDATE_TAG:-}"
 UPDATE_TIMEOUT="${UPDATE_TIMEOUT:-900}"
 AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="${AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE:-true}"
 OPENCLAW_NODE_CANDIDATES="${OPENCLAW_NODE_CANDIDATES:-}"
-FORK_MANAGER_REPO_DIR="${FORK_MANAGER_REPO_DIR:-$HOME/openclaw-fork-manager}"
-FORK_MANAGER_PRODUCTION_BRANCH="${FORK_MANAGER_PRODUCTION_BRANCH:-main-with-all-prs}"
-FORK_MANAGER_SYNC_COMMAND="${FORK_MANAGER_SYNC_COMMAND-}"
-FORK_MANAGER_BUILD_COMMAND="${FORK_MANAGER_BUILD_COMMAND-pnpm install --frozen-lockfile && pnpm build}"
-FORK_MANAGER_GATEWAY_INSTALL_COMMAND="${FORK_MANAGER_GATEWAY_INSTALL_COMMAND-node openclaw.mjs gateway install --force --port ${OPENCLAW_GATEWAY_PORT:-18789} --json}"
-FORK_MANAGER_COMMAND_TIMEOUT="${FORK_MANAGER_COMMAND_TIMEOUT:-1800}"
-FORK_MANAGER_DEPLOY_REVISION_FILE="${FORK_MANAGER_DEPLOY_REVISION_FILE:-$STATE_DIR/fork-manager-deployed.rev}"
-FORK_MANAGER_OPENCLAW_BIN="${FORK_MANAGER_OPENCLAW_BIN:-$FORK_MANAGER_REPO_DIR/openclaw.mjs}"
-FORK_MANAGER_CHECKOUT_PRODUCTION_BRANCH="${FORK_MANAGER_CHECKOUT_PRODUCTION_BRANCH:-true}"
-case "$OPENCLAW_UPDATE_MODE" in
-  standard|fork_manager) ;;
-  *)
-    echo "Unsupported OPENCLAW_UPDATE_MODE=$OPENCLAW_UPDATE_MODE; expected standard or fork_manager." >&2
-    exit 2
-    ;;
-esac
-if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
-  OPENCLAW_BIN="$FORK_MANAGER_OPENCLAW_BIN"
-fi
 AUTO_SELF_UPDATE="${AUTO_SELF_UPDATE:-false}"
 SELF_UPDATE_REPO_DIR="${SELF_UPDATE_REPO_DIR:-}"
 SELF_UPDATE_REMOTE="${SELF_UPDATE_REMOTE:-origin}"
@@ -868,9 +848,6 @@ UPDATE_OUTPUT=""
 DOCTOR_OUTPUT=""
 HEALTH_OUTPUT=""
 UPDATE_ERROR=""
-FORK_MANAGER_PRODUCTION_REVISION=""
-FORK_MANAGER_DEPLOYED_REVISION=""
-FORK_MANAGER_UPDATE_SUMMARY=""
 RESTART_ERROR=""
 HEALTH_ERROR=""
 SELF_UPDATE_ATTEMPTED=0
@@ -941,6 +918,7 @@ OPENCLAW_NODE_BIN=""
 OPENCLAW_NODE_ENTRYPOINT=""
 OPENCLAW_NODE_ENGINE_RANGE=""
 OPENCLAW_NODE_TARGET_ENGINE_RANGE=""
+OPENCLAW_UPDATE_TARGET_VERSION=""
 OPENCLAW_NODE_VERSION=""
 OPENCLAW_NODE_PATH_DIR=""
 CONFIG_LAST_TOUCHED_VERSION=""
@@ -1090,13 +1068,6 @@ persist_json() {
     --arg doctorOutput "$DOCTOR_OUTPUT" \
     --arg healthOutput "$HEALTH_OUTPUT" \
     --arg updateError "$UPDATE_ERROR" \
-    --arg openclawUpdateMode "$OPENCLAW_UPDATE_MODE" \
-    --arg forkManagerRepoDir "$FORK_MANAGER_REPO_DIR" \
-    --arg forkManagerProductionBranch "$FORK_MANAGER_PRODUCTION_BRANCH" \
-    --arg forkManagerProductionRevision "$FORK_MANAGER_PRODUCTION_REVISION" \
-    --arg forkManagerDeployedRevision "$FORK_MANAGER_DEPLOYED_REVISION" \
-    --arg forkManagerOpenclawBin "$FORK_MANAGER_OPENCLAW_BIN" \
-    --arg forkManagerUpdateSummary "$FORK_MANAGER_UPDATE_SUMMARY" \
     --arg restartError "$RESTART_ERROR" \
     --arg healthError "$HEALTH_ERROR" \
     --arg selfUpdateFrom "$SELF_UPDATE_FROM" \
@@ -1186,18 +1157,9 @@ persist_json() {
       availableVersion: $availableVersion,
       updateAvailable: $updateAvailable,
       channel: $channel,
-      updateMode: $openclawUpdateMode,
       dryRun: $dryRun,
       updateAttempted: $updateAttempted,
       updateSucceeded: $updateSucceeded,
-      forkManager: {
-        repoDir: $forkManagerRepoDir,
-        productionBranch: $forkManagerProductionBranch,
-        productionRevision: $forkManagerProductionRevision,
-        deployedRevision: $forkManagerDeployedRevision,
-        openclawBin: $forkManagerOpenclawBin,
-        summary: $forkManagerUpdateSummary
-      },
       selfUpdate: {
         attempted: $selfUpdateAttempted,
         available: $selfUpdateAvailable,
@@ -1556,24 +1518,32 @@ path_is_same_or_inside() {
   [[ "$path" == "$root" || "$path" == "$root"/* ]]
 }
 
+openclaw_package_root_from_ancestors() {
+  local path="$1"
+  local current
+  current="$(canonical_path "$path")"
+  [[ -f "$current" ]] && current="$(dirname "$current")"
+
+  while [[ -n "$current" ]]; do
+    if [[ -f "$current/package.json" && "$(jq -r '.name // empty' "$current/package.json" 2>/dev/null)" == "openclaw" ]]; then
+      printf '%s\n' "$current"
+      return 0
+    fi
+    [[ "$current" == "/" ]] && break
+    current="$(dirname "$current")"
+  done
+  return 1
+}
+
 openclaw_package_root_from_path() {
   local path="$1"
-  local real parent
+  local real root embedded
   real="$(canonical_path "$path")"
 
-  if [[ -d "$real" && -f "$real/package.json" ]]; then
-    if [[ "$(jq -r '.name // empty' "$real/package.json" 2>/dev/null)" == "openclaw" ]]; then
-      printf '%s\n' "$real"
-      return 0
-    fi
-  fi
-
-  if [[ -f "$real" ]]; then
-    parent="$(dirname "$real")"
-    if [[ -f "$parent/package.json" && "$(jq -r '.name // empty' "$parent/package.json" 2>/dev/null)" == "openclaw" ]]; then
-      printf '%s\n' "$parent"
-      return 0
-    fi
+  root="$(openclaw_package_root_from_ancestors "$real" || true)"
+  if [[ -n "$root" ]]; then
+    printf '%s\n' "$root"
+    return 0
   fi
 
   case "$real" in
@@ -1588,13 +1558,22 @@ openclaw_package_root_from_path() {
   esac
 
   if [[ -f "$real" ]]; then
-    local embedded
     embedded="$(grep -oE '/[^"]*/node_modules/\.pnpm/openclaw@[^"]*/node_modules/openclaw/openclaw\.mjs' "$real" 2>/dev/null | head -n 1 || true)"
     if [[ -n "$embedded" ]]; then
       printf '%s\n' "${embedded%/openclaw.mjs}"
       return 0
     fi
+
+    while IFS= read -r embedded; do
+      [[ -n "$embedded" && "$embedded" != "$real" ]] || continue
+      root="$(openclaw_package_root_from_ancestors "$embedded" || true)"
+      if [[ -n "$root" ]]; then
+        printf '%s\n' "$root"
+        return 0
+      fi
+    done < <(grep -oE "/[^[:space:]\"';]+" "$real" 2>/dev/null || true)
   fi
+  return 1
 }
 
 gateway_systemd_exec_start() {
@@ -1611,8 +1590,28 @@ gateway_systemd_exec_start() {
     tail -n 1
 }
 
+gateway_systemd_runtime_tokens() {
+  [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] || return 1
+  command_exists "$SYSTEMCTL_BIN" || return 1
+
+  local pid token exec_start
+  pid="$(run_runtime_probe "$SYSTEMCTL_BIN" --user show "$SYSTEMD_UNIT_NAME" -p MainPID --value 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 0 && -r "$PROCFS_DIR/$pid/cmdline" ]]; then
+    while IFS= read -r token; do
+      [[ -n "$token" ]] && printf '%s\n' "$token"
+    done < <(tr '\0' '\n' < "$PROCFS_DIR/$pid/cmdline")
+  fi
+
+  exec_start="$(gateway_systemd_exec_start || true)"
+  for token in $exec_start; do
+    token="${token%\"}"
+    token="${token#\"}"
+    [[ -n "$token" ]] && printf '%s\n' "$token"
+  done
+}
+
 active_openclaw_package_root() {
-  local path root exec_start token
+  local path root token
   if [[ "$OPENCLAW_BIN" == */* ]]; then
     path="$OPENCLAW_BIN"
   else
@@ -1635,16 +1634,13 @@ active_openclaw_package_root() {
     fi
   fi
 
-  exec_start="$(gateway_systemd_exec_start || true)"
-  for token in $exec_start; do
-    token="${token%\"}"
-    token="${token#\"}"
+  while IFS= read -r token; do
     root="$(openclaw_package_root_from_path "$token" || true)"
     if [[ -n "$root" ]]; then
       printf '%s\n' "$root"
       return 0
     fi
-  done
+  done < <(gateway_systemd_runtime_tokens || true)
   return 1
 }
 
@@ -1676,18 +1672,15 @@ refresh_selected_openclaw_entrypoint() {
 collect_openclaw_node_candidates() {
   # shellcheck disable=SC2178 # populated through append_unique_array nameref calls.
   local -n candidates_ref="$1"
-  local candidate root exec_start token
+  local candidate root token
 
   for candidate in $OPENCLAW_NODE_CANDIDATES; do
     [[ -x "$candidate" ]] && append_unique_array candidates_ref "$candidate"
   done
 
-  exec_start="$(gateway_systemd_exec_start || true)"
-  for token in $exec_start; do
-    candidate="${token%\"}"
-    candidate="${candidate#\"}"
+  while IFS= read -r candidate; do
     [[ -x "$candidate" && "$(basename "$candidate")" == node ]] && append_unique_array candidates_ref "$candidate"
-  done
+  done < <(gateway_systemd_runtime_tokens || true)
 
   candidate="$(command -v node 2>/dev/null || true)"
   [[ -x "$candidate" ]] && append_unique_array candidates_ref "$candidate"
@@ -1824,8 +1817,8 @@ any_node_satisfies_engine_range() {
   return 1
 }
 
-read_target_openclaw_node_engine() {
-  local root target npm_bin npm_dir output status json range candidate
+read_target_openclaw_package_metadata() {
+  local root target npm_bin npm_dir output status version range candidate
   local node_candidates=()
   local npm_candidates=()
 
@@ -1852,13 +1845,18 @@ read_target_openclaw_node_engine() {
 
   for npm_bin in "${npm_candidates[@]}"; do
     npm_dir="$(dirname "$npm_bin")"
-    output="$(PATH="$npm_dir:$PATH" run_runtime_probe "$npm_bin" view "openclaw@$target" engines.node --json 2>/dev/null)"
+    output="$(PATH="$npm_dir:$PATH" run_runtime_probe "$npm_bin" view "openclaw@$target" version --json 2>/dev/null)"
     status=$?
     [[ "$status" -eq 0 ]] || continue
-    json="$output"
-    range="$(printf '%s' "$json" | jq -r 'if type == "string" then . elif type == "object" then .node // empty else empty end' 2>/dev/null || true)"
+    version="$(printf '%s' "$output" | jq -r 'if type == "string" then . elif type == "array" then last // empty else .version // empty end' 2>/dev/null || true)"
+    [[ "$version" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || continue
+
+    output="$(PATH="$npm_dir:$PATH" run_runtime_probe "$npm_bin" view "openclaw@$version" engines.node --json 2>/dev/null)"
+    status=$?
+    [[ "$status" -eq 0 ]] || continue
+    range="$(printf '%s' "$output" | jq -r 'if type == "string" then . elif type == "object" then .node // empty else empty end' 2>/dev/null || true)"
     if [[ -n "$range" && "$range" != "null" ]]; then
-      printf '%s\n' "$range"
+      printf '%s\n%s\n' "$version" "$range"
       return 0
     fi
   done
@@ -1867,16 +1865,17 @@ read_target_openclaw_node_engine() {
 
 prepare_openclaw_node_runtime_for_update() {
   [[ "$AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE" == "true" ]] || return 0
-  [[ "$OPENCLAW_UPDATE_MODE" == "standard" ]] || return 0
   [[ -z "$UPDATE_INSTALL_KIND" || "$UPDATE_INSTALL_KIND" == "package" ]] || return 0
 
-  local engine_range current_node
-  engine_range="$(read_target_openclaw_node_engine || true)"
-  if [[ -z "$engine_range" ]]; then
+  local metadata target_version engine_range current_node
+  metadata="$(read_target_openclaw_package_metadata || true)"
+  target_version="$(printf '%s\n' "$metadata" | sed -n '1p')"
+  engine_range="$(printf '%s\n' "$metadata" | sed -n '2p')"
+  if [[ -z "$target_version" || -z "$engine_range" ]]; then
     add_incident_code "openclaw_node_runtime_preflight_failed"
-    append_array ERRORS "Could not determine the target OpenClaw Node engine; the update was blocked before package files were changed."
+    append_array ERRORS "Could not determine the target OpenClaw version and Node engine; the update was blocked before package files were changed."
     append_array ACTIONS "Verify npm registry access and the target OpenClaw package metadata, then retry the Nurse run."
-    record_remediation "openclaw_node_runtime" "blocked_engine_metadata_unavailable" "target Node engine could not be read"
+    record_remediation "openclaw_node_runtime" "blocked_engine_metadata_unavailable" "target version and Node engine could not be read"
     return 1
   fi
 
@@ -1888,6 +1887,7 @@ prepare_openclaw_node_runtime_for_update() {
     return 1
   fi
   OPENCLAW_NODE_TARGET_ENGINE_RANGE="$engine_range"
+  OPENCLAW_UPDATE_TARGET_VERSION="$target_version"
 
   current_node="$(command -v node 2>/dev/null || true)"
   if [[ "$OPENCLAW_NODE_BIN" != "$current_node" ]]; then
@@ -2214,9 +2214,6 @@ scan_openclaw_user_plugin_versions() {
     fi
     [[ -n "$version" ]] || version="unknown"
     summary_lines+=("$package_name=$version")
-    if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
-      continue
-    fi
     if [[ "$version" != "$wanted" ]]; then
       OPENCLAW_USER_PLUGIN_DRIFT_COUNT=$((OPENCLAW_USER_PLUGIN_DRIFT_COUNT + 1))
       append_sanity_finding "OpenClaw user plugin version drift: $package_name reports $version while active CLI reports $wanted."
@@ -2255,7 +2252,6 @@ build_openclaw_npm_cmd() {
 
 align_openclaw_user_plugins() {
   [[ "$AUTO_ALIGN_OPENCLAW_USER_PLUGINS" == "true" ]] || return 0
-  [[ "$OPENCLAW_UPDATE_MODE" != "fork_manager" ]] || return 0
   [[ -d "$OPENCLAW_USER_NPM_DIR" ]] || return 0
 
   local target_version="$CURRENT_VERSION_AFTER"
@@ -4102,11 +4098,6 @@ run_preflight_checks() {
     append_unique_array required "$SYSTEMCTL_BIN"
   fi
 
-  if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
-    append_unique_array required git
-    append_unique_array required bash
-  fi
-
   if [[ "$NO_NOTIFY" -eq 0 && "$REPORT_CHANNEL" == "telegram" && -n "$TELEGRAM_TARGET" && -n "$TELEGRAM_BOT_TOKEN" ]]; then
     append_unique_array required curl
   fi
@@ -4128,17 +4119,6 @@ run_preflight_checks() {
 
   if [[ "$NO_NOTIFY" -eq 0 && "$REPORT_CHANNEL" == "telegram" && -z "$TELEGRAM_BOT_TOKEN" ]]; then
     append_unique_array ACTIONS "Configure TELEGRAM_BOT_TOKEN so OpenClawNurse can deliver reports."
-  fi
-
-  if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
-    if [[ ! -d "$FORK_MANAGER_REPO_DIR/.git" ]]; then
-      append_array ERRORS "Fork-manager update mode is enabled, but FORK_MANAGER_REPO_DIR is not a git checkout: $FORK_MANAGER_REPO_DIR"
-      missing_required=1
-    fi
-    if [[ ! -x "$FORK_MANAGER_OPENCLAW_BIN" ]]; then
-      append_array ERRORS "Fork-manager update mode is enabled, but FORK_MANAGER_OPENCLAW_BIN is not executable: $FORK_MANAGER_OPENCLAW_BIN"
-      missing_required=1
-    fi
   fi
 
   return "$missing_required"
@@ -4340,184 +4320,7 @@ maybe_migrate_pm2_gateway_to_systemd() {
   return 0
 }
 
-fork_manager_production_revision() {
-  git -C "$FORK_MANAGER_REPO_DIR" rev-parse --verify "$FORK_MANAGER_PRODUCTION_BRANCH^{commit}" 2>/dev/null
-}
-
-fork_manager_production_version() {
-  git -C "$FORK_MANAGER_REPO_DIR" show "$FORK_MANAGER_PRODUCTION_BRANCH:package.json" 2>/dev/null |
-    jq -r '.version // empty' 2>/dev/null
-}
-
-fork_manager_load_deployed_revision() {
-  FORK_MANAGER_DEPLOYED_REVISION=""
-  [[ -f "$FORK_MANAGER_DEPLOY_REVISION_FILE" ]] || return 0
-  FORK_MANAGER_DEPLOYED_REVISION="$(head -n 1 "$FORK_MANAGER_DEPLOY_REVISION_FILE" 2>/dev/null | tr -cd '0-9a-fA-F' | cut -c1-40)"
-}
-
-fork_manager_validate_runtime_source() {
-  if [[ ! -d "$FORK_MANAGER_REPO_DIR/.git" ]]; then
-    UPDATE_ERROR="FORK_MANAGER_REPO_DIR is not a git checkout: $FORK_MANAGER_REPO_DIR"
-    append_array ERRORS "$UPDATE_ERROR"
-    return 1
-  fi
-  if [[ ! -x "$FORK_MANAGER_OPENCLAW_BIN" ]]; then
-    UPDATE_ERROR="FORK_MANAGER_OPENCLAW_BIN is not executable: $FORK_MANAGER_OPENCLAW_BIN"
-    append_array ERRORS "$UPDATE_ERROR"
-    return 1
-  fi
-  if ! FORK_MANAGER_PRODUCTION_REVISION="$(fork_manager_production_revision)"; then
-    UPDATE_ERROR="Could not resolve fork-manager production branch $FORK_MANAGER_PRODUCTION_BRANCH in $FORK_MANAGER_REPO_DIR."
-    append_array ERRORS "$UPDATE_ERROR"
-    return 1
-  fi
-  return 0
-}
-
-run_fork_manager_update_status() {
-  fork_manager_load_deployed_revision
-  CURRENT_VERSION_BEFORE="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
-  CURRENT_VERSION_AFTER="$CURRENT_VERSION_BEFORE"
-  CHANNEL_VALUE="fork_manager:$FORK_MANAGER_PRODUCTION_BRANCH"
-  UPDATE_AVAILABLE=0
-
-  fork_manager_validate_runtime_source || return 1
-  sync_fork_manager_production_branch || return 1
-
-  AVAILABLE_VERSION="$(fork_manager_production_version)"
-  if [[ -z "$AVAILABLE_VERSION" ]]; then
-    UPDATE_ERROR="Could not read package.json version from $FORK_MANAGER_PRODUCTION_BRANCH."
-    append_array ERRORS "$UPDATE_ERROR"
-    return 1
-  fi
-
-  if [[ "$FORK_MANAGER_DEPLOYED_REVISION" != "$FORK_MANAGER_PRODUCTION_REVISION" ]]; then
-    UPDATE_AVAILABLE=1
-  fi
-
-  FORK_MANAGER_UPDATE_SUMMARY="production=${FORK_MANAGER_PRODUCTION_REVISION:0:12}; deployed=${FORK_MANAGER_DEPLOYED_REVISION:-none}; version=$AVAILABLE_VERSION"
-  return 0
-}
-
-run_fork_manager_shell_command() {
-  local command_text="$1"
-  local label="$2"
-  local output_var="$3"
-  local status_var="$4"
-
-  run_capture_with_heartbeat "$output_var" "$status_var" "$label" 30 \
-    env \
-      FORK_MANAGER_REPO_DIR="$FORK_MANAGER_REPO_DIR" \
-      FORK_MANAGER_COMMAND="$command_text" \
-      timeout "${FORK_MANAGER_COMMAND_TIMEOUT}s" \
-      bash -lc 'cd "$FORK_MANAGER_REPO_DIR" && eval "$FORK_MANAGER_COMMAND"'
-}
-
-should_sync_fork_manager_before_status() {
-  [[ -n "$FORK_MANAGER_SYNC_COMMAND" ]] || return 1
-  [[ "$AUTO_UPDATE" == "true" ]] || return 1
-  [[ "$DRY_RUN" -eq 0 ]] || return 1
-  [[ "$CONFIG_HEALTH" != "invalid" ]] || return 1
-  (( CONSECUTIVE_FAILURES < MAX_CONSECUTIVE_UPDATE_FAILURES )) || return 1
-  return 0
-}
-
-sync_fork_manager_production_branch() {
-  should_sync_fork_manager_before_status || return 0
-
-  local output status
-  run_fork_manager_shell_command "$FORK_MANAGER_SYNC_COMMAND" "Running fork-manager sync command" output status
-  UPDATE_OUTPUT="$output"
-  if [[ "$status" -ne 0 ]]; then
-    UPDATE_ERROR="$output"
-    append_array ERRORS "Fork-manager sync command failed."
-    record_remediation "openclaw_fork_manager_update" "sync_failed" "$(remediation_detail_from_output "$output")"
-    return 1
-  fi
-
-  if ! FORK_MANAGER_PRODUCTION_REVISION="$(fork_manager_production_revision)"; then
-    UPDATE_ERROR="Could not resolve fork-manager production branch after sync."
-    append_array ERRORS "$UPDATE_ERROR"
-    return 1
-  fi
-
-  return 0
-}
-
-persist_fork_manager_deployed_revision() {
-  mkdir -p "$(dirname "$FORK_MANAGER_DEPLOY_REVISION_FILE")"
-  printf '%s\n' "$FORK_MANAGER_PRODUCTION_REVISION" >"$FORK_MANAGER_DEPLOY_REVISION_FILE"
-  FORK_MANAGER_DEPLOYED_REVISION="$FORK_MANAGER_PRODUCTION_REVISION"
-}
-
-run_fork_manager_update() {
-  UPDATE_ATTEMPTED=1
-
-  fork_manager_validate_runtime_source || return 1
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    append_array FIXES "Dry-run: would deploy OpenClaw fork-manager production branch $FORK_MANAGER_PRODUCTION_BRANCH at ${FORK_MANAGER_PRODUCTION_REVISION:0:12}."
-    record_remediation "openclaw_fork_manager_update" "would_apply" "would deploy $FORK_MANAGER_PRODUCTION_BRANCH ${FORK_MANAGER_PRODUCTION_REVISION:0:12}"
-    UPDATE_SUCCEEDED=0
-    return 0
-  fi
-
-  local output status
-  [[ -n "$UPDATE_OUTPUT" ]] || UPDATE_OUTPUT=""
-
-  if [[ "$FORK_MANAGER_CHECKOUT_PRODUCTION_BRANCH" == "true" ]]; then
-    run_capture output status "Checking out fork-manager production branch" \
-      git -C "$FORK_MANAGER_REPO_DIR" checkout "$FORK_MANAGER_PRODUCTION_BRANCH"
-    UPDATE_OUTPUT="${UPDATE_OUTPUT}${UPDATE_OUTPUT:+$'\n\n'}$output"
-    if [[ "$status" -ne 0 ]]; then
-      UPDATE_ERROR="$output"
-      append_array ERRORS "Could not check out fork-manager production branch."
-      record_remediation "openclaw_fork_manager_update" "checkout_failed" "$(remediation_detail_from_output "$output")"
-      return 1
-    fi
-  fi
-
-  if [[ -n "$FORK_MANAGER_BUILD_COMMAND" ]]; then
-    run_fork_manager_shell_command "$FORK_MANAGER_BUILD_COMMAND" "Building OpenClaw fork-manager runtime" output status
-    UPDATE_OUTPUT="${UPDATE_OUTPUT}${UPDATE_OUTPUT:+$'\n\n'}$output"
-    if [[ "$status" -ne 0 ]]; then
-      UPDATE_ERROR="$output"
-      append_array ERRORS "Fork-manager runtime build failed."
-      classify_update_failure "$output"
-      record_remediation "openclaw_fork_manager_update" "build_failed" "$(remediation_detail_from_output "$output")"
-      return 1
-    fi
-  fi
-
-  if [[ -n "$FORK_MANAGER_GATEWAY_INSTALL_COMMAND" ]]; then
-    run_fork_manager_shell_command "$FORK_MANAGER_GATEWAY_INSTALL_COMMAND" "Installing fork-manager gateway service" output status
-    UPDATE_OUTPUT="${UPDATE_OUTPUT}${UPDATE_OUTPUT:+$'\n\n'}$output"
-    if [[ "$status" -ne 0 ]]; then
-      UPDATE_ERROR="$output"
-      append_array ERRORS "Fork-manager gateway service install failed."
-      record_remediation "openclaw_fork_manager_update" "gateway_install_failed" "$(remediation_detail_from_output "$output")"
-      return 1
-    fi
-  fi
-
-  persist_fork_manager_deployed_revision
-  UPDATE_SUCCEEDED=1
-  UPDATE_AVAILABLE=0
-  CONSECUTIVE_FAILURES=0
-  CURRENT_VERSION_AFTER="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
-  [[ -n "$CURRENT_VERSION_AFTER" ]] || CURRENT_VERSION_AFTER="$AVAILABLE_VERSION"
-  FORK_MANAGER_UPDATE_SUMMARY="deployed $FORK_MANAGER_PRODUCTION_BRANCH ${FORK_MANAGER_PRODUCTION_REVISION:0:12}"
-  append_array FIXES "Deployed OpenClaw fork-manager production branch $FORK_MANAGER_PRODUCTION_BRANCH at ${FORK_MANAGER_PRODUCTION_REVISION:0:12}."
-  record_remediation "openclaw_fork_manager_update" "applied" "$FORK_MANAGER_PRODUCTION_BRANCH ${FORK_MANAGER_PRODUCTION_REVISION:0:12}"
-  return 0
-}
-
 run_update_status() {
-  if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
-    run_fork_manager_update_status
-    return
-  fi
-
   local output status json_output
   local cmd
   build_openclaw_cmd cmd
@@ -4556,13 +4359,6 @@ should_attempt_update() {
   [[ "$AUTO_UPDATE" == "true" ]] || return 1
   [[ "$CONFIG_HEALTH" != "invalid" ]] || return 1
   (( CONSECUTIVE_FAILURES < MAX_CONSECUTIVE_UPDATE_FAILURES )) || return 1
-
-  if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
-    [[ "$UPDATE_AVAILABLE" -eq 1 ]] || return 1
-    [[ -n "$FORK_MANAGER_PRODUCTION_REVISION" ]] || return 1
-    [[ "$FORK_MANAGER_DEPLOYED_REVISION" != "$FORK_MANAGER_PRODUCTION_REVISION" ]] || return 1
-    return 0
-  fi
 
   if [[ "$CONFIG_VERSION_DRIFT" -eq 1 && "$AUTO_REMEDIATE_CONFIG_VERSION_DRIFT" == "true" ]]; then
     return 0
@@ -4627,7 +4423,9 @@ build_openclaw_update_cmd() {
   build_openclaw_cmd "$name"
   ref+=(update --json --yes --no-restart --timeout "$UPDATE_TIMEOUT")
 
-  if [[ -n "$UPDATE_TAG" ]]; then
+  if [[ -n "$OPENCLAW_UPDATE_TARGET_VERSION" ]]; then
+    ref+=(--tag "$OPENCLAW_UPDATE_TARGET_VERSION")
+  elif [[ -n "$UPDATE_TAG" ]]; then
     ref+=(--tag "$UPDATE_TAG")
   elif [[ -n "$UPDATE_CHANNEL" && "$UPDATE_CHANNEL" != "$CHANNEL_VALUE" ]]; then
     ref+=(--channel "$UPDATE_CHANNEL")
@@ -4635,30 +4433,38 @@ build_openclaw_update_cmd() {
 }
 
 validate_openclaw_cli_after_update() {
-  local output status version recovery_status=0 detail
+  local output status version recovery_status=0 detail=""
 
   refresh_selected_openclaw_entrypoint || true
   output="$(openclaw_cli_version 2>&1)"
   status=$?
   version="$(printf '%s' "$output" | extract_openclaw_version)"
   if [[ "$status" -eq 0 && -n "$version" ]]; then
-    CURRENT_VERSION_AFTER="$version"
-    return 0
-  fi
-
-  recover_openclaw_node_runtime_after_failure "$output" || recovery_status=$?
-  if [[ "$recovery_status" -eq 0 ]]; then
-    refresh_selected_openclaw_entrypoint || true
-    output="$(openclaw_cli_version 2>&1)"
-    status=$?
-    version="$(printf '%s' "$output" | extract_openclaw_version)"
-    if [[ "$status" -eq 0 && -n "$version" ]]; then
+    if [[ -z "$OPENCLAW_UPDATE_TARGET_VERSION" || "$version" == "$OPENCLAW_UPDATE_TARGET_VERSION" ]]; then
       CURRENT_VERSION_AFTER="$version"
       return 0
     fi
+    detail="OpenClaw reported version $version after updating to expected version $OPENCLAW_UPDATE_TARGET_VERSION"
   fi
 
-  detail="$(remediation_detail_from_output "$output")"
+  if [[ -z "$detail" ]]; then
+    recover_openclaw_node_runtime_after_failure "$output" || recovery_status=$?
+    if [[ "$recovery_status" -eq 0 ]]; then
+      refresh_selected_openclaw_entrypoint || true
+      output="$(openclaw_cli_version 2>&1)"
+      status=$?
+      version="$(printf '%s' "$output" | extract_openclaw_version)"
+      if [[ "$status" -eq 0 && -n "$version" ]]; then
+        if [[ -z "$OPENCLAW_UPDATE_TARGET_VERSION" || "$version" == "$OPENCLAW_UPDATE_TARGET_VERSION" ]]; then
+          CURRENT_VERSION_AFTER="$version"
+          return 0
+        fi
+        detail="OpenClaw reported version $version after updating to expected version $OPENCLAW_UPDATE_TARGET_VERSION"
+      fi
+    fi
+  fi
+
+  [[ -n "$detail" ]] || detail="$(remediation_detail_from_output "$output")"
   [[ -n "$detail" ]] || detail="OpenClaw version probe failed with exit $status after the updater returned success"
   UPDATE_ERROR="$detail"
   GATEWAY_SERVICE_REFRESH_BLOCKS_RESTART=1
@@ -4670,11 +4476,6 @@ validate_openclaw_cli_after_update() {
 }
 
 run_update() {
-  if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
-    run_fork_manager_update
-    return
-  fi
-
   UPDATE_ATTEMPTED=1
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -4758,7 +4559,6 @@ run_update() {
 }
 
 refresh_stale_gateway_service() {
-  [[ "$OPENCLAW_UPDATE_MODE" != "fork_manager" ]] || return 0
   [[ "$AUTO_REFRESH_STALE_GATEWAY_SERVICE" == "true" ]] || return 0
   [[ "$DRY_RUN" -eq 0 ]] || return 0
   [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] || return 0
@@ -4901,7 +4701,6 @@ remediate_expected_openclaw_model_config() {
 }
 
 refresh_gateway_service_after_update() {
-  [[ "$OPENCLAW_UPDATE_MODE" != "fork_manager" ]] || return 0
   [[ "$AUTO_REFRESH_GATEWAY_SERVICE_AFTER_UPDATE" == "true" ]] || return 0
   [[ "$RESTART_MODE" == "systemd_user" ]] || return 0
   command_exists "$SYSTEMCTL_BIN" || return 0
@@ -5238,21 +5037,13 @@ build_report() {
 
   local update_line="not attempted"
   if [[ "$UPDATE_ATTEMPTED" -eq 1 && "$UPDATE_SUCCEEDED" -eq 1 ]]; then
-    if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
-      update_line="fork-manager applied successfully"
-    else
-      update_line="applied successfully"
-    fi
+    update_line="applied successfully"
   elif [[ "$UPDATE_ATTEMPTED" -eq 1 && "$DRY_RUN" -eq 1 ]]; then
     update_line="eligible but skipped because dry-run is active"
   elif [[ "$UPDATE_ATTEMPTED" -eq 1 ]]; then
     update_line="failed"
   elif [[ "$CURRENT_VERSION_BEFORE" == "$AVAILABLE_VERSION" && -n "$CURRENT_VERSION_BEFORE" ]]; then
-    if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
-      update_line="fork-manager production branch already deployed"
-    else
-      update_line="already on the latest version"
-    fi
+    update_line="already on the latest version"
   fi
 
   local self_update_line="not attempted"
