@@ -43,6 +43,9 @@ terminate_smoke_tmp() {
 trap cleanup_smoke_tmp EXIT
 trap terminate_smoke_tmp HUP INT TERM
 export RUN_PROFILE=heavy
+# Most legacy smoke fixtures use standalone fake CLIs without a package root or
+# registry metadata. Runtime-selection tests opt in explicitly below.
+export AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE=false
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -1436,6 +1439,8 @@ case "\${1:-}" in
       printf '{"availability":{"available":true,"latestVersion":"2026.1.1"},"update":{"registry":{"latestVersion":"2026.1.1"}},"channel":{"value":"stable"}}\\n'
     else
       printf '%s\\n' "\${FAKE_NODE_VERSION:-wrapper}" >"$tmp/update-node"
+      command -v node >"$tmp/update-child-node"
+      node --version >"$tmp/update-child-node-version"
       printf '2026.1.1\\n' >"$tmp/version"
       printf '{"ok":true}\\n'
     fi
@@ -1462,6 +1467,7 @@ EOF
 EXTRA_PATH="$tmp/bin"
 OPENCLAW_BIN="$tmp/node_modules/.bin/openclaw"
 OPENCLAW_NODE_CANDIDATES="$tmp/node25/bin/node $tmp/node24/bin/node"
+AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="true"
 STATE_DIR="$tmp/state"
 REPORT_CHANNEL="none"
 AUTO_UPDATE="true"
@@ -1483,6 +1489,10 @@ EOF
 
   [[ "$(cat "$tmp/update-node")" == "24.18.0" ]] ||
     fail "update did not run with the compatible Node candidate"
+  [[ "$(cat "$tmp/update-child-node")" == "$tmp/node24/bin/node" ]] ||
+    fail "update subprocess PATH did not prefer the compatible Node candidate"
+  [[ "$(cat "$tmp/update-child-node-version")" == "v24.18.0" ]] ||
+    fail "update subprocess did not execute with the compatible Node candidate"
   "$JQ_BIN" -e '
     .status == "UPDATED"
     and .updateSucceeded == true
@@ -1510,7 +1520,24 @@ EOF
   ' "$tmp/blocked-state/doctor-state.json" >/dev/null ||
     fail "missing compatible Node runtime did not block the update safely"
 
-  pass "update selects compatible Node and blocks safely when none exists"
+  : >"$tmp/engine"
+  printf '2026.1.0\n' >"$tmp/version"
+  rm -f "$tmp/update-node" "$tmp/update-child-node" "$tmp/update-child-node-version"
+  sed "s|STATE_DIR=\"$tmp/state\"|STATE_DIR=\"$tmp/metadata-state\"|" \
+    "$tmp/cfg/openclawnurse.env" >"$tmp/cfg/metadata.env"
+  PATH="$tmp/bin:$PATH" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/metadata.env" --no-notify >/dev/null
+
+  [[ ! -f "$tmp/update-node" ]] ||
+    fail "update ran without trustworthy target Node engine metadata"
+  "$JQ_BIN" -e '
+    .status == "FAILED"
+    and .updateAttempted == false
+    and any(.incidentCodes[]; . == "openclaw_node_runtime_preflight_failed")
+    and any(.remediations[]; .code == "openclaw_node_runtime" and .result == "blocked_engine_metadata_unavailable")
+  ' "$tmp/metadata-state/doctor-state.json" >/dev/null ||
+    fail "missing target Node engine metadata did not block the update safely"
+
+  pass "update propagates compatible Node and blocks unsafe mutations"
 }
 
 smoke_update_recovers_after_node_runtime_failure() {
@@ -1526,7 +1553,7 @@ EOF
   cat >"$tmp/node_modules/openclaw/openclaw.mjs" <<EOF
 #!/usr/bin/env bash
 if [[ "\${1:-}" == "--profile" ]]; then shift 2; fi
-if [[ -f "$tmp/stranded" && -z "\${FAKE_NODE_VERSION:-}" ]]; then
+if [[ -f "$tmp/stranded" && "\${FAKE_NODE_VERSION:-}" != "24.18.0" ]]; then
   printf 'openclaw requires Node >=24.15.0 <25; Detected: node 25.8.2\\n' >&2
   exit 1
 fi
@@ -1537,7 +1564,7 @@ case "\${1:-}" in
   update)
     if [[ "\${2:-}" == "status" ]]; then
       printf '{"availability":{"available":true,"latestVersion":"2026.1.1"},"update":{"registry":{"latestVersion":"2026.1.1"}},"channel":{"value":"stable"}}\\n'
-    elif [[ -z "\${FAKE_NODE_VERSION:-}" ]]; then
+    elif [[ "\${FAKE_NODE_VERSION:-}" != "24.18.0" ]]; then
       printf '{"name":"openclaw","version":"2026.1.1","engines":{"node":">=24.15.0 <25"}}\\n' >"$tmp/node_modules/openclaw/package.json"
       : >"$tmp/stranded"
       printf 'openclaw requires Node >=24.15.0 <25; Detected: node 25.8.2\\n' >&2
@@ -1556,11 +1583,13 @@ esac
 EOF
   chmod +x "$tmp/node_modules/openclaw/openclaw.mjs"
   ln -s ../openclaw/openclaw.mjs "$tmp/node_modules/.bin/openclaw"
-  cat >"$tmp/bin/npm" <<'EOF'
+  printf '">=22"\n' >"$tmp/target-engine"
+  cat >"$tmp/bin/npm" <<EOF
 #!/usr/bin/env bash
-exit 1
+cat "$tmp/target-engine"
 EOF
   chmod +x "$tmp/bin/npm"
+  make_fake_node_runtime "$tmp/node25" "25.8.2" 0
   make_fake_node_runtime "$tmp/node24" "24.18.0" 0
   cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
 {"gateway":{"port":18789}}
@@ -1568,7 +1597,8 @@ EOF
   cat >"$tmp/cfg/openclawnurse.env" <<EOF
 EXTRA_PATH="$tmp/bin"
 OPENCLAW_BIN="$tmp/node_modules/.bin/openclaw"
-OPENCLAW_NODE_CANDIDATES="$tmp/node24/bin/node"
+OPENCLAW_NODE_CANDIDATES="$tmp/node25/bin/node $tmp/node24/bin/node"
+AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="true"
 STATE_DIR="$tmp/state"
 REPORT_CHANNEL="none"
 AUTO_UPDATE="true"
@@ -1613,6 +1643,98 @@ EOF
     fail "post-update Node runtime recovery was not reported"
 
   pass "Nurse bootstraps and recovers when the original Node cannot run OpenClaw"
+}
+
+smoke_startup_runtime_failure_is_bounded_and_notified() {
+  local tmp status
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/node-runtime-startup-failure.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw" \
+    "$tmp/node_modules/openclaw" "$tmp/node_modules/.bin"
+  cat >"$tmp/node_modules/openclaw/package.json" <<'EOF'
+{"name":"openclaw","version":"2026.1.0","engines":{"node":">=99"}}
+EOF
+  cat >"$tmp/node_modules/openclaw/openclaw.mjs" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  sleep 30
+  printf 'OpenClaw 2026.1.0\n'
+  exit 0
+fi
+printf '{}\n'
+EOF
+  chmod +x "$tmp/node_modules/openclaw/openclaw.mjs"
+  ln -s ../openclaw/openclaw.mjs "$tmp/node_modules/.bin/openclaw"
+  cat >"$tmp/bin/curl" <<EOF
+#!/usr/bin/env bash
+output_file=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    -o)
+      output_file="\${2:-}"
+      shift 2
+      ;;
+    -w)
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '{"ok":true}\\n' >"\$output_file"
+: >"$tmp/telegram-called"
+printf '200'
+EOF
+  chmod +x "$tmp/bin/curl"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"gateway":{"port":18789}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+EXTRA_PATH="$tmp/bin"
+OPENCLAW_BIN="$tmp/node_modules/.bin/openclaw"
+AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="true"
+STATE_DIR="$tmp/state"
+STATUS_TIMEOUT="1"
+REPORT_CHANNEL="telegram"
+TELEGRAM_TARGET="chat"
+TELEGRAM_BOT_TOKEN="fake-token"
+TELEGRAM_API_BASE_URL="http://telegram.test"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+RESTART_COMMAND="true"
+EOF
+
+  set +e
+  timeout 6s env PATH="$tmp/bin:$PATH" HOME="$tmp/home" \
+    "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" >/dev/null
+  status=$?
+  set -e
+
+  [[ "$status" -eq 1 ]] ||
+    fail "startup runtime probe was not bounded or did not report failure (exit $status)"
+  [[ -f "$tmp/telegram-called" ]] ||
+    fail "startup runtime failure was not delivered immediately"
+  [[ ! -f "$tmp/state/pending-report.txt" ]] ||
+    fail "successfully delivered startup failure remained pending"
+  "$JQ_BIN" -e '
+    .status == "FAILED"
+    and .notificationDelivered == true
+    and .notificationPending == false
+    and any(.incidentCodes[]; . == "openclaw_node_runtime_incompatible")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "bounded startup runtime failure was not persisted as delivered"
+
+  pass "startup runtime probes are bounded and failures are notified"
 }
 
 smoke_gateway_env_file_feeds_openclaw_commands() {
@@ -2790,6 +2912,7 @@ main() {
   smoke_update_retry_success_is_not_failed
   smoke_update_selects_compatible_node_runtime
   smoke_update_recovers_after_node_runtime_failure
+  smoke_startup_runtime_failure_is_bounded_and_notified
   smoke_gateway_env_file_feeds_openclaw_commands
   smoke_gateway_refresh_failure_skips_restart
   smoke_gateway_log_scan_reports_oom

@@ -615,7 +615,9 @@ build_openclaw_cmd() {
   # shellcheck disable=SC2178 # nameref points at an array selected by name.
   local -n ref="$name"
   if [[ -n "${OPENCLAW_NODE_BIN:-}" && -n "${OPENCLAW_NODE_ENTRYPOINT:-}" ]]; then
-    ref=("$OPENCLAW_NODE_BIN" "$OPENCLAW_NODE_ENTRYPOINT")
+    local node_dir
+    node_dir="$(dirname "$OPENCLAW_NODE_BIN")"
+    ref=(env "PATH=$node_dir:$PATH" "$OPENCLAW_NODE_BIN" "$OPENCLAW_NODE_ENTRYPOINT")
   else
     ref=("$OPENCLAW_BIN")
   fi
@@ -627,7 +629,7 @@ build_openclaw_cmd() {
 openclaw_cli_version() {
   local cmd
   build_openclaw_cmd cmd
-  "${cmd[@]}" --version
+  timeout "${STATUS_TIMEOUT}s" "${cmd[@]}" --version
 }
 
 json_payload_from_output() {
@@ -1738,8 +1740,11 @@ prepare_openclaw_node_runtime_for_update() {
   local engine_range current_node
   engine_range="$(read_target_openclaw_node_engine || true)"
   if [[ -z "$engine_range" ]]; then
-    log WARN "Could not read target OpenClaw Node engine; post-update runtime recovery remains enabled"
-    return 0
+    add_incident_code "openclaw_node_runtime_preflight_failed"
+    append_array ERRORS "Could not determine the target OpenClaw Node engine; the update was blocked before package files were changed."
+    append_array ACTIONS "Verify npm registry access and the target OpenClaw package metadata, then retry the Nurse run."
+    record_remediation "openclaw_node_runtime" "blocked_engine_metadata_unavailable" "target Node engine could not be read"
+    return 1
   fi
 
   if ! select_compatible_openclaw_node "$engine_range"; then
@@ -5217,7 +5222,15 @@ persist_startup_failure() {
   report="$(build_report)"
   if command_exists jq; then
     persist_json "$report"
-    persist_pending_report "$report"
+    if deliver_report "$report"; then
+      report="$(build_report)"
+      persist_json "$report"
+    else
+      finalize_status
+      report="$(build_report)"
+      persist_json "$report"
+      persist_pending_report "$report"
+    fi
   else
     log ERROR "jq is unavailable; skipping JSON persistence for the failed startup report"
     printf '%s\n' "$report"

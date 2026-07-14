@@ -61,8 +61,9 @@ Common settings:
 - `openclawnurse-heavy`: installed wrapper/trigger key for agents to request the heavy profile explicitly.
 - `AUTO_UPDATE`: whether the Nurse should apply available updates.
 - `AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE`: validates the target release's Node
-  engine before an update, selects a compatible installed runtime, and retries
-  maintenance with it if an update strands the original CLI. If no compatible
+  engine before an update, selects a compatible installed runtime for the CLI
+  and its child processes, and retries maintenance with it if an update strands
+  the original CLI. If the target engine cannot be verified or no compatible
   runtime exists, the update is blocked before package files are changed.
 - `OPENCLAW_NODE_CANDIDATES`: optional space-separated Node executables to add
   to automatic discovery (gateway service, PATH, nvm, Volta, user toolchains,
