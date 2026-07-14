@@ -46,6 +46,7 @@ export RUN_PROFILE=heavy
 # Most legacy smoke fixtures use standalone fake CLIs without a package root or
 # registry metadata. Runtime-selection tests opt in explicitly below.
 export AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE=false
+export AUTO_UPGRADE_APT_NODE_FOR_OPENCLAW=false
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -1699,6 +1700,128 @@ EOF
   pass "Nurse bootstraps and recovers when the original Node cannot run OpenClaw"
 }
 
+smoke_startup_upgrades_apt_node_runtime() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/apt-node-runtime.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw" \
+    "$tmp/node_modules/openclaw" "$tmp/node_modules/.bin" \
+    "$tmp/lib/node_modules/npm/node_modules/semver"
+  printf '22.22.0\n' >"$tmp/node-version"
+  printf '{"name":"semver"}\n' >"$tmp/lib/node_modules/npm/node_modules/semver/package.json"
+  cat >"$tmp/bin/node" <<EOF
+#!/usr/bin/env bash
+version="\$(cat "$tmp/node-version")"
+if [[ "\${1:-}" == "--version" ]]; then
+  printf 'v%s\\n' "\$version"
+  exit 0
+fi
+if [[ "\${1:-}" == "-e" ]]; then
+  if [[ -n "\${5:-}" ]]; then
+    [[ "\${4:-}" == "24.18.0" && "\${5:-}" == ">=24.15.0 <25" ]]
+    exit
+  fi
+  [[ "\$version" == "24.18.0" && "\${4:-}" == ">=24.15.0 <25" ]]
+  exit
+fi
+export FAKE_NODE_VERSION="\$version"
+exec "\$@"
+EOF
+  chmod +x "$tmp/bin/node"
+  cat >"$tmp/node_modules/openclaw/package.json" <<'EOF'
+{"name":"openclaw","version":"2026.7.1","engines":{"node":">=24.15.0 <25"}}
+EOF
+  cat >"$tmp/node_modules/openclaw/openclaw.mjs" <<EOF
+#!/usr/bin/env bash
+if [[ "\$(node --version)" != "v24.18.0" ]]; then
+  printf 'openclaw requires Node >=24.15.0 <25; Detected: node %s\\n' "\$(node --version)" >&2
+  exit 1
+fi
+case "\${1:-}" in
+  --version) printf 'OpenClaw 2026.7.1\\n' ;;
+  update) printf '{"availability":{"available":false,"latestVersion":"2026.7.1"},"update":{"installKind":"package","registry":{"latestVersion":"2026.7.1"}},"channel":{"value":"stable"}}\\n' ;;
+  health) printf '{"ok":true}\\n' ;;
+  status) printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\\n' ;;
+  *) printf '{}\\n' ;;
+esac
+EOF
+  chmod +x "$tmp/node_modules/openclaw/openclaw.mjs"
+  ln -s ../openclaw/openclaw.mjs "$tmp/node_modules/.bin/openclaw"
+  cat >"$tmp/bin/dpkg-query" <<EOF
+#!/usr/bin/env bash
+printf 'nodejs: %s\\n' "$tmp/bin/node"
+EOF
+  cat >"$tmp/bin/apt-cache" <<'EOF'
+#!/usr/bin/env bash
+cat <<OUT
+nodejs:
+  Installed: 22.22.0-1nodesource1
+  Candidate: 24.18.0-1nodesource1
+OUT
+EOF
+  cat >"$tmp/bin/apt-get" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >"$tmp/apt-get-args"
+printf '24.18.0\\n' >"$tmp/node-version"
+EOF
+  cat >"$tmp/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == "-n" ]] && shift
+[[ "${1:-}" == "true" ]] && exit 0
+exec "$@"
+EOF
+  chmod +x "$tmp/bin/dpkg-query" "$tmp/bin/apt-cache" "$tmp/bin/apt-get" "$tmp/bin/sudo"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"gateway":{"port":18789}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+EXTRA_PATH="$tmp/bin"
+OPENCLAW_BIN="$tmp/node_modules/.bin/openclaw"
+AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="true"
+AUTO_UPGRADE_APT_NODE_FOR_OPENCLAW="true"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="true"
+AUTO_ALIGN_OPENCLAW_USER_PLUGINS="false"
+AUTO_RESTART_UNHEALTHY_GATEWAY="false"
+AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD="false"
+AUTO_CLEAN_OPENCLAW_PM2_DAEMONS="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+RESTART_COMMAND="true"
+EOF
+
+  PATH="$tmp/bin:$PATH" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" \
+    --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+
+  [[ "$(cat "$tmp/node-version")" == "24.18.0" ]] ||
+    fail "Nurse did not upgrade the incompatible APT Node runtime"
+  grep -Fq -- 'install --only-upgrade -y nodejs' "$tmp/apt-get-args" ||
+    fail "Nurse did not limit APT remediation to a nodejs package upgrade"
+  "$JQ_BIN" -e '
+    .status == "OK"
+    and any(.remediations[];
+      .code == "openclaw_node_runtime"
+      and .result == "upgraded_apt_node"
+    )
+    and any(.remediations[];
+      .code == "openclaw_node_runtime"
+      and .result == "recovered_before_maintenance"
+    )
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "APT Node runtime recovery was not reported"
+
+  pass "Nurse upgrades an incompatible APT Node runtime before maintenance"
+}
+
 smoke_startup_runtime_failure_is_bounded_and_notified() {
   local tmp status
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/node-runtime-startup-failure.XXXXXX")"
@@ -3274,6 +3397,7 @@ main() {
   smoke_update_retry_success_is_not_failed
   smoke_update_selects_compatible_node_runtime
   smoke_update_recovers_after_node_runtime_failure
+  smoke_startup_upgrades_apt_node_runtime
   smoke_startup_runtime_failure_is_bounded_and_notified
   smoke_cli_failure_is_not_misdiagnosed_as_node
   smoke_runtime_recovery_uses_effective_systemd_execstart

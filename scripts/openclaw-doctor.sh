@@ -222,6 +222,8 @@ UPDATE_TAG="${UPDATE_TAG:-}"
 UPDATE_TIMEOUT="${UPDATE_TIMEOUT:-900}"
 AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="${AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE:-true}"
 OPENCLAW_NODE_CANDIDATES="${OPENCLAW_NODE_CANDIDATES:-}"
+AUTO_UPGRADE_APT_NODE_FOR_OPENCLAW="${AUTO_UPGRADE_APT_NODE_FOR_OPENCLAW:-true}"
+APT_NODE_UPGRADE_TIMEOUT="${APT_NODE_UPGRADE_TIMEOUT:-600}"
 AUTO_SELF_UPDATE="${AUTO_SELF_UPDATE:-false}"
 SELF_UPDATE_REPO_DIR="${SELF_UPDATE_REPO_DIR:-}"
 SELF_UPDATE_REMOTE="${SELF_UPDATE_REMOTE:-origin}"
@@ -921,6 +923,7 @@ OPENCLAW_NODE_TARGET_ENGINE_RANGE=""
 OPENCLAW_UPDATE_TARGET_VERSION=""
 OPENCLAW_NODE_VERSION=""
 OPENCLAW_NODE_PATH_DIR=""
+APT_NODE_UPGRADE_ATTEMPTED=0
 CONFIG_LAST_TOUCHED_VERSION=""
 CONFIG_VERSION_DRIFT=0
 CONFIG_VERSION_DRIFT_FINDING=""
@@ -1746,6 +1749,89 @@ process.exit(semver.satisfies(process.versions.node, process.argv[2]) ? 0 : 1);
   return 1
 }
 
+node_version_satisfies_engine_range() {
+  local version="$1"
+  local engine_range="$2"
+  local node_bin semver_module
+  local candidates=()
+  local semver_modules=()
+
+  collect_openclaw_node_candidates candidates
+  collect_openclaw_semver_modules semver_modules "${candidates[@]}"
+  for node_bin in "${candidates[@]}"; do
+    for semver_module in "${semver_modules[@]}"; do
+      run_runtime_probe "$node_bin" -e '
+const semver = require(process.argv[1]);
+process.exit(semver.satisfies(process.argv[2], process.argv[3]) ? 0 : 1);
+' "$semver_module" "$version" "$engine_range" >/dev/null 2>&1 && return 0
+    done
+  done
+  return 1
+}
+
+apt_node_upgrade_candidate() {
+  [[ "$AUTO_UPGRADE_APT_NODE_FOR_OPENCLAW" == "true" ]] || return 1
+  command_exists apt-cache || return 1
+  command_exists apt-get || return 1
+  command_exists dpkg-query || return 1
+  command_exists sudo || return 1
+
+  local engine_range="$1"
+  local current_node current_real ownership package_version version
+  current_node="$(command -v node 2>/dev/null || true)"
+  [[ -x "$current_node" ]] || return 1
+  current_real="$(canonical_path "$current_node")"
+  ownership="$(dpkg-query -S "$current_real" 2>/dev/null || true)"
+  printf '%s\n' "$ownership" | grep -Eq '^nodejs(:[^:]+)?:[[:space:]]' || return 1
+  sudo -n true >/dev/null 2>&1 || return 1
+
+  package_version="$(apt-cache policy nodejs 2>/dev/null | awk '/^[[:space:]]*Candidate:/ {print $2; exit}')"
+  version="$(printf '%s\n' "$package_version" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
+  [[ -n "$version" ]] || return 1
+  node_version_satisfies_engine_range "$version" "$engine_range" || return 1
+  printf '%s\n' "$version"
+}
+
+upgrade_apt_node_for_openclaw() {
+  local engine_range="$1"
+  local candidate output status
+  candidate="$(apt_node_upgrade_candidate "$engine_range" || true)"
+  [[ -n "$candidate" ]] || return 1
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    append_array FIXES "Dry-run: would upgrade the APT nodejs package to Node $candidate for OpenClaw compatibility ($engine_range)."
+    record_remediation "openclaw_node_runtime" "would_upgrade_apt_node" "candidate $candidate satisfies $engine_range"
+    return 3
+  fi
+  if [[ "$APT_NODE_UPGRADE_ATTEMPTED" -eq 1 ]]; then
+    return 2
+  fi
+  APT_NODE_UPGRADE_ATTEMPTED=1
+
+  run_capture_with_heartbeat output status "Upgrading APT nodejs for OpenClaw compatibility" 30 \
+    timeout --kill-after=10s "${APT_NODE_UPGRADE_TIMEOUT}s" \
+    sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+    apt-get install --only-upgrade -y nodejs
+  if [[ "$status" -ne 0 ]]; then
+    add_incident_code "openclaw_node_runtime_upgrade_failed"
+    append_array ERRORS "The compatible APT nodejs candidate $candidate could not be installed."
+    append_array ACTIONS "Review the nodejs package upgrade error, then retry the Nurse run."
+    record_remediation "openclaw_node_runtime" "apt_node_upgrade_failed" "$(remediation_detail_from_output "$output")"
+    return 2
+  fi
+  if ! select_compatible_openclaw_node "$engine_range"; then
+    add_incident_code "openclaw_node_runtime_upgrade_failed"
+    append_array ERRORS "APT upgraded nodejs, but the installed Node runtime still does not satisfy $engine_range."
+    append_array ACTIONS "Review the installed nodejs package and OPENCLAW_NODE_CANDIDATES before retrying maintenance."
+    record_remediation "openclaw_node_runtime" "apt_node_upgrade_invalid" "expected candidate $candidate satisfying $engine_range"
+    return 2
+  fi
+
+  append_array FIXES "Upgraded the APT nodejs package to Node $OPENCLAW_NODE_VERSION for OpenClaw compatibility ($engine_range)."
+  record_remediation "openclaw_node_runtime" "upgraded_apt_node" "$OPENCLAW_NODE_BIN version $OPENCLAW_NODE_VERSION satisfies $engine_range"
+  return 0
+}
+
 openclaw_node_path_dir() {
   local node_bin="$1"
   local node_dir shim_dir shim_key shim_target
@@ -1880,11 +1966,22 @@ prepare_openclaw_node_runtime_for_update() {
   fi
 
   if ! select_compatible_openclaw_node "$engine_range"; then
-    add_incident_code "openclaw_node_runtime_incompatible"
-    append_array ERRORS "OpenClaw ${AVAILABLE_VERSION:-update target} requires Node $engine_range, but no compatible installed Node runtime was found."
-    append_array ACTIONS "Install a compatible Node runtime or list its executable in OPENCLAW_NODE_CANDIDATES; the OpenClaw update was not started."
-    record_remediation "openclaw_node_runtime" "blocked_missing_compatible_runtime" "required $engine_range"
-    return 1
+    local upgrade_status=0
+    upgrade_apt_node_for_openclaw "$engine_range" || upgrade_status=$?
+    if [[ "$upgrade_status" -eq 3 ]]; then
+      OPENCLAW_NODE_TARGET_ENGINE_RANGE="$engine_range"
+      OPENCLAW_UPDATE_TARGET_VERSION="$target_version"
+      return 0
+    fi
+    if [[ "$upgrade_status" -ne 0 ]]; then
+      if [[ "$upgrade_status" -ne 2 ]]; then
+        add_incident_code "openclaw_node_runtime_incompatible"
+        append_array ERRORS "OpenClaw ${AVAILABLE_VERSION:-update target} requires Node $engine_range, but no compatible installed Node runtime was found."
+        append_array ACTIONS "Install a compatible Node runtime or list its executable in OPENCLAW_NODE_CANDIDATES; the OpenClaw update was not started."
+        record_remediation "openclaw_node_runtime" "blocked_missing_compatible_runtime" "required $engine_range"
+      fi
+      return 1
+    fi
   fi
   OPENCLAW_NODE_TARGET_ENGINE_RANGE="$engine_range"
   OPENCLAW_UPDATE_TARGET_VERSION="$target_version"
@@ -1945,10 +2042,19 @@ ensure_openclaw_node_runtime() {
     return 1
   fi
 
-  add_incident_code "openclaw_node_runtime_incompatible"
-  append_array ERRORS "The OpenClaw CLI is unavailable and no installed Node runtime satisfies $engine_range."
-  append_array ACTIONS "Install a compatible Node runtime or list its executable in OPENCLAW_NODE_CANDIDATES before the next Nurse run."
-  record_remediation "openclaw_node_runtime" "blocked_missing_compatible_runtime" "installed OpenClaw requires $engine_range"
+  local upgrade_status=0
+  upgrade_apt_node_for_openclaw "$engine_range" || upgrade_status=$?
+  if [[ "$upgrade_status" -eq 0 ]]; then
+    append_array FIXES "Recovered OpenClaw maintenance startup after upgrading the system Node runtime."
+    record_remediation "openclaw_node_runtime" "recovered_before_maintenance" "$OPENCLAW_NODE_BIN version $OPENCLAW_NODE_VERSION satisfies $engine_range"
+    return 0
+  fi
+  if [[ "$upgrade_status" -ne 2 ]]; then
+    add_incident_code "openclaw_node_runtime_incompatible"
+    append_array ERRORS "The OpenClaw CLI is unavailable and no installed Node runtime satisfies $engine_range."
+    append_array ACTIONS "Install a compatible Node runtime or list its executable in OPENCLAW_NODE_CANDIDATES before the next Nurse run."
+    record_remediation "openclaw_node_runtime" "blocked_missing_compatible_runtime" "installed OpenClaw requires $engine_range"
+  fi
   return 1
 }
 
@@ -1999,6 +2105,17 @@ recover_openclaw_node_runtime_after_failure() {
       record_remediation "openclaw_node_runtime" "recovered_after_update_failure" "$OPENCLAW_NODE_BIN version $OPENCLAW_NODE_VERSION satisfies $engine_range"
       return 0
     fi
+  done
+
+  for engine_range in "${engine_ranges[@]}"; do
+    local upgrade_status=0
+    upgrade_apt_node_for_openclaw "$engine_range" || upgrade_status=$?
+    if [[ "$upgrade_status" -eq 0 ]]; then
+      append_array FIXES "Recovered OpenClaw maintenance after the update failure by upgrading the system Node runtime."
+      record_remediation "openclaw_node_runtime" "recovered_after_update_failure" "$OPENCLAW_NODE_BIN version $OPENCLAW_NODE_VERSION satisfies $engine_range"
+      return 0
+    fi
+    [[ "$upgrade_status" -ne 2 ]] || return 2
   done
 
   for engine_range in "${engine_ranges[@]}"; do

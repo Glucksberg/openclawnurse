@@ -74,6 +74,11 @@ Common settings:
 - `OPENCLAW_NODE_CANDIDATES`: optional space-separated Node executables to add
   to automatic discovery (gateway service, PATH, nvm, Volta, user toolchains,
   and common Homebrew locations are already scanned).
+- `AUTO_UPGRADE_APT_NODE_FOR_OPENCLAW`: when no compatible runtime is installed,
+  allows a non-interactive `nodejs` package-only upgrade on Debian/Ubuntu hosts
+  with passwordless `sudo`, but only after the APT candidate is verified against
+  the OpenClaw release's Node engine requirement. Other package managers and
+  unverifiable candidates remain manual.
 - `AUTO_ALIGN_OPENCLAW_USER_PLUGINS`: whether the Nurse should align user-installed
   `@openclaw/*` packages under `~/.openclaw/npm` with the active OpenClaw runtime.
 - `OPENCLAW_PLUGIN_ALIGN_PACKAGES`: `auto` to align every `@openclaw/*`
