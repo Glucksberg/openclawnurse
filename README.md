@@ -60,6 +60,13 @@ Common settings:
 - `RUN_PROFILE`: `light` for the normal daily run, or `heavy` for full doctor/security maintenance.
 - `openclawnurse-heavy`: installed wrapper/trigger key for agents to request the heavy profile explicitly.
 - `AUTO_UPDATE`: whether the Nurse should apply available updates.
+- `AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE`: validates the target release's Node
+  engine before an update, selects a compatible installed runtime, and retries
+  maintenance with it if an update strands the original CLI. If no compatible
+  runtime exists, the update is blocked before package files are changed.
+- `OPENCLAW_NODE_CANDIDATES`: optional space-separated Node executables to add
+  to automatic discovery (gateway service, PATH, nvm, Volta, user toolchains,
+  and common Homebrew locations are already scanned).
 - `OPENCLAW_UPDATE_MODE`: `standard` for the default `openclaw update` flow, or `fork_manager` for hosts that run OpenClaw from a fork-manager production branch.
 - `FORK_MANAGER_REPO_DIR`: local OpenClaw checkout used when `OPENCLAW_UPDATE_MODE=fork_manager`.
 - `FORK_MANAGER_PRODUCTION_BRANCH`: branch to deploy in fork-manager mode, usually `main-with-all-prs`.

@@ -221,6 +221,8 @@ OPENCLAW_UPDATE_MODE="${OPENCLAW_UPDATE_MODE:-standard}"
 UPDATE_CHANNEL="${UPDATE_CHANNEL:-stable}"
 UPDATE_TAG="${UPDATE_TAG:-}"
 UPDATE_TIMEOUT="${UPDATE_TIMEOUT:-900}"
+AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="${AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE:-true}"
+OPENCLAW_NODE_CANDIDATES="${OPENCLAW_NODE_CANDIDATES:-}"
 FORK_MANAGER_REPO_DIR="${FORK_MANAGER_REPO_DIR:-$HOME/openclaw-fork-manager}"
 FORK_MANAGER_PRODUCTION_BRANCH="${FORK_MANAGER_PRODUCTION_BRANCH:-main-with-all-prs}"
 FORK_MANAGER_SYNC_COMMAND="${FORK_MANAGER_SYNC_COMMAND-}"
@@ -612,10 +614,20 @@ build_openclaw_cmd() {
   local name="$1"
   # shellcheck disable=SC2178 # nameref points at an array selected by name.
   local -n ref="$name"
-  ref=("$OPENCLAW_BIN")
+  if [[ -n "${OPENCLAW_NODE_BIN:-}" && -n "${OPENCLAW_NODE_ENTRYPOINT:-}" ]]; then
+    ref=("$OPENCLAW_NODE_BIN" "$OPENCLAW_NODE_ENTRYPOINT")
+  else
+    ref=("$OPENCLAW_BIN")
+  fi
   if [[ -n "$OPENCLAW_PROFILE" ]]; then
     ref+=(--profile "$OPENCLAW_PROFILE")
   fi
+}
+
+openclaw_cli_version() {
+  local cmd
+  build_openclaw_cmd cmd
+  "${cmd[@]}" --version
 }
 
 json_payload_from_output() {
@@ -832,6 +844,7 @@ CURRENT_VERSION_AFTER=""
 AVAILABLE_VERSION=""
 UPDATE_AVAILABLE=0
 CHANNEL_VALUE=""
+UPDATE_INSTALL_KIND=""
 UPDATE_ATTEMPTED=0
 UPDATE_SUCCEEDED=0
 DOCTOR_ATTEMPTED=0
@@ -918,6 +931,10 @@ LOCAL_HOTFIX_COUNT=0
 OPENCLAW_USER_PLUGIN_DRIFT_COUNT=0
 OPENCLAW_USER_PLUGIN_ALIGN_ATTEMPTED=0
 OPENCLAW_USER_PLUGIN_ALIGN_SUCCEEDED=0
+OPENCLAW_NODE_BIN=""
+OPENCLAW_NODE_ENTRYPOINT=""
+OPENCLAW_NODE_ENGINE_RANGE=""
+OPENCLAW_NODE_VERSION=""
 CONFIG_LAST_TOUCHED_VERSION=""
 CONFIG_VERSION_DRIFT=0
 CONFIG_VERSION_DRIFT_FINDING=""
@@ -1533,12 +1550,20 @@ path_is_same_or_inside() {
 
 openclaw_package_root_from_path() {
   local path="$1"
-  local real
+  local real parent
   real="$(canonical_path "$path")"
 
   if [[ -d "$real" && -f "$real/package.json" ]]; then
     if [[ "$(jq -r '.name // empty' "$real/package.json" 2>/dev/null)" == "openclaw" ]]; then
       printf '%s\n' "$real"
+      return 0
+    fi
+  fi
+
+  if [[ -f "$real" ]]; then
+    parent="$(dirname "$real")"
+    if [[ -f "$parent/package.json" && "$(jq -r '.name // empty' "$parent/package.json" 2>/dev/null)" == "openclaw" ]]; then
+      printf '%s\n' "$parent"
       return 0
     fi
   fi
@@ -1562,6 +1587,228 @@ openclaw_package_root_from_path() {
       return 0
     fi
   fi
+}
+
+active_openclaw_package_root() {
+  local path
+  if [[ "$OPENCLAW_BIN" == */* ]]; then
+    path="$OPENCLAW_BIN"
+  else
+    path="$(command -v "$OPENCLAW_BIN" 2>/dev/null || true)"
+  fi
+  [[ -n "$path" ]] || return 1
+  openclaw_package_root_from_path "$path"
+}
+
+active_openclaw_entrypoint() {
+  local root
+  root="$(active_openclaw_package_root || true)"
+  [[ -n "$root" ]] || return 1
+
+  if [[ -f "$root/openclaw.mjs" ]]; then
+    printf '%s\n' "$root/openclaw.mjs"
+    return 0
+  fi
+  if [[ -f "$root/dist/index.js" ]]; then
+    printf '%s\n' "$root/dist/index.js"
+    return 0
+  fi
+  return 1
+}
+
+collect_openclaw_node_candidates() {
+  # shellcheck disable=SC2178 # populated through append_unique_array nameref calls.
+  local -n candidates_ref="$1"
+  local candidate root unit_text exec_start
+
+  for candidate in $OPENCLAW_NODE_CANDIDATES; do
+    [[ -x "$candidate" ]] && append_unique_array candidates_ref "$candidate"
+  done
+
+  if [[ "$RESTART_MODE" == "systemd_user" && -n "$SYSTEMD_UNIT_NAME" ]] && command_exists "$SYSTEMCTL_BIN"; then
+    unit_text="$("$SYSTEMCTL_BIN" --user cat "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
+    exec_start="$(printf '%s\n' "$unit_text" | sed -n 's/^ExecStart=//p' | head -n 1)"
+    candidate="$(printf '%s\n' "$exec_start" | awk '{print $1}' | tr -d '"')"
+    [[ -x "$candidate" && "$(basename "$candidate")" == node ]] && append_unique_array candidates_ref "$candidate"
+  fi
+
+  candidate="$(command -v node 2>/dev/null || true)"
+  [[ -x "$candidate" ]] && append_unique_array candidates_ref "$candidate"
+  while IFS= read -r candidate; do
+    [[ -x "$candidate" ]] && append_unique_array candidates_ref "$candidate"
+  done < <(type -a -P node 2>/dev/null || true)
+
+  for root in "$HOME/.local/toolchains" "$HOME/.nvm/versions/node" "$HOME/.volta/tools/image/node"; do
+    [[ -d "$root" ]] || continue
+    while IFS= read -r candidate; do
+      [[ -x "$candidate" ]] && append_unique_array candidates_ref "$candidate"
+    done < <(find "$root" -maxdepth 5 -type f -path '*/bin/node' -perm -u+x 2>/dev/null | sort -Vr)
+  done
+
+  for root in /home/linuxbrew/.linuxbrew /opt/homebrew /usr/local; do
+    while IFS= read -r candidate; do
+      [[ -x "$candidate" ]] && append_unique_array candidates_ref "$candidate"
+    done < <(compgen -G "$root/opt/node@*/bin/node" 2>/dev/null | sort -Vr || true)
+  done
+}
+
+node_satisfies_engine_range() {
+  local node_bin="$1"
+  local engine_range="$2"
+  local node_dir semver_module
+  node_dir="$(dirname "$node_bin")"
+  semver_module="$node_dir/../lib/node_modules/npm/node_modules/semver"
+  [[ -f "$semver_module/package.json" ]] || return 1
+
+  "$node_bin" -e '
+const semver = require(process.argv[1]);
+process.exit(semver.satisfies(process.versions.node, process.argv[2]) ? 0 : 1);
+' "$semver_module" "$engine_range" >/dev/null 2>&1
+}
+
+select_compatible_openclaw_node() {
+  local engine_range="$1"
+  local entrypoint candidate version output
+  local candidates=()
+
+  entrypoint="$(active_openclaw_entrypoint || true)"
+  [[ -n "$entrypoint" ]] || return 1
+  collect_openclaw_node_candidates candidates
+
+  for candidate in "${candidates[@]}"; do
+    version="$("$candidate" --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1)"
+    [[ -n "$version" ]] || continue
+    node_satisfies_engine_range "$candidate" "$engine_range" || continue
+    output="$("$candidate" "$entrypoint" --version 2>/dev/null || true)"
+    [[ -n "$(printf '%s' "$output" | extract_openclaw_version)" ]] || continue
+
+    OPENCLAW_NODE_BIN="$candidate"
+    OPENCLAW_NODE_ENTRYPOINT="$entrypoint"
+    OPENCLAW_NODE_ENGINE_RANGE="$engine_range"
+    OPENCLAW_NODE_VERSION="$version"
+    return 0
+  done
+  return 1
+}
+
+read_target_openclaw_node_engine() {
+  local root target npm_bin npm_dir output json range candidate
+  local node_candidates=()
+  local npm_candidates=()
+
+  root="$(active_openclaw_package_root || true)"
+  [[ -n "$root" && -f "$root/package.json" ]] || return 1
+  [[ "$(jq -r '.name // empty' "$root/package.json" 2>/dev/null)" == "openclaw" ]] || return 1
+
+  if [[ -n "$UPDATE_TAG" ]]; then
+    target="$UPDATE_TAG"
+  elif [[ -n "$UPDATE_CHANNEL" && "$UPDATE_CHANNEL" != "$CHANNEL_VALUE" ]]; then
+    target="$UPDATE_CHANNEL"
+  else
+    target="${AVAILABLE_VERSION:-$UPDATE_CHANNEL}"
+  fi
+  [[ -n "$target" ]] || return 1
+
+  npm_bin="$(command -v npm 2>/dev/null || true)"
+  [[ -x "$npm_bin" ]] && append_unique_array npm_candidates "$npm_bin"
+  collect_openclaw_node_candidates node_candidates
+  for candidate in "${node_candidates[@]}"; do
+    npm_bin="$(dirname "$candidate")/npm"
+    [[ -x "$npm_bin" ]] && append_unique_array npm_candidates "$npm_bin"
+  done
+
+  for npm_bin in "${npm_candidates[@]}"; do
+    npm_dir="$(dirname "$npm_bin")"
+    output="$(PATH="$npm_dir:$PATH" timeout "${STATUS_TIMEOUT}s" "$npm_bin" view "openclaw@$target" engines.node --json 2>/dev/null || true)"
+    json="$output"
+    range="$(printf '%s' "$json" | jq -r 'if type == "string" then . elif type == "object" then .node // empty else empty end' 2>/dev/null || true)"
+    if [[ -n "$range" && "$range" != "null" ]]; then
+      printf '%s\n' "$range"
+      return 0
+    fi
+  done
+  return 1
+}
+
+prepare_openclaw_node_runtime_for_update() {
+  [[ "$AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE" == "true" ]] || return 0
+  [[ "$OPENCLAW_UPDATE_MODE" == "standard" ]] || return 0
+  [[ -z "$UPDATE_INSTALL_KIND" || "$UPDATE_INSTALL_KIND" == "package" ]] || return 0
+
+  local engine_range current_node
+  engine_range="$(read_target_openclaw_node_engine || true)"
+  if [[ -z "$engine_range" ]]; then
+    log WARN "Could not read target OpenClaw Node engine; post-update runtime recovery remains enabled"
+    return 0
+  fi
+
+  if ! select_compatible_openclaw_node "$engine_range"; then
+    add_incident_code "openclaw_node_runtime_incompatible"
+    append_array ERRORS "OpenClaw ${AVAILABLE_VERSION:-update target} requires Node $engine_range, but no compatible installed Node runtime was found."
+    append_array ACTIONS "Install a compatible Node runtime or list its executable in OPENCLAW_NODE_CANDIDATES; the OpenClaw update was not started."
+    record_remediation "openclaw_node_runtime" "blocked_missing_compatible_runtime" "required $engine_range"
+    return 1
+  fi
+
+  current_node="$(command -v node 2>/dev/null || true)"
+  if [[ "$OPENCLAW_NODE_BIN" != "$current_node" ]]; then
+    append_array FIXES "Selected Node $OPENCLAW_NODE_VERSION at $OPENCLAW_NODE_BIN for OpenClaw update compatibility ($engine_range)."
+    record_remediation "openclaw_node_runtime" "selected" "$OPENCLAW_NODE_BIN version $OPENCLAW_NODE_VERSION satisfies $engine_range"
+  fi
+  return 0
+}
+
+ensure_openclaw_node_runtime() {
+  if openclaw_cli_version >/dev/null 2>&1; then
+    return 0
+  fi
+  [[ "$AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE" == "true" ]] || return 1
+
+  local root engine_range
+  root="$(active_openclaw_package_root || true)"
+  [[ -n "$root" && -f "$root/package.json" ]] || return 1
+  engine_range="$(jq -r '.engines.node // empty' "$root/package.json" 2>/dev/null || true)"
+  [[ -n "$engine_range" ]] || return 1
+
+  if select_compatible_openclaw_node "$engine_range"; then
+    append_array FIXES "Recovered OpenClaw maintenance startup with Node $OPENCLAW_NODE_VERSION at $OPENCLAW_NODE_BIN ($engine_range)."
+    record_remediation "openclaw_node_runtime" "recovered_before_maintenance" "$OPENCLAW_NODE_BIN version $OPENCLAW_NODE_VERSION satisfies $engine_range"
+    return 0
+  fi
+
+  add_incident_code "openclaw_node_runtime_incompatible"
+  append_array ERRORS "The OpenClaw CLI is unavailable and no installed Node runtime satisfies $engine_range."
+  append_array ACTIONS "Install a compatible Node runtime or list its executable in OPENCLAW_NODE_CANDIDATES before the next Nurse run."
+  record_remediation "openclaw_node_runtime" "blocked_missing_compatible_runtime" "installed OpenClaw requires $engine_range"
+  return 1
+}
+
+recover_openclaw_node_runtime_after_failure() {
+  local failure_output="$1"
+  [[ "$AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE" == "true" ]] || return 1
+  if openclaw_cli_version >/dev/null 2>&1 && ! printf '%s' "$failure_output" | grep -Eqi 'requires Node|Node\.js .*required|Detected: node|unsupported.*Node|EBADENGINE'; then
+    return 1
+  fi
+
+  local root engine_range
+  root="$(active_openclaw_package_root || true)"
+  engine_range=""
+  if [[ -n "$root" && -f "$root/package.json" ]]; then
+    engine_range="$(jq -r '.engines.node // empty' "$root/package.json" 2>/dev/null || true)"
+  fi
+  [[ -n "$engine_range" ]] || engine_range="$OPENCLAW_NODE_ENGINE_RANGE"
+  [[ -n "$engine_range" ]] || return 1
+
+  OPENCLAW_NODE_BIN=""
+  OPENCLAW_NODE_ENTRYPOINT=""
+  OPENCLAW_NODE_VERSION=""
+  if ! select_compatible_openclaw_node "$engine_range"; then
+    return 1
+  fi
+
+  append_array FIXES "Recovered OpenClaw maintenance with Node $OPENCLAW_NODE_VERSION at $OPENCLAW_NODE_BIN after the update runtime failed."
+  record_remediation "openclaw_node_runtime" "recovered_after_update_failure" "$OPENCLAW_NODE_BIN version $OPENCLAW_NODE_VERSION satisfies $engine_range"
+  return 0
 }
 
 openclaw_local_package_root_for_bin_path() {
@@ -1652,7 +1899,7 @@ detect_config_version_drift() {
   local current_version="$CURRENT_VERSION_AFTER"
   [[ -n "$current_version" ]] || current_version="$CURRENT_VERSION_BEFORE"
   if [[ -z "$current_version" ]]; then
-    current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+    current_version="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
   fi
   [[ -n "$current_version" ]] || return 0
 
@@ -1678,7 +1925,7 @@ mark_config_version_drift_remediated_if_current() {
 
   local current_version="$CURRENT_VERSION_AFTER"
   if [[ -z "$current_version" ]]; then
-    current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+    current_version="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
   fi
   [[ -n "$current_version" ]] || return 0
   version_less "$current_version" "$CONFIG_LAST_TOUCHED_VERSION" && return 0
@@ -1736,7 +1983,7 @@ scan_openclaw_user_plugin_versions() {
   local current_version="$CURRENT_VERSION_AFTER"
   [[ -n "$current_version" ]] || current_version="$CURRENT_VERSION_BEFORE"
   if [[ -z "$current_version" ]]; then
-    current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+    current_version="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
   fi
   [[ -n "$current_version" ]] || return 0
 
@@ -1773,6 +2020,27 @@ scan_openclaw_user_plugin_versions() {
   OPENCLAW_USER_PLUGINS_SUMMARY="$(printf '%s\n' "${summary_lines[@]}" | paste -sd ';' - 2>/dev/null || printf '%s\n' "${summary_lines[@]}")"
 }
 
+build_openclaw_npm_cmd() {
+  local name="$1"
+  # shellcheck disable=SC2178 # nameref points at an array selected by name.
+  local -n ref="$name"
+  local npm_bin node_dir
+
+  if [[ -n "$OPENCLAW_NODE_BIN" ]]; then
+    node_dir="$(dirname "$OPENCLAW_NODE_BIN")"
+    npm_bin="$node_dir/npm"
+    if [[ -x "$npm_bin" ]]; then
+      ref=(env "PATH=$node_dir:$PATH" "$npm_bin")
+      return 0
+    fi
+  fi
+  if command_exists npm; then
+    ref=(npm)
+    return 0
+  fi
+  return 1
+}
+
 align_openclaw_user_plugins() {
   [[ "$AUTO_ALIGN_OPENCLAW_USER_PLUGINS" == "true" ]] || return 0
   [[ "$OPENCLAW_UPDATE_MODE" != "fork_manager" ]] || return 0
@@ -1781,7 +2049,7 @@ align_openclaw_user_plugins() {
   local target_version="$CURRENT_VERSION_AFTER"
   [[ -n "$target_version" ]] || target_version="$CURRENT_VERSION_BEFORE"
   if [[ -z "$target_version" ]]; then
-    target_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+    target_version="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
   fi
   [[ -n "$target_version" ]] || return 0
 
@@ -1806,7 +2074,8 @@ align_openclaw_user_plugins() {
     return 0
   fi
 
-  if ! command_exists npm; then
+  local npm_cmd
+  if ! build_openclaw_npm_cmd npm_cmd; then
     append_array ERRORS "Cannot align OpenClaw user plugins because npm is missing."
     append_array ACTIONS "Install npm or align $OPENCLAW_USER_NPM_DIR dependencies manually."
     record_remediation "openclaw_user_plugin_drift" "blocked_missing_npm" "npm not found"
@@ -1815,7 +2084,7 @@ align_openclaw_user_plugins() {
 
   local output status
   run_capture_with_heartbeat output status "Aligning OpenClaw user plugins to $target_version" 30 \
-    timeout "${OPENCLAW_PLUGIN_ALIGN_TIMEOUT}s" npm --prefix "$OPENCLAW_USER_NPM_DIR" install --save-exact "${specs[@]}"
+    timeout "${OPENCLAW_PLUGIN_ALIGN_TIMEOUT}s" "${npm_cmd[@]}" --prefix "$OPENCLAW_USER_NPM_DIR" install --save-exact "${specs[@]}"
 
   if [[ "$status" -eq 0 ]]; then
     OPENCLAW_USER_PLUGIN_ALIGN_SUCCEEDED=1
@@ -2073,7 +2342,7 @@ maybe_auto_remediate_openclaw_installations() {
   local current_version="$CURRENT_VERSION_AFTER"
   [[ -n "$current_version" ]] || current_version="$CURRENT_VERSION_BEFORE"
   if [[ -z "$current_version" && -x "$OPENCLAW_BIN" ]]; then
-    current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+    current_version="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
   fi
   [[ -n "$current_version" ]] || return 0
 
@@ -2214,7 +2483,7 @@ run_runtime_sanity() {
   current_version="$CURRENT_VERSION_AFTER"
   [[ -n "$current_version" ]] || current_version="$CURRENT_VERSION_BEFORE"
   if [[ -z "$current_version" ]]; then
-    current_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+    current_version="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
   fi
 
   local paths=()
@@ -2905,6 +3174,12 @@ run_self_test() {
     printf 'Reason: preflight checks failed\n'
     printf 'Errors:\n'
     printf -- '- %s\n' "${ERRORS[@]}"
+    return 1
+  fi
+
+  if ! ensure_openclaw_node_runtime; then
+    printf 'SELF_TEST=FAILED\n'
+    printf 'Reason: no compatible Node runtime can execute OpenClaw\n'
     return 1
   fi
 
@@ -3889,7 +4164,7 @@ fork_manager_validate_runtime_source() {
 
 run_fork_manager_update_status() {
   fork_manager_load_deployed_revision
-  CURRENT_VERSION_BEFORE="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+  CURRENT_VERSION_BEFORE="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
   CURRENT_VERSION_AFTER="$CURRENT_VERSION_BEFORE"
   CHANNEL_VALUE="fork_manager:$FORK_MANAGER_PRODUCTION_BRANCH"
   UPDATE_AVAILABLE=0
@@ -4017,7 +4292,7 @@ run_fork_manager_update() {
   UPDATE_SUCCEEDED=1
   UPDATE_AVAILABLE=0
   CONSECUTIVE_FAILURES=0
-  CURRENT_VERSION_AFTER="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+  CURRENT_VERSION_AFTER="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
   [[ -n "$CURRENT_VERSION_AFTER" ]] || CURRENT_VERSION_AFTER="$AVAILABLE_VERSION"
   FORK_MANAGER_UPDATE_SUMMARY="deployed $FORK_MANAGER_PRODUCTION_BRANCH ${FORK_MANAGER_PRODUCTION_REVISION:0:12}"
   append_array FIXES "Deployed OpenClaw fork-manager production branch $FORK_MANAGER_PRODUCTION_BRANCH at ${FORK_MANAGER_PRODUCTION_REVISION:0:12}."
@@ -4051,7 +4326,7 @@ run_update_status() {
     return 1
   fi
 
-  CURRENT_VERSION_BEFORE="$("$OPENCLAW_BIN" --version 2>/dev/null | sed -E 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/' | head -n 1)"
+  CURRENT_VERSION_BEFORE="$(openclaw_cli_version 2>/dev/null | sed -E 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/' | head -n 1)"
   CURRENT_VERSION_AFTER="$CURRENT_VERSION_BEFORE"
   UPDATE_AVAILABLE=0
   if printf '%s' "$json_output" | jq -e '.availability.available == true' >/dev/null 2>&1; then
@@ -4061,6 +4336,7 @@ run_update_status() {
     AVAILABLE_VERSION="$(printf '%s' "$json_output" | jq -r '.availability.latestVersion // .update.registry.latestVersion // empty')"
   fi
   CHANNEL_VALUE="$(printf '%s' "$json_output" | jq -r '.channel.value // empty')"
+  UPDATE_INSTALL_KIND="$(printf '%s' "$json_output" | jq -r '.update.installKind // empty')"
   return 0
 }
 
@@ -4132,6 +4408,20 @@ classify_update_failure() {
   append_array ACTIONS "Run openclaw update manually after reviewing the error output."
 }
 
+build_openclaw_update_cmd() {
+  local name="$1"
+  # shellcheck disable=SC2178 # nameref points at an array selected by name.
+  local -n ref="$name"
+  build_openclaw_cmd "$name"
+  ref+=(update --json --yes --no-restart --timeout "$UPDATE_TIMEOUT")
+
+  if [[ -n "$UPDATE_TAG" ]]; then
+    ref+=(--tag "$UPDATE_TAG")
+  elif [[ -n "$UPDATE_CHANNEL" && "$UPDATE_CHANNEL" != "$CHANNEL_VALUE" ]]; then
+    ref+=(--channel "$UPDATE_CHANNEL")
+  fi
+}
+
 run_update() {
   if [[ "$OPENCLAW_UPDATE_MODE" == "fork_manager" ]]; then
     run_fork_manager_update
@@ -4146,15 +4436,8 @@ run_update() {
     return 0
   fi
 
-  local cmd=("$OPENCLAW_BIN")
-  [[ -n "$OPENCLAW_PROFILE" ]] && cmd+=(--profile "$OPENCLAW_PROFILE")
-  cmd+=(update --json --yes --no-restart --timeout "$UPDATE_TIMEOUT")
-
-  if [[ -n "$UPDATE_TAG" ]]; then
-    cmd+=(--tag "$UPDATE_TAG")
-  elif [[ -n "$UPDATE_CHANNEL" && "$UPDATE_CHANNEL" != "$CHANNEL_VALUE" ]]; then
-    cmd+=(--channel "$UPDATE_CHANNEL")
-  fi
+  local cmd
+  build_openclaw_update_cmd cmd
 
   local output status
   run_capture_with_heartbeat output status "Applying update" 30 "${cmd[@]}"
@@ -4163,7 +4446,7 @@ run_update() {
   if [[ "$status" -eq 0 ]]; then
     UPDATE_SUCCEEDED=1
     CONSECUTIVE_FAILURES=0
-    CURRENT_VERSION_AFTER="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+    CURRENT_VERSION_AFTER="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
     [[ -n "$CURRENT_VERSION_AFTER" ]] || CURRENT_VERSION_AFTER="${AVAILABLE_VERSION:-$CONFIG_LAST_TOUCHED_VERSION}"
     append_array FIXES "OpenClaw update completed successfully."
     if [[ "$CONFIG_VERSION_DRIFT" -eq 1 ]]; then
@@ -4174,6 +4457,7 @@ run_update() {
   fi
 
   UPDATE_ERROR="$output"
+  recover_openclaw_node_runtime_after_failure "$output" || true
 
   # shellcheck disable=SC2034 # run_capture_with_heartbeat writes the captured output by nameref.
   local doctor_repair_output
@@ -4188,6 +4472,7 @@ run_update() {
     append_array FIXES "Doctor repair completed before the update retry."
   fi
 
+  build_openclaw_update_cmd cmd
   run_capture_with_heartbeat output status "Retrying update after repair" 30 "${cmd[@]}"
   UPDATE_OUTPUT="${UPDATE_OUTPUT}"$'\n\n--- retry ---\n'"${output}"
 
@@ -4195,7 +4480,7 @@ run_update() {
     UPDATE_SUCCEEDED=1
     CONSECUTIVE_FAILURES=0
     UPDATE_ERROR=""
-    CURRENT_VERSION_AFTER="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+    CURRENT_VERSION_AFTER="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
     [[ -n "$CURRENT_VERSION_AFTER" ]] || CURRENT_VERSION_AFTER="${AVAILABLE_VERSION:-$CONFIG_LAST_TOUCHED_VERSION}"
     append_array FIXES "OpenClaw update failed on the first attempt, then succeeded after doctor repair."
     if [[ "$CONFIG_VERSION_DRIFT" -eq 1 ]]; then
@@ -4220,7 +4505,7 @@ refresh_stale_gateway_service() {
   command_exists "$SYSTEMCTL_BIN" || return 0
 
   local active_version="$CURRENT_VERSION_AFTER"
-  [[ -n "$active_version" ]] || active_version="$("$OPENCLAW_BIN" --version 2>/dev/null | extract_openclaw_version)"
+  [[ -n "$active_version" ]] || active_version="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
   [[ -n "$active_version" ]] || return 0
 
   local unit_text service_version output status
@@ -4615,7 +4900,7 @@ diag_shell_capture() {
 
 collect_diagnostics() {
   local version process_snapshot disk_snapshot mem_snapshot config_error gateway_log gateway_err openclaw_status
-  version="$(diag_capture 5 "$OPENCLAW_BIN" --version)"
+  version="$(openclaw_cli_version 2>/dev/null || true)"
   process_snapshot="$(diag_shell_capture 5 "ps -eo pid,pcpu,pmem,args 2>/dev/null | grep -i '[o]penclaw' | head -5")"
   disk_snapshot="$(diag_shell_capture 5 "df -h \"${OPENCLAW_STATE_HOME}\" 2>/dev/null | tail -1 || df -h / | tail -1")"
   mem_snapshot="$(diag_shell_capture 5 "free -h 2>/dev/null | awk '/Mem:/{print \$3\"/\"\$2}'")"
@@ -4924,6 +5209,21 @@ finalize_status() {
   STATUS="OK"
 }
 
+persist_startup_failure() {
+  local start_epoch="$1"
+  local report
+  STATUS="FAILED"
+  DURATION_SECONDS=$(( $(date +%s) - start_epoch ))
+  report="$(build_report)"
+  if command_exists jq; then
+    persist_json "$report"
+    persist_pending_report "$report"
+  else
+    log ERROR "jq is unavailable; skipping JSON persistence for the failed startup report"
+    printf '%s\n' "$report"
+  fi
+}
+
 main() {
   local start_epoch
   start_epoch="$(date +%s)"
@@ -4960,17 +5260,12 @@ main() {
   maybe_self_update || true
 
   if ! run_preflight_checks; then
-    STATUS="FAILED"
-    DURATION_SECONDS=$(( $(date +%s) - start_epoch ))
-    local preflight_report
-    preflight_report="$(build_report)"
-    if command_exists jq; then
-      persist_json "$preflight_report"
-      persist_pending_report "$preflight_report"
-    else
-      log ERROR "jq is unavailable; skipping JSON persistence for the failed preflight report"
-      printf '%s\n' "$preflight_report"
-    fi
+    persist_startup_failure "$start_epoch"
+    exit 1
+  fi
+
+  if ! ensure_openclaw_node_runtime; then
+    persist_startup_failure "$start_epoch"
     exit 1
   fi
 
@@ -4995,7 +5290,9 @@ main() {
   run_cron_sanity || true
 
   if should_attempt_update; then
-    run_update || true
+    if prepare_openclaw_node_runtime_for_update; then
+      run_update || true
+    fi
   fi
   if [[ "$UPDATE_SUCCEEDED" -eq 1 ]]; then
     align_openclaw_user_plugins || true
