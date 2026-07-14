@@ -63,8 +63,11 @@ Common settings:
 - `AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE`: validates the target release's Node
   engine before an update, selects a compatible installed runtime for the CLI
   and its child processes, and retries maintenance with it if an update strands
-  the original CLI. If the target engine cannot be verified or no compatible
-  runtime exists, the update is blocked before package files are changed.
+  the original CLI. Runtime probes are bounded and must return a valid version;
+  recovery keeps the target release's engine constraint instead of falling back
+  to the old runtime. If metadata cannot be verified, no compatible runtime
+  exists, or the CLI package itself is broken, the Nurse blocks mutation and
+  reports the distinct cause.
 - `OPENCLAW_NODE_CANDIDATES`: optional space-separated Node executables to add
   to automatic discovery (gateway service, PATH, nvm, Volta, user toolchains,
   and common Homebrew locations are already scanned).

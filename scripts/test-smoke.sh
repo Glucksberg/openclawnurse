@@ -120,10 +120,27 @@ if [[ "\${1:-}" == "--version" ]]; then
   exit 0
 fi
 if [[ "\${1:-}" == "-e" ]]; then
+  if [[ "$engine_status" == "broad-only" ]]; then
+    [[ "\${4:-}" == ">=22" ]] && exit 0
+    exit 1
+  fi
   exit $engine_status
 fi
 export FAKE_NODE_VERSION="$version"
 exec "\$@"
+EOF
+  chmod +x "$root/bin/node"
+}
+
+make_hanging_node_runtime() {
+  local root="$1"
+  mkdir -p "$root/bin"
+  cat >"$root/bin/node" <<'EOF'
+#!/usr/bin/env bash
+trap '' TERM
+while true; do
+  sleep 1
+done
 EOF
   chmod +x "$root/bin/node"
 }
@@ -1453,25 +1470,40 @@ EOF
   chmod +x "$tmp/node_modules/openclaw/openclaw.mjs"
   ln -s ../openclaw/openclaw.mjs "$tmp/node_modules/.bin/openclaw"
   printf '">=24.15.0 <25"\n' >"$tmp/engine"
+  : >"$tmp/reject-primary-npm"
   cat >"$tmp/bin/npm" <<EOF
 #!/usr/bin/env bash
+if [[ -f "$tmp/reject-primary-npm" ]]; then
+  cat "$tmp/engine"
+  exit 1
+fi
 cat "$tmp/engine"
 EOF
   chmod +x "$tmp/bin/npm"
+  make_hanging_node_runtime "$tmp/node-hang"
   make_fake_node_runtime "$tmp/node25" "25.8.2" 1
   make_fake_node_runtime "$tmp/node24" "24.18.0" 0
+  rm -rf "$tmp/node24/lib/node_modules/npm/node_modules/semver"
+  cat >"$tmp/node24/bin/npm" <<EOF
+#!/usr/bin/env bash
+printf 'fallback\n' >"$tmp/npm-fallback-used"
+cat "$tmp/engine"
+EOF
+  chmod +x "$tmp/node24/bin/npm"
   cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
 {"gateway":{"port":18789}}
 EOF
   cat >"$tmp/cfg/openclawnurse.env" <<EOF
 EXTRA_PATH="$tmp/bin"
 OPENCLAW_BIN="$tmp/node_modules/.bin/openclaw"
-OPENCLAW_NODE_CANDIDATES="$tmp/node25/bin/node $tmp/node24/bin/node"
+OPENCLAW_NODE_CANDIDATES="$tmp/node-hang/bin/node $tmp/node25/bin/node $tmp/node24/bin/node"
 AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="true"
 STATE_DIR="$tmp/state"
+STATUS_TIMEOUT="1"
 REPORT_CHANNEL="none"
 AUTO_UPDATE="true"
 AUTO_ALIGN_OPENCLAW_USER_PLUGINS="false"
+AUTO_RESTART_UNHEALTHY_GATEWAY="false"
 ENABLE_RUNTIME_SANITY="false"
 ENABLE_TELEGRAM_SANITY="false"
 ENABLE_GATEWAY_LOG_SCAN="false"
@@ -1482,7 +1514,7 @@ ENABLE_DISK_SANITY="false"
 ENABLE_CRON_SANITY="false"
 CONFIG_BACKUP_ENABLED="false"
 RESTART_MODE="custom"
-RESTART_COMMAND="true"
+RESTART_COMMAND="command -v node > $tmp/restart-child-node"
 EOF
 
   PATH="$tmp/bin:$PATH" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
@@ -1493,6 +1525,10 @@ EOF
     fail "update subprocess PATH did not prefer the compatible Node candidate"
   [[ "$(cat "$tmp/update-child-node-version")" == "v24.18.0" ]] ||
     fail "update subprocess did not execute with the compatible Node candidate"
+  [[ "$(cat "$tmp/restart-child-node")" == "$tmp/node24/bin/node" ]] ||
+    fail "custom restart command did not inherit the compatible Node candidate"
+  [[ -f "$tmp/npm-fallback-used" ]] ||
+    fail "target engine discovery trusted output from a failed npm probe"
   "$JQ_BIN" -e '
     .status == "UPDATED"
     and .updateSucceeded == true
@@ -1501,6 +1537,7 @@ EOF
   ' "$tmp/state/doctor-state.json" >/dev/null ||
     fail "compatible Node runtime selection was not reported"
 
+  rm -f "$tmp/reject-primary-npm"
   printf '">=99"\n' >"$tmp/engine"
   printf '2026.1.0\n' >"$tmp/version"
   rm -f "$tmp/update-node"
@@ -1603,6 +1640,7 @@ STATE_DIR="$tmp/state"
 REPORT_CHANNEL="none"
 AUTO_UPDATE="true"
 AUTO_ALIGN_OPENCLAW_USER_PLUGINS="false"
+AUTO_RESTART_UNHEALTHY_GATEWAY="false"
 ENABLE_RUNTIME_SANITY="false"
 ENABLE_TELEGRAM_SANITY="false"
 ENABLE_GATEWAY_LOG_SCAN="false"
@@ -1657,9 +1695,10 @@ EOF
   cat >"$tmp/node_modules/openclaw/openclaw.mjs" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--version" ]]; then
-  sleep 30
-  printf 'OpenClaw 2026.1.0\n'
-  exit 0
+  trap '' TERM
+  while true; do
+    sleep 1
+  done
 fi
 printf '{}\n'
 EOF
@@ -1735,6 +1774,277 @@ EOF
     fail "bounded startup runtime failure was not persisted as delivered"
 
   pass "startup runtime probes are bounded and failures are notified"
+}
+
+smoke_cli_failure_is_not_misdiagnosed_as_node() {
+  local tmp status
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/cli-failure-classification.XXXXXX")"
+
+  mkdir -p "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw" \
+    "$tmp/node_modules/openclaw" "$tmp/node_modules/.bin"
+  cat >"$tmp/node_modules/openclaw/package.json" <<'EOF'
+{"name":"openclaw","version":"2026.1.0","engines":{"node":">=22"}}
+EOF
+  cat >"$tmp/node_modules/openclaw/openclaw.mjs" <<'EOF'
+#!/usr/bin/env bash
+printf 'OpenClaw 2026.1.0\n'
+printf 'Error: Cannot find module openclaw/dist/missing.js\n' >&2
+exit 42
+EOF
+  chmod +x "$tmp/node_modules/openclaw/openclaw.mjs"
+  ln -s ../openclaw/openclaw.mjs "$tmp/node_modules/.bin/openclaw"
+  make_fake_node_runtime "$tmp/node24" "24.18.0" 0
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"gateway":{"port":18789}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/node_modules/.bin/openclaw"
+OPENCLAW_NODE_CANDIDATES="$tmp/node24/bin/node"
+AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="true"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+RESTART_COMMAND="true"
+EOF
+
+  set +e
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+  status=$?
+  set -e
+  [[ "$status" -eq 1 ]] || fail "corrupt OpenClaw CLI did not fail startup"
+  "$JQ_BIN" -e '
+    .status == "FAILED"
+    and any(.incidentCodes[]; . == "openclaw_cli_unavailable")
+    and all(.incidentCodes[]; . != "openclaw_node_runtime_incompatible")
+    and any(.remediations[]; .code == "openclaw_node_runtime" and .result == "blocked_cli_unavailable")
+    and any(.actions[]; contains("repair or reinstall"))
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "corrupt OpenClaw CLI was misdiagnosed as a Node incompatibility"
+
+  sed \
+    -e "s|STATE_DIR=\"$tmp/state\"|STATE_DIR=\"$tmp/disabled-state\"|" \
+    -e 's|AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="true"|AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="false"|' \
+    "$tmp/cfg/openclawnurse.env" >"$tmp/cfg/disabled.env"
+  set +e
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/disabled.env" --no-notify >/dev/null
+  status=$?
+  set -e
+  [[ "$status" -eq 1 ]] || fail "disabled runtime selection did not report unavailable CLI"
+  "$JQ_BIN" -e '
+    .status == "FAILED"
+    and any(.errors[]; contains("automatic compatible-Node selection is disabled"))
+    and any(.remediations[]; .code == "openclaw_node_runtime" and .result == "blocked_selection_disabled")
+  ' "$tmp/disabled-state/doctor-state.json" >/dev/null ||
+    fail "disabled runtime selection produced an empty startup report"
+
+  pass "CLI corruption and disabled selection are reported accurately"
+}
+
+smoke_runtime_recovery_uses_effective_systemd_execstart() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/runtime-systemd-root.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw" \
+    "$tmp/node_modules/openclaw/dist"
+  cat >"$tmp/node_modules/openclaw/package.json" <<'EOF'
+{"name":"openclaw","version":"2026.1.0","engines":{"node":">=24.15.0 <25"}}
+EOF
+  cat >"$tmp/node_modules/openclaw/openclaw.mjs" <<EOF
+#!/usr/bin/env bash
+if [[ "\${FAKE_NODE_VERSION:-}" != "24.18.0" ]]; then
+  printf 'openclaw requires Node >=24.15.0 <25; Detected: node 25.8.2\\n' >&2
+  exit 1
+fi
+if [[ "\${1:-}" == "--profile" ]]; then shift 2; fi
+case "\${1:-}" in
+  --version) printf 'OpenClaw 2026.1.0\\n' ;;
+  update) printf '{"availability":{"available":false,"latestVersion":"2026.1.0"},"update":{"installKind":"package","registry":{"latestVersion":"2026.1.0"}},"channel":{"value":"stable"}}\\n' ;;
+  doctor) printf 'doctor complete\\n' ;;
+  health) printf '{"ok":true}\\n' ;;
+  status) printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\\n' ;;
+  *) printf '{}\\n' ;;
+esac
+EOF
+  chmod +x "$tmp/node_modules/openclaw/openclaw.mjs"
+  : >"$tmp/node_modules/openclaw/dist/index.js"
+  make_fake_node_runtime "$tmp/node25" "25.8.2" 1
+  make_fake_node_runtime "$tmp/node24" "24.18.0" 0
+  cat >"$tmp/bin/openclaw-wrapper" <<EOF
+#!/usr/bin/env bash
+exec "$tmp/node25/bin/node" "$tmp/node_modules/openclaw/openclaw.mjs" "\$@"
+EOF
+  chmod +x "$tmp/bin/openclaw-wrapper"
+  cat >"$tmp/bin/systemctl" <<EOF
+#!/usr/bin/env bash
+if [[ "\${2:-}" == "cat" ]]; then
+  printf '[Service]\\n'
+  printf 'ExecStart=$tmp/node25/bin/node /old/openclaw/dist/index.js gateway\\n'
+  printf 'ExecStart=\\n'
+  printf 'ExecStart=$tmp/node24/bin/node $tmp/node_modules/openclaw/dist/index.js gateway\\n'
+fi
+exit 0
+EOF
+  chmod +x "$tmp/bin/systemctl"
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"gateway":{"port":18789}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+EXTRA_PATH="$tmp/bin"
+OPENCLAW_BIN="$tmp/bin/openclaw-wrapper"
+AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="true"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="false"
+SYSTEMCTL_BIN="$tmp/bin/systemctl"
+SYSTEMD_UNIT_NAME="openclaw-gateway.service"
+RESTART_MODE="systemd_user"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+EOF
+
+  PATH="$tmp/bin:$PATH" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+  "$JQ_BIN" -e '
+    any(.remediations[]; .code == "openclaw_node_runtime" and .result == "recovered_before_maintenance")
+    and any(.fixes[]; contains("Node 24.18.0"))
+    and all(.incidentCodes[]; . != "openclaw_node_runtime_incompatible")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "opaque launcher did not recover from the effective systemd ExecStart"
+
+  pass "runtime recovery uses the effective systemd ExecStart package root"
+}
+
+smoke_update_recovery_preserves_target_engine() {
+  local tmp status
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/runtime-target-recovery.XXXXXX")"
+
+  mkdir -p "$tmp/bin" "$tmp/state" "$tmp/cfg" "$tmp/home/.openclaw" \
+    "$tmp/node_modules/openclaw" "$tmp/node_modules/.bin"
+  printf '2026.1.0\n' >"$tmp/version"
+  printf '0\n' >"$tmp/update-attempts"
+  printf '">=24.15.0 <25"\n' >"$tmp/target-engine"
+  cat >"$tmp/node_modules/openclaw/package.json" <<'EOF'
+{"name":"openclaw","version":"2026.1.0","engines":{"node":">=22"}}
+EOF
+  cat >"$tmp/node_modules/openclaw/openclaw.mjs" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--profile" ]]; then shift 2; fi
+case "\${1:-}" in
+  --version)
+    printf 'OpenClaw %s\\n' "\$(cat "$tmp/version")"
+    ;;
+  update)
+    if [[ "\${2:-}" == "status" ]]; then
+      printf '{"availability":{"available":true,"latestVersion":"2026.1.1"},"update":{"installKind":"package","registry":{"latestVersion":"2026.1.1"}},"channel":{"value":"stable"}}\\n'
+    else
+      attempts="\$(cat "$tmp/update-attempts")"
+      attempts=\$((attempts + 1))
+      printf '%s\\n' "\$attempts" >"$tmp/update-attempts"
+      if [[ "\$attempts" -eq 1 ]]; then
+        if [[ -f "$tmp/remove-target-runtime" ]]; then
+          chmod -x "$tmp/node24/bin/node"
+        fi
+        printf 'npm ERR! code EBADENGINE\\n' >&2
+        exit 1
+      fi
+      printf '%s\\n' "\${FAKE_NODE_VERSION:-wrapper}" >"$tmp/retry-node"
+      printf '2026.1.1\\n' >"$tmp/version"
+      printf '{"ok":true}\\n'
+    fi
+    ;;
+  doctor) printf 'doctor complete\\n' ;;
+  health) printf '{"ok":true}\\n' ;;
+  status) printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":1},"tasks":{},"taskAudit":{}}\\n' ;;
+  *) printf '{}\\n' ;;
+esac
+EOF
+  chmod +x "$tmp/node_modules/openclaw/openclaw.mjs"
+  ln -s ../openclaw/openclaw.mjs "$tmp/node_modules/.bin/openclaw"
+  cat >"$tmp/bin/npm" <<EOF
+#!/usr/bin/env bash
+cat "$tmp/target-engine"
+EOF
+  chmod +x "$tmp/bin/npm"
+  make_fake_node_runtime "$tmp/node25" "25.8.2" "broad-only"
+  make_fake_node_runtime "$tmp/node24" "24.18.0" 0
+  cat >"$tmp/home/.openclaw/openclaw.json" <<'EOF'
+{"gateway":{"port":18789}}
+EOF
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+EXTRA_PATH="$tmp/bin"
+OPENCLAW_BIN="$tmp/node_modules/.bin/openclaw"
+OPENCLAW_NODE_CANDIDATES="$tmp/node25/bin/node $tmp/node24/bin/node"
+AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="true"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="none"
+AUTO_UPDATE="true"
+AUTO_ALIGN_OPENCLAW_USER_PLUGINS="false"
+AUTO_RESTART_UNHEALTHY_GATEWAY="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+RESTART_COMMAND="true"
+EOF
+
+  PATH="$tmp/bin:$PATH" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --no-notify >/dev/null
+  [[ "$(cat "$tmp/retry-node")" == "24.18.0" ]] ||
+    fail "EBADENGINE recovery abandoned the target-compatible Node runtime"
+  "$JQ_BIN" -e '
+    .status == "UPDATED"
+    and .updateSucceeded == true
+    and any(.remediations[]; .code == "openclaw_node_runtime" and .result == "recovered_after_update_failure")
+  ' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "target-compatible runtime recovery was not reported"
+
+  printf '2026.1.0\n' >"$tmp/version"
+  printf '0\n' >"$tmp/update-attempts"
+  : >"$tmp/remove-target-runtime"
+  rm -f "$tmp/retry-node"
+  chmod +x "$tmp/node24/bin/node"
+  sed "s|STATE_DIR=\"$tmp/state\"|STATE_DIR=\"$tmp/missing-target-state\"|" \
+    "$tmp/cfg/openclawnurse.env" >"$tmp/cfg/missing-target.env"
+
+  set +e
+  PATH="$tmp/bin:$PATH" HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" \
+    --config "$tmp/cfg/missing-target.env" --no-notify >/dev/null
+  status=$?
+  set -e
+  [[ "$status" -eq 0 ]] || fail "runtime recovery failure caused an unexpected process exit"
+  [[ "$(cat "$tmp/update-attempts")" == "1" ]] ||
+    fail "update retried with a runtime that only satisfied the installed package"
+  [[ ! -f "$tmp/retry-node" ]] ||
+    fail "update abandoned the target engine requirement during recovery"
+  "$JQ_BIN" -e '
+    .status == "FAILED"
+    and .updateSucceeded == false
+    and any(.errors[]; contains("runtime recovery could not make the installed CLI executable"))
+  ' "$tmp/missing-target-state/doctor-state.json" >/dev/null ||
+    fail "missing target-compatible runtime was not reported after the failed update"
+
+  pass "update recovery preserves the target Node engine requirement"
 }
 
 smoke_gateway_env_file_feeds_openclaw_commands() {
@@ -2913,6 +3223,9 @@ main() {
   smoke_update_selects_compatible_node_runtime
   smoke_update_recovers_after_node_runtime_failure
   smoke_startup_runtime_failure_is_bounded_and_notified
+  smoke_cli_failure_is_not_misdiagnosed_as_node
+  smoke_runtime_recovery_uses_effective_systemd_execstart
+  smoke_update_recovery_preserves_target_engine
   smoke_gateway_env_file_feeds_openclaw_commands
   smoke_gateway_refresh_failure_skips_restart
   smoke_gateway_log_scan_reports_oom
