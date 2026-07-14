@@ -64,7 +64,10 @@ Common settings:
   engine before an update, selects a compatible installed runtime for the CLI
   and its child processes, and retries maintenance with it if an update strands
   the original CLI. Runtime probes are bounded and must return a valid version;
-  recovery keeps the target release's engine constraint instead of falling back
+  selected executables are exposed as `node` even when they use names such as
+  `node24`, and successful updates must pass a fresh CLI validation before any
+  gateway restart. Removed or relocated package entrypoints are rediscovered.
+  Recovery keeps the target release's engine constraint instead of falling back
   to the old runtime. If metadata cannot be verified, no compatible runtime
   exists, or the CLI package itself is broken, the Nurse blocks mutation and
   reports the distinct cause.
