@@ -222,6 +222,7 @@ UPDATE_TAG="${UPDATE_TAG:-}"
 UPDATE_TIMEOUT="${UPDATE_TIMEOUT:-900}"
 AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="${AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE:-true}"
 OPENCLAW_NODE_CANDIDATES="${OPENCLAW_NODE_CANDIDATES:-}"
+OPENCLAW_NODE_CANDIDATES_ONLY="${OPENCLAW_NODE_CANDIDATES_ONLY:-false}"
 AUTO_UPGRADE_APT_NODE_FOR_OPENCLAW="${AUTO_UPGRADE_APT_NODE_FOR_OPENCLAW:-true}"
 APT_NODE_UPGRADE_TIMEOUT="${APT_NODE_UPGRADE_TIMEOUT:-600}"
 AUTO_SELF_UPDATE="${AUTO_SELF_UPDATE:-false}"
@@ -1680,6 +1681,8 @@ collect_openclaw_node_candidates() {
   for candidate in $OPENCLAW_NODE_CANDIDATES; do
     [[ -x "$candidate" ]] && append_unique_array candidates_ref "$candidate"
   done
+
+  [[ "$OPENCLAW_NODE_CANDIDATES_ONLY" == "true" ]] && return 0
 
   while IFS= read -r candidate; do
     [[ -x "$candidate" && "$(basename "$candidate")" == node ]] && append_unique_array candidates_ref "$candidate"
@@ -3941,7 +3944,9 @@ validate_self_update_tree() {
   fi
 
   if [[ "$SELF_UPDATE_RUN_TESTS" == "true" && -x "$tree/scripts/test-smoke.sh" ]]; then
-    self_update_capture output status "Running OpenClawNurse smoke tests for self-update target" "$tree/scripts/test-smoke.sh"
+    self_update_capture output status "Running OpenClawNurse smoke tests for self-update target" \
+      env AUTO_SELF_UPDATE=false SELF_UPDATE_POST_SELF_TEST=false \
+      "$tree/scripts/test-smoke.sh"
     if [[ "$status" -ne 0 ]]; then
       printf '%s\n' "$output"
       return 1

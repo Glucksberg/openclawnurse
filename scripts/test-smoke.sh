@@ -43,6 +43,10 @@ terminate_smoke_tmp() {
 trap cleanup_smoke_tmp EXIT
 trap terminate_smoke_tmp HUP INT TERM
 export RUN_PROFILE=heavy
+# A smoke fixture may invoke a full maintenance run. Never let a test launched
+# by self-update validation recursively start another self-update validation.
+export AUTO_SELF_UPDATE=false
+export SELF_UPDATE_POST_SELF_TEST=false
 # Most legacy smoke fixtures use standalone fake CLIs without a package root or
 # registry metadata. Runtime-selection tests opt in explicitly below.
 export AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE=false
@@ -1778,6 +1782,8 @@ EOF
 EXTRA_PATH="$tmp/bin"
 OPENCLAW_BIN="$tmp/node_modules/.bin/openclaw"
 AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="true"
+OPENCLAW_NODE_CANDIDATES="$tmp/bin/node"
+OPENCLAW_NODE_CANDIDATES_ONLY="true"
 AUTO_UPGRADE_APT_NODE_FOR_OPENCLAW="true"
 STATE_DIR="$tmp/state"
 REPORT_CHANNEL="none"
@@ -1872,6 +1878,7 @@ EOF
 EXTRA_PATH="$tmp/bin"
 OPENCLAW_BIN="$tmp/node_modules/.bin/openclaw"
 AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="true"
+OPENCLAW_NODE_CANDIDATES_ONLY="true"
 STATE_DIR="$tmp/state"
 STATUS_TIMEOUT="1"
 REPORT_CHANNEL="telegram"
