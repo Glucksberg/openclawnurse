@@ -134,7 +134,9 @@ indirectly or not report on its own:
   package so operators know updates may overwrite local repairs.
 - user plugin drift: compares user-installed `@openclaw/*` plugins under
   `~/.openclaw/npm` with the active OpenClaw runtime and can align them after
-  updates or drift.
+  updates or drift. Before installation, it verifies each requested version in
+  npm; for numeric runtime packaging revisions such as `2026.7.1-2`, it accepts
+  a published plugin at the compatible base version such as `2026.7.1`.
 - gateway logs: scans recent journal output for provider errors, config issues,
   stuck sessions, and update provenance warnings.
 
