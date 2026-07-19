@@ -2301,6 +2301,26 @@ collect_openclaw_user_plugin_packages() {
   fi
 }
 
+openclaw_runtime_base_version() {
+  local version="$1"
+  if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-[0-9]+$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  fi
+}
+
+openclaw_user_package_version_matches_runtime() {
+  local package_name="$1"
+  local installed_version="$2"
+  local runtime_version="$3"
+
+  [[ "$installed_version" == "$runtime_version" ]] && return 0
+  [[ "$package_name" == @openclaw/* ]] || return 1
+
+  local base_version
+  base_version="$(openclaw_runtime_base_version "$runtime_version")"
+  [[ -n "$base_version" && "$installed_version" == "$base_version" ]]
+}
+
 scan_openclaw_user_plugin_versions() {
   OPENCLAW_USER_PLUGINS_SUMMARY=""
   OPENCLAW_USER_PLUGIN_DRIFT_COUNT=0
@@ -2334,7 +2354,7 @@ scan_openclaw_user_plugin_versions() {
     fi
     [[ -n "$version" ]] || version="unknown"
     summary_lines+=("$package_name=$version")
-    if [[ "$version" != "$wanted" ]]; then
+    if ! openclaw_user_package_version_matches_runtime "$package_name" "$version" "$wanted"; then
       OPENCLAW_USER_PLUGIN_DRIFT_COUNT=$((OPENCLAW_USER_PLUGIN_DRIFT_COUNT + 1))
       append_sanity_finding "OpenClaw user plugin version drift: $package_name reports $version while active CLI reports $wanted."
       append_array ACTIONS "Align OpenClaw user plugins with the active OpenClaw runtime version."
@@ -2370,6 +2390,36 @@ build_openclaw_npm_cmd() {
   return 1
 }
 
+resolve_openclaw_user_package_version() {
+  local package_name="$1"
+  local runtime_version="$2"
+  local npm_cmd_name="$3"
+  local result_var="$4"
+  local -n npm_ref="$npm_cmd_name"
+  local output status base_version
+
+  run_capture_allow_fail output status "Checking npm for ${package_name}@${runtime_version}" \
+    timeout "${OPENCLAW_PLUGIN_ALIGN_TIMEOUT}s" \
+    "${npm_ref[@]}" view "${package_name}@${runtime_version}" version --json
+  if [[ "$status" -eq 0 && -n "$output" && "$output" != "null" ]]; then
+    printf -v "$result_var" '%s' "$runtime_version"
+    return 0
+  fi
+
+  [[ "$package_name" == @openclaw/* ]] || return 1
+  base_version="$(openclaw_runtime_base_version "$runtime_version")"
+  [[ -n "$base_version" ]] || return 1
+
+  run_capture_allow_fail output status "Checking npm for compatible ${package_name}@${base_version}" \
+    timeout "${OPENCLAW_PLUGIN_ALIGN_TIMEOUT}s" \
+    "${npm_ref[@]}" view "${package_name}@${base_version}" version --json
+  if [[ "$status" -eq 0 && -n "$output" && "$output" != "null" ]]; then
+    printf -v "$result_var" '%s' "$base_version"
+    return 0
+  fi
+  return 1
+}
+
 align_openclaw_user_plugins() {
   [[ "$AUTO_ALIGN_OPENCLAW_USER_PLUGINS" == "true" ]] || return 0
   [[ -d "$OPENCLAW_USER_NPM_DIR" ]] || return 0
@@ -2391,14 +2441,9 @@ align_openclaw_user_plugins() {
 
   OPENCLAW_USER_PLUGIN_ALIGN_ATTEMPTED=1
 
-  local specs=()
-  for package_name in "${packages[@]}"; do
-    specs+=("${package_name}@${target_version}")
-  done
-
   if [[ "$DRY_RUN" -eq 1 ]]; then
     append_array FIXES "Dry-run: would align OpenClaw user plugins to $target_version: ${packages[*]}."
-    record_remediation "openclaw_user_plugin_drift" "would_apply" "would npm install --save-exact ${specs[*]}"
+    record_remediation "openclaw_user_plugin_drift" "would_apply" "would resolve published package versions and npm install --save-exact ${packages[*]}"
     return 0
   fi
 
@@ -2409,6 +2454,19 @@ align_openclaw_user_plugins() {
     record_remediation "openclaw_user_plugin_drift" "blocked_missing_npm" "npm not found"
     return 1
   fi
+
+  local specs=()
+  local package_version
+  for package_name in "${packages[@]}"; do
+    package_version=""
+    if ! resolve_openclaw_user_package_version "$package_name" "$target_version" npm_cmd package_version; then
+      append_array ERRORS "Cannot align $package_name: neither $target_version nor a compatible published base version is available from npm."
+      append_array ACTIONS "Review the published npm versions for $package_name before retrying plugin alignment."
+      record_remediation "openclaw_user_plugin_drift" "blocked_missing_version" "$package_name@$target_version is not published"
+      return 1
+    fi
+    specs+=("${package_name}@${package_version}")
+  done
 
   local output status
   run_capture_with_heartbeat output status "Aligning OpenClaw user plugins to $target_version" 30 \
@@ -4463,7 +4521,7 @@ run_update_status() {
     return 1
   fi
 
-  CURRENT_VERSION_BEFORE="$(openclaw_cli_version 2>/dev/null | sed -E 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/' | head -n 1)"
+  CURRENT_VERSION_BEFORE="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
   CURRENT_VERSION_AFTER="$CURRENT_VERSION_BEFORE"
   UPDATE_AVAILABLE=0
   if printf '%s' "$json_output" | jq -e '.availability.available == true' >/dev/null 2>&1; then

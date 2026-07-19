@@ -1028,11 +1028,11 @@ smoke_openclaw_user_plugin_drift_is_remediated() {
 
 case "${1:-}" in
   --version)
-    printf 'OpenClaw 2026.1.0\n'
+    printf 'OpenClaw 2026.1.0-2\n'
     ;;
   update)
     if [[ "${2:-}" == "status" ]]; then
-      printf '{"availability":{"available":false,"latestVersion":"2026.1.0"},"channel":{"value":"stable"}}\n'
+      printf '{"availability":{"available":false,"latestVersion":"2026.1.0-2"},"channel":{"value":"stable"}}\n'
     else
       printf '{"ok":true}\n'
     fi
@@ -1054,6 +1054,25 @@ EOF
   chmod +x "$tmp/bin/openclaw"
   cat >"$tmp/bin/npm" <<EOF
 #!/usr/bin/env bash
+if [[ "\${1:-}" == "view" ]]; then
+  case "\${2:-}" in
+    @openclaw/*@2026.1.0-2)
+      printf 'npm error code ETARGET\n' >&2
+      exit 1
+      ;;
+    @openclaw/*@2026.1.0)
+      printf '"2026.1.0"\n'
+      exit 0
+      ;;
+    openclaw@2026.1.0-2)
+      printf '"2026.1.0-2"\n'
+      exit 0
+      ;;
+    *)
+      exit 1
+      ;;
+  esac
+fi
 prefix=""
 while [[ \$# -gt 0 ]]; do
   case "\$1" in
@@ -1116,17 +1135,17 @@ EOF
     and .sanity.openclawUserPluginAlignAttempted == true
     and .sanity.openclawUserPluginAlignSucceeded == true
     and (.sanity.openclawUserPluginsSummary | contains("@openclaw/codex=2026.1.0"))
-    and (.sanity.openclawUserPluginsSummary | contains("openclaw=2026.1.0"))
+    and (.sanity.openclawUserPluginsSummary | contains("openclaw=2026.1.0-2"))
     and any(.remediations[]; .code == "openclaw_user_plugin_drift" and .result == "applied")
   ' "$tmp/state/doctor-state.json" >/dev/null ||
     fail "OpenClaw user plugin drift was not remediated"
 
   "$JQ_BIN" -e '.version == "2026.1.0"' "$tmp/home/.openclaw/npm/node_modules/@openclaw/codex/package.json" >/dev/null ||
     fail "plugin package was not aligned"
-  "$JQ_BIN" -e '.version == "2026.1.0"' "$tmp/home/.openclaw/npm/node_modules/openclaw/package.json" >/dev/null ||
+  "$JQ_BIN" -e '.version == "2026.1.0-2"' "$tmp/home/.openclaw/npm/node_modules/openclaw/package.json" >/dev/null ||
     fail "openclaw peer package was not aligned"
 
-  pass "OpenClaw user plugin drift is remediated"
+  pass "OpenClaw user plugin drift uses a published compatible base version"
 }
 
 smoke_model_config_drift_after_doctor_is_remediated() {
