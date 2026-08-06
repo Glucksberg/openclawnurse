@@ -2,9 +2,24 @@
 
 set -euo pipefail
 
+if [[ "${OPENCLAWNURSE_SMOKE_HERMETIC:-}" != "1" ]]; then
+  smoke_env_root="$(mktemp -d)"
+  mkdir -p "$smoke_env_root/home" "$smoke_env_root/proc"
+  exec env -i \
+    HOME="$smoke_env_root/home" \
+    PATH="/usr/local/bin:/usr/bin:/bin" \
+    LANG="C.UTF-8" \
+    OPENCLAWNURSE_SMOKE_HERMETIC="1" \
+    OPENCLAWNURSE_SMOKE_TMP_ROOT="$smoke_env_root" \
+    RESTART_MODE="custom" \
+    RESTART_COMMAND="true" \
+    PROCFS_DIR="$smoke_env_root/proc" \
+    bash "$0" "$@"
+fi
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 JQ_BIN="${JQ_BIN:-$(command -v jq 2>/dev/null || printf jq)}"
-SMOKE_TMP_ROOT="$(mktemp -d)"
+SMOKE_TMP_ROOT="${OPENCLAWNURSE_SMOKE_TMP_ROOT:-$(mktemp -d)}"
 
 # Keep smoke runs hermetic even when they are launched by a live Nurse process
 # during self-update validation.
