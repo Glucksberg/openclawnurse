@@ -87,12 +87,13 @@ Common settings:
 - `SELF_UPDATE_REPO_DIR`: local OpenClawNurse git checkout used for self-update. The installer writes this automatically.
 - `SELF_UPDATE_POLICY`: `reset-to-remote` for aggressive upstream convergence with a clean-worktree guard, or `fast-forward` for stricter history preservation.
 - `SELF_UPDATE_TIMEOUT`: per-step timeout for self-update fetch, validation and apply operations. The default is 900 seconds to leave room for smoke tests on small hosts.
-- The systemd unit constrains Nurse runs with memory/swap/CPU limits so a stuck OpenClaw maintenance command is killed with the service instead of exhausting the host.
+- The systemd unit constrains Nurse runs with memory/swap/CPU limits so a stuck OpenClaw maintenance command is killed with the service instead of exhausting the host. A final `FAILED*` report exits nonzero so systemd and external monitors can escalate it.
 - `RESTART_MODE`: gateway restart strategy, usually `systemd_user`.
 - `SYSTEMD_UNIT_NAME`: gateway service name, usually `openclaw-gateway.service`.
 - `REPORT_CHANNEL`: report channel, for example `telegram` or `none`.
 - `TELEGRAM_TARGET`: chat/group id for direct reports.
 - `TELEGRAM_BOT_TOKEN`: optional dedicated token. If empty, the Nurse can reuse the OpenClaw Telegram token from `~/.openclaw/openclaw.json`.
+- `TELEGRAM_BOT_TOKEN_FILE`: optional regular owner-only token file for direct outage alerts when OpenClaw uses a non-disclosable SecretRef or is unavailable.
 - `EXPECTED_OPENCLAW_MODEL`: optional expected primary model. `openai-codex/*` values are treated as legacy aliases and normalized to canonical `openai/*` routes while preserving Codex runtime auth.
 - `AUTO_REMEDIATE_EXPECTED_OPENCLAW_MODEL`: restores model config drift after `openclaw doctor --repair`.
 - `AUTO_MIGRATE_PM2_GATEWAY_TO_SYSTEMD`: removes PM2 apps whose name or metadata points to OpenClaw and keeps the gateway under systemd.

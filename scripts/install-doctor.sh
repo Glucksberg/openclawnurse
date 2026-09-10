@@ -643,6 +643,7 @@ main() {
   log "Installing OpenClawNurse with scheduler=$resolved_scheduler"
 
   ensure_config_file
+  chmod 0600 "$CONFIG_FILE"
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
   apply_cli_overrides
