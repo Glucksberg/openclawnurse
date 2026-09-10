@@ -250,6 +250,8 @@ GATEWAY_WAIT_TIMEOUT="${GATEWAY_WAIT_TIMEOUT:-180}"
 GATEWAY_WAIT_INTERVAL="${GATEWAY_WAIT_INTERVAL:-5}"
 HEALTH_TIMEOUT_MS="${HEALTH_TIMEOUT_MS:-10000}"
 MAX_CONSECUTIVE_UPDATE_FAILURES="${MAX_CONSECUTIVE_UPDATE_FAILURES:-3}"
+AUTO_RECOVER_NEWER_SCHEMA="${AUTO_RECOVER_NEWER_SCHEMA:-true}"
+SCHEMA_RECOVERY_STATE_DIR="${SCHEMA_RECOVERY_STATE_DIR:-$STATE_DIR/schema-recovery-state}"
 EXIT_NONZERO_ON_FAILED_STATUS="${EXIT_NONZERO_ON_FAILED_STATUS:-true}"
 RETRY_NOTIFICATION_ON_NEXT_RUN="${RETRY_NOTIFICATION_ON_NEXT_RUN:-true}"
 AUTO_REMEDIATE_MISSING_TRANSCRIPTS="${AUTO_REMEDIATE_MISSING_TRANSCRIPTS:-true}"
@@ -971,6 +973,18 @@ TELEGRAM_TOKEN_FILE_INVALID=0
 UPDATE_BACKUP_CREATED=0
 UPDATE_BACKUP_PATH=""
 UPDATE_BACKUP_FAILURE_DETAIL=""
+SCHEMA_MISMATCH_DETECTED=0
+SCHEMA_MISMATCH_DB=""
+SCHEMA_WRITER_VERSION=""
+SCHEMA_REPORTED_VERSION=""
+SCHEMA_SUPPORTED_VERSION=""
+SCHEMA_MISMATCH_FINDING=""
+SCHEMA_MISMATCH_ACTION=""
+SCHEMA_RECOVERY_APPLIED=0
+OPENCLAW_UPDATE_TARGET_VERSION=""
+UPDATE_GIT_BEHIND=0
+UPDATE_GIT_SHA=""
+UPDATE_GIT_UPSTREAM_SHA=""
 
 load_previous_state() {
   if [[ -f "$STATE_FILE" ]] && jq empty "$STATE_FILE" >/dev/null 2>&1; then
@@ -1126,6 +1140,10 @@ persist_json() {
     --arg configLastTouchedVersion "$CONFIG_LAST_TOUCHED_VERSION" \
     --arg configRestoreDiff "$CONFIG_RESTORE_DIFF" \
     --arg updateBackupPath "$UPDATE_BACKUP_PATH" \
+    --arg schemaMismatchDb "$SCHEMA_MISMATCH_DB" \
+    --arg schemaWriterVersion "$SCHEMA_WRITER_VERSION" \
+    --arg schemaReportedVersion "$SCHEMA_REPORTED_VERSION" \
+    --arg schemaSupportedVersion "$SCHEMA_SUPPORTED_VERSION" \
     --arg openclawInstallations "$OPENCLAW_INSTALLATIONS_SUMMARY" \
     --arg gatewayExecStart "$GATEWAY_EXECSTART" \
     --arg gatewayServiceVersion "$GATEWAY_SERVICE_VERSION" \
@@ -1172,6 +1190,8 @@ persist_json() {
     --argjson configBackupCreated "$(json_bool "$CONFIG_BACKUP_CREATED")" \
     --argjson configVersionDrift "$(json_bool "$CONFIG_VERSION_DRIFT")" \
     --argjson updateBackupCreated "$(json_bool "$UPDATE_BACKUP_CREATED")" \
+    --argjson schemaMismatchDetected "$(json_bool "$SCHEMA_MISMATCH_DETECTED")" \
+    --argjson schemaRecoveryApplied "$(json_bool "$SCHEMA_RECOVERY_APPLIED")" \
     --argjson diagnostics "$diagnostics_json" \
     --argjson statusReasons "$status_reasons_json" \
     --argjson sanityAttempted "$(json_bool "$SANITY_ATTEMPTED")" \
@@ -1209,6 +1229,14 @@ persist_json() {
       updateBackup: {
         created: $updateBackupCreated,
         path: $updateBackupPath
+      },
+      schemaRecovery: {
+        detected: $schemaMismatchDetected,
+        database: $schemaMismatchDb,
+        writerVersion: $schemaWriterVersion,
+        reportedSchema: $schemaReportedVersion,
+        supportedSchema: $schemaSupportedVersion,
+        applied: $schemaRecoveryApplied
       },
       selfUpdate: {
         attempted: $selfUpdateAttempted,
@@ -4551,6 +4579,60 @@ maybe_migrate_pm2_gateway_to_systemd() {
   return 0
 }
 
+detect_newer_schema_mismatch() {
+  local output="$1"
+  [[ "$AUTO_RECOVER_NEWER_SCHEMA" == "true" ]] || return 1
+  printf '%s' "$output" | grep -Eqi 'uses newer schema version[[:space:]]+[0-9]+.*(build )?supports[[:space:]]+[0-9]+' || return 1
+
+  local database="" writer_version=""
+  database="$(printf '%s\n' "$output" | sed -nE 's/.*(state|agent) database (.+) uses newer schema version.*/\2/p' | head -n 1)"
+  database="${database#\"}"
+  database="${database%\"}"
+  database="${database#\'}"
+  database="${database%\'}"
+  [[ -n "$database" ]] || database="$OPENCLAW_STATE_HOME/state/openclaw.sqlite"
+  database="$(readlink -f "$database" 2>/dev/null || printf '%s' "$database")"
+
+  if command_exists "$SQLITE3_BIN" && [[ -r "$database" ]]; then
+    writer_version="$(timeout --kill-after=2s 5s "$SQLITE3_BIN" -readonly "$database" \
+      "SELECT app_version FROM schema_meta WHERE meta_key = 'primary' LIMIT 1;" 2>/dev/null | head -n 1)"
+  fi
+
+  SCHEMA_MISMATCH_DETECTED=1
+  SCHEMA_MISMATCH_DB="$database"
+  SCHEMA_WRITER_VERSION="$writer_version"
+  SCHEMA_REPORTED_VERSION="$(printf '%s\n' "$output" | sed -nE 's/.*uses newer schema version[[:space:]]+([0-9]+).*/\1/p' | head -n 1)"
+  SCHEMA_SUPPORTED_VERSION="$(printf '%s\n' "$output" | sed -nE 's/.*(build )?supports[[:space:]]+([0-9]+).*/\2/p' | head -n 1)"
+  if [[ "$writer_version" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+    OPENCLAW_UPDATE_TARGET_VERSION="$writer_version"
+    AVAILABLE_VERSION="$writer_version"
+  fi
+  CURRENT_VERSION_BEFORE="$(openclaw_cli_version 2>/dev/null | extract_openclaw_version)"
+  CURRENT_VERSION_AFTER="$CURRENT_VERSION_BEFORE"
+  UPDATE_AVAILABLE=1
+  SCHEMA_MISMATCH_FINDING="OpenClaw database $database uses schema ${SCHEMA_REPORTED_VERSION:-unknown}, newer than the active CLI supports."
+  SCHEMA_MISMATCH_ACTION="Recover forward to a build that can read the live database; never roll back code alone."
+  append_sanity_finding "$SCHEMA_MISMATCH_FINDING"
+  append_unique_array ACTIONS "$SCHEMA_MISMATCH_ACTION"
+  add_incident_code "openclaw_schema_mismatch"
+  record_remediation "openclaw_schema_mismatch" "detected" "database=$database writer=${writer_version:-unknown}"
+  log WARN "Detected OpenClaw schema mismatch in $database; forcing forward recovery"
+  return 0
+}
+
+mark_schema_mismatch_recovered() {
+  [[ "$SCHEMA_MISMATCH_DETECTED" -eq 1 ]] || return 0
+  SCHEMA_RECOVERY_APPLIED=1
+  remove_array_value SANITY_FINDINGS "$SCHEMA_MISMATCH_FINDING"
+  remove_array_value ACTIONS "$SCHEMA_MISMATCH_ACTION"
+  remove_incident_code "openclaw_schema_mismatch"
+  if ! array_has_nonempty SANITY_FINDINGS; then
+    SANITY_DEGRADED=0
+  fi
+  record_remediation "openclaw_schema_mismatch" "applied" "database=$SCHEMA_MISMATCH_DB recovered=${CURRENT_VERSION_AFTER:-unknown}"
+  append_array FIXES "Recovered OpenClaw forward from an incompatible newer state schema."
+}
+
 run_update_status() {
   local output status json_output
   local cmd
@@ -4561,6 +4643,9 @@ run_update_status() {
 
   if [[ "$status" -ne 0 ]]; then
     UPDATE_ERROR="$output"
+    if detect_newer_schema_mismatch "$output"; then
+      return 0
+    fi
     append_array ERRORS "Unable to read openclaw update status."
     return 1
   fi
@@ -4583,12 +4668,23 @@ run_update_status() {
   fi
   CHANNEL_VALUE="$(printf '%s' "$json_output" | jq -r '.channel.value // empty')"
   UPDATE_INSTALL_KIND="$(printf '%s' "$json_output" | jq -r '.update.installKind // empty')"
+  UPDATE_GIT_BEHIND="$(printf '%s' "$json_output" | jq -r '.availability.gitBehind // .update.git.behind // 0')"
+  UPDATE_GIT_SHA="$(printf '%s' "$json_output" | jq -r '.update.git.sha // empty')"
+  UPDATE_GIT_UPSTREAM_SHA="$(printf '%s' "$json_output" | jq -r '.update.git.upstreamSha // empty')"
+  [[ "$UPDATE_GIT_BEHIND" =~ ^[0-9]+$ ]] || UPDATE_GIT_BEHIND=0
   return 0
 }
 
 should_attempt_update() {
   [[ "$AUTO_UPDATE" == "true" ]] || return 1
   [[ "$CONFIG_HEALTH" != "invalid" ]] || return 1
+
+  # A schema-forward repair is an emergency compatibility path. Ordinary
+  # update failures must not permanently suppress it.
+  if [[ "$SCHEMA_MISMATCH_DETECTED" -eq 1 ]]; then
+    return 0
+  fi
+
   (( CONSECUTIVE_FAILURES < MAX_CONSECUTIVE_UPDATE_FAILURES )) || return 1
 
   if [[ "$CONFIG_VERSION_DRIFT" -eq 1 && "$AUTO_REMEDIATE_CONFIG_VERSION_DRIFT" == "true" ]]; then
@@ -4596,6 +4692,12 @@ should_attempt_update() {
   fi
 
   [[ "$UPDATE_AVAILABLE" -eq 1 ]] || return 1
+  if [[ "$UPDATE_INSTALL_KIND" == "git" ]]; then
+    [[ "$CHANNEL_VALUE" == "dev" && "${UPDATE_CHANNEL:-$CHANNEL_VALUE}" == "dev" ]] || return 1
+    (( UPDATE_GIT_BEHIND > 0 )) || return 1
+    [[ -n "$UPDATE_GIT_SHA" && -n "$UPDATE_GIT_UPSTREAM_SHA" && "$UPDATE_GIT_SHA" != "$UPDATE_GIT_UPSTREAM_SHA" ]] || return 1
+    return 0
+  fi
   [[ -n "$AVAILABLE_VERSION" ]] || return 1
   [[ "$CURRENT_VERSION_BEFORE" != "$AVAILABLE_VERSION" ]] || return 1
   return 0
@@ -4647,6 +4749,15 @@ classify_update_failure() {
   append_array ACTIONS "Run openclaw update manually after reviewing the error output."
 }
 
+active_openclaw_source_checkout_root() {
+  local package_root git_root
+  package_root="$(active_openclaw_package_root || true)"
+  [[ -n "$package_root" ]] || return 1
+  git_root="$(git -C "$package_root" rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ -n "$git_root" && "$(canonical_path "$git_root")" == "$(canonical_path "$package_root")" ]] || return 1
+  printf '%s\n' "$package_root"
+}
+
 build_openclaw_update_cmd() {
   local name="$1"
   # shellcheck disable=SC2178 # nameref points at an array selected by name.
@@ -4654,7 +4765,21 @@ build_openclaw_update_cmd() {
   build_openclaw_cmd "$name"
   ref+=(update --json --yes --no-restart --timeout "$UPDATE_TIMEOUT")
 
-  if [[ -n "$OPENCLAW_UPDATE_TARGET_VERSION" ]]; then
+  if [[ "$SCHEMA_MISMATCH_DETECTED" -eq 1 ]]; then
+    local package_root
+    package_root="$(active_openclaw_source_checkout_root || true)"
+    if [[ -n "$package_root" ]]; then
+      # Git installations ignore --tag=<version>. Follow main forward and
+      # validate its declared schema support against every live database.
+      ref+=(--channel dev)
+    elif [[ -n "$OPENCLAW_UPDATE_TARGET_VERSION" ]]; then
+      ref+=(--tag "$OPENCLAW_UPDATE_TARGET_VERSION")
+    else
+      ref+=(--channel dev)
+    fi
+    mkdir -p "$SCHEMA_RECOVERY_STATE_DIR"
+    ref=(env "OPENCLAW_STATE_DIR=$SCHEMA_RECOVERY_STATE_DIR" "${ref[@]}")
+  elif [[ -n "$OPENCLAW_UPDATE_TARGET_VERSION" ]]; then
     ref+=(--tag "$OPENCLAW_UPDATE_TARGET_VERSION")
   elif [[ -n "$UPDATE_TAG" ]]; then
     ref+=(--tag "$UPDATE_TAG")
@@ -4864,6 +4989,95 @@ create_pre_update_backup() {
   return 0
 }
 
+version_is_at_least() {
+  local actual="$1" expected="$2"
+  [[ -n "$actual" && -n "$expected" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$expected" "$actual" | sort -V | head -n 1)" == "$expected" ]]
+}
+
+validate_live_schema_compatibility() {
+  local package_root state_supported agent_supported database schema supported kind output status
+  package_root="$(active_openclaw_package_root || true)"
+  if [[ -z "$package_root" || ! -f "$package_root/package.json" ]]; then
+    POST_UPDATE_VALIDATION_DETAIL="cannot resolve the updated OpenClaw package metadata for schema validation"
+    return 1
+  fi
+  state_supported="$(jq -r '.openclaw.schemaVersions.state // empty' "$package_root/package.json" 2>/dev/null)"
+  agent_supported="$(jq -r '.openclaw.schemaVersions.agent // empty' "$package_root/package.json" 2>/dev/null)"
+
+  while IFS= read -r database; do
+    [[ -r "$database" ]] || continue
+    schema="$("$SQLITE3_BIN" -readonly "$database" "SELECT schema_version FROM schema_meta WHERE meta_key = 'primary' LIMIT 1;" 2>/dev/null | head -n 1)"
+    [[ -n "$schema" ]] || continue
+    if [[ "$database" == */openclaw-agent.sqlite ]]; then
+      kind="agent"
+      supported="$agent_supported"
+    else
+      kind="state"
+      supported="$state_supported"
+    fi
+    if [[ ! "$schema" =~ ^[0-9]+$ || ! "$supported" =~ ^[0-9]+$ ]]; then
+      POST_UPDATE_VALIDATION_DETAIL="updated package does not declare usable $kind schema support for $database"
+      return 1
+    fi
+    if (( schema > supported )); then
+      POST_UPDATE_VALIDATION_DETAIL="updated package supports $kind schema $supported but $database uses schema $schema"
+      return 1
+    fi
+  done < <(update_backup_database_paths)
+
+  local cmd
+  build_openclaw_cmd cmd
+  cmd+=(update status --json --timeout "$STATUS_TIMEOUT")
+  run_capture output status "Validating updated CLI against live state" "${cmd[@]}"
+  if [[ "$status" -ne 0 ]] || ! printf '%s\n' "$output" | json_payload_from_output | jq empty >/dev/null 2>&1; then
+    POST_UPDATE_VALIDATION_DETAIL="updated CLI still cannot read the canonical live state: $(remediation_detail_from_output "$output")"
+    return 1
+  fi
+  return 0
+}
+
+validate_git_update_progress() {
+  [[ "$UPDATE_INSTALL_KIND" == "git" && "$UPDATE_GIT_BEHIND" -gt 0 ]] || return 0
+  local cmd output status payload final_sha final_behind final_channel
+  build_openclaw_cmd cmd
+  cmd+=(update status --json --timeout "$STATUS_TIMEOUT")
+  run_capture output status "Validating Git update progress" "${cmd[@]}"
+  payload="$(printf '%s\n' "$output" | json_payload_from_output)"
+  if [[ "$status" -ne 0 ]] || ! printf '%s' "$payload" | jq empty >/dev/null 2>&1; then
+    POST_UPDATE_VALIDATION_DETAIL="cannot validate the Git revision after updater success"
+    return 1
+  fi
+  final_sha="$(printf '%s' "$payload" | jq -r '.update.git.sha // empty')"
+  final_behind="$(printf '%s' "$payload" | jq -r '.availability.gitBehind // .update.git.behind // empty')"
+  final_channel="$(printf '%s' "$payload" | jq -r '.channel.value // empty')"
+  if [[ -z "$final_sha" || "$final_sha" == "$UPDATE_GIT_SHA" || ! "$final_behind" =~ ^[0-9]+$ || "$final_behind" -ge "$UPDATE_GIT_BEHIND" || "$final_channel" != "dev" ]]; then
+    POST_UPDATE_VALIDATION_DETAIL="Git updater reported success without advancing the dev checkout ($UPDATE_GIT_SHA -> ${final_sha:-unknown}, behind $UPDATE_GIT_BEHIND -> ${final_behind:-unknown})"
+    return 1
+  fi
+  return 0
+}
+
+post_update_candidate_is_valid() {
+  local version="$1"
+  POST_UPDATE_VALIDATION_DETAIL=""
+  if [[ -n "$OPENCLAW_UPDATE_TARGET_VERSION" ]]; then
+    if [[ "$SCHEMA_MISMATCH_DETECTED" -eq 1 ]]; then
+      if ! version_is_at_least "$version" "$OPENCLAW_UPDATE_TARGET_VERSION"; then
+        POST_UPDATE_VALIDATION_DETAIL="OpenClaw reported version $version after recovery to writer version $OPENCLAW_UPDATE_TARGET_VERSION or newer"
+        return 1
+      fi
+    elif [[ "$version" != "$OPENCLAW_UPDATE_TARGET_VERSION" ]]; then
+      POST_UPDATE_VALIDATION_DETAIL="OpenClaw reported version $version after updating to expected version $OPENCLAW_UPDATE_TARGET_VERSION"
+      return 1
+    fi
+  fi
+  if [[ "$SCHEMA_MISMATCH_DETECTED" -eq 1 ]] && ! validate_live_schema_compatibility; then
+    return 1
+  fi
+  validate_git_update_progress
+}
+
 validate_openclaw_cli_after_update() {
   local output status version recovery_status=0 detail=""
 
@@ -4872,11 +5086,11 @@ validate_openclaw_cli_after_update() {
   status=$?
   version="$(printf '%s' "$output" | extract_openclaw_version)"
   if [[ "$status" -eq 0 && -n "$version" ]]; then
-    if [[ -z "$OPENCLAW_UPDATE_TARGET_VERSION" || "$version" == "$OPENCLAW_UPDATE_TARGET_VERSION" ]]; then
+    if post_update_candidate_is_valid "$version"; then
       CURRENT_VERSION_AFTER="$version"
       return 0
     fi
-    detail="OpenClaw reported version $version after updating to expected version $OPENCLAW_UPDATE_TARGET_VERSION"
+    detail="$POST_UPDATE_VALIDATION_DETAIL"
   fi
 
   if [[ -z "$detail" ]]; then
@@ -4887,11 +5101,11 @@ validate_openclaw_cli_after_update() {
       status=$?
       version="$(printf '%s' "$output" | extract_openclaw_version)"
       if [[ "$status" -eq 0 && -n "$version" ]]; then
-        if [[ -z "$OPENCLAW_UPDATE_TARGET_VERSION" || "$version" == "$OPENCLAW_UPDATE_TARGET_VERSION" ]]; then
+        if post_update_candidate_is_valid "$version"; then
           CURRENT_VERSION_AFTER="$version"
           return 0
         fi
-        detail="OpenClaw reported version $version after updating to expected version $OPENCLAW_UPDATE_TARGET_VERSION"
+        detail="$POST_UPDATE_VALIDATION_DETAIL"
       fi
     fi
   fi
@@ -4937,6 +5151,8 @@ run_update() {
     fi
     UPDATE_SUCCEEDED=1
     CONSECUTIVE_FAILURES=0
+    UPDATE_ERROR=""
+    mark_schema_mismatch_recovered
     append_array FIXES "OpenClaw update completed successfully."
     if [[ "$CONFIG_VERSION_DRIFT" -eq 1 ]]; then
       record_remediation "openclaw_config_version_drift" "applied" "updated canonical OpenClaw runtime after config version drift"
@@ -4981,6 +5197,7 @@ run_update() {
     UPDATE_SUCCEEDED=1
     CONSECUTIVE_FAILURES=0
     UPDATE_ERROR=""
+    mark_schema_mismatch_recovered
     append_array FIXES "OpenClaw update failed on the first attempt, then succeeded after doctor repair."
     if [[ "$CONFIG_VERSION_DRIFT" -eq 1 ]]; then
       record_remediation "openclaw_config_version_drift" "applied" "updated canonical OpenClaw runtime after config version drift"
@@ -5543,6 +5760,11 @@ EOF
 
   if [[ "$UPDATE_BACKUP_CREATED" -eq 1 ]]; then
     printf '\nPre-update backup: %s\n' "${UPDATE_BACKUP_PATH:-created and verified}"
+  fi
+
+  if [[ "$SCHEMA_MISMATCH_DETECTED" -eq 1 ]]; then
+    printf '\nSchema recovery: detected database=%s writer=%s applied=%s\n' \
+      "${SCHEMA_MISMATCH_DB:-unknown}" "${SCHEMA_WRITER_VERSION:-unknown}" "$SCHEMA_RECOVERY_APPLIED"
   fi
 
   if [[ "$CONFIG_RESTORED" -eq 1 ]]; then
