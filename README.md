@@ -67,6 +67,11 @@ Common settings:
   metadata, path map, and checksums. `openclaw` requests a full portable archive
   first and falls back to the compact bundle.
 - `UPDATE_BACKUP_RETENTION`: number of compact pre-update archives retained.
+- `AUTO_RECOVER_NEWER_SCHEMA`: when update status reports a newer SQLite schema,
+  use isolated updater state to recover forward, then validate the installed
+  package's declared state/agent schema support against every live database.
+- Git updates are automatic only for the `dev` channel and count as successful
+  only when the checkout SHA advances and `gitBehind` decreases.
 - `AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE`: validates the target release's Node
   engine before an update, selects a compatible installed runtime for the CLI
   and its child processes, and retries maintenance with it if an update strands

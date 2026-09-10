@@ -3537,6 +3537,199 @@ EOF
   pass "required backup failures block updates"
 }
 
+make_schema_recovery_openclaw() {
+  local root="$1" database="$2" advance_support="$3"
+  mkdir -p "$root/bin" "$root/dist"
+  printf '{"name":"openclaw","version":"2026.1.0","openclaw":{"schemaVersions":{"state":17,"agent":18}}}\n' >"$root/package.json"
+  printf '{"version":"2026.1.0","buildId":"schema-old"}\n' >"$root/dist/build-info.json"
+  cat >"$root/bin/openclaw" <<EOF
+#!/usr/bin/env bash
+root="$root"
+database="$database"
+case "\${1:-}" in
+  --version) printf 'OpenClaw %s\\n' "\$(jq -r .version "\$root/package.json")" ;;
+  update)
+    if [[ "\${2:-}" == "status" ]]; then
+      if [[ "\$(jq -r .openclaw.schemaVersions.agent "\$root/package.json")" -lt 19 ]]; then
+        printf 'OpenClaw agent database %s uses newer schema version 19; this build supports 18.\\n' "\$database" >&2
+        exit 1
+      fi
+      printf '{"update":{"installKind":"package"},"availability":{"available":false},"channel":{"value":"stable"}}\\n'
+    else
+      printf '%s\\n' "\${OPENCLAW_STATE_DIR:-}" >"$root/update-state-dir"
+      printf '%s\\n' "\$*" >"$root/update-args"
+      if [[ "$advance_support" == "true" ]]; then
+        printf '{"name":"openclaw","version":"2026.1.2","openclaw":{"schemaVersions":{"state":17,"agent":19}}}\\n' >"\$root/package.json"
+      else
+        printf '{"name":"openclaw","version":"2026.1.2","openclaw":{"schemaVersions":{"state":17,"agent":18}}}\\n' >"\$root/package.json"
+      fi
+      printf '{"ok":true}\\n'
+    fi
+    ;;
+  doctor) printf 'doctor complete\\n' ;;
+  health) printf '{"ok":true}\\n' ;;
+  status) printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":0},"tasks":{},"taskAudit":{}}\\n' ;;
+  *) printf '{}\\n' ;;
+esac
+EOF
+  chmod +x "$root/bin/openclaw"
+}
+
+smoke_schema_mismatch_uses_origin_database_and_bypasses_failure_gate() {
+  local tmp database
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/schema-forward.XXXXXX")"
+  database="$tmp/openclaw/agents/a/agent/openclaw-agent.sqlite"
+  mkdir -p "$(dirname "$database")" "$tmp/home" "$tmp/nurse" "$tmp/cfg"
+  "$SQLITE3_BIN" "$database" <<'SQL'
+CREATE TABLE schema_meta(meta_key TEXT PRIMARY KEY, role TEXT NOT NULL, schema_version INTEGER NOT NULL, agent_id TEXT, app_version TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+INSERT INTO schema_meta VALUES('primary','agent',19,'a','2026.1.1',1,1);
+SQL
+  printf '{}\n' >"$tmp/openclaw/openclaw.json"
+  make_schema_recovery_openclaw "$tmp/package" "$database" true
+  printf '{"consecutiveFailures":3}\n' >"$tmp/nurse/doctor-state.json"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/package/bin/openclaw"
+OPENCLAW_STATE_HOME="$tmp/openclaw"
+OPENCLAW_CONFIG_FILE="$tmp/openclaw/openclaw.json"
+STATE_DIR="$tmp/nurse"
+UPDATE_BACKUP_ENABLED="true"
+UPDATE_BACKUP_DIR="$tmp/backups"
+AUTO_UPDATE="true"
+AUTO_RECOVER_NEWER_SCHEMA="true"
+REPORT_CHANNEL="none"
+AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EOF
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" >/dev/null
+  [[ "$(<"$tmp/package/update-state-dir")" == "$tmp/nurse/schema-recovery-state" ]] || fail "schema updater did not use isolated state"
+  grep -Fq -- '--tag 2026.1.1' "$tmp/package/update-args" || fail "package recovery did not target the writer version"
+  "$JQ_BIN" -e --arg database "$database" '
+    .status == "UPDATED"
+    and .consecutiveFailures == 0
+    and .schemaRecovery.detected == true
+    and .schemaRecovery.database == $database
+    and .schemaRecovery.writerVersion == "2026.1.1"
+    and .schemaRecovery.applied == true
+  ' "$tmp/nurse/doctor-state.json" >/dev/null || fail "agent database schema recovery was not reported"
+  pass "schema recovery uses the failing database and bypasses the ordinary failure gate"
+}
+
+smoke_schema_recovery_rejects_incompatible_candidate() {
+  local tmp database
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/schema-reject.XXXXXX")"
+  database="$tmp/openclaw/agents/a/agent/openclaw-agent.sqlite"
+  mkdir -p "$(dirname "$database")" "$tmp/home" "$tmp/nurse" "$tmp/cfg"
+  "$SQLITE3_BIN" "$database" <<'SQL'
+CREATE TABLE schema_meta(meta_key TEXT PRIMARY KEY, role TEXT NOT NULL, schema_version INTEGER NOT NULL, agent_id TEXT, app_version TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+INSERT INTO schema_meta VALUES('primary','agent',19,'a','2026.1.1',1,1);
+SQL
+  printf '{}\n' >"$tmp/openclaw/openclaw.json"
+  make_schema_recovery_openclaw "$tmp/package" "$database" false
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/package/bin/openclaw"
+OPENCLAW_STATE_HOME="$tmp/openclaw"
+OPENCLAW_CONFIG_FILE="$tmp/openclaw/openclaw.json"
+STATE_DIR="$tmp/nurse"
+UPDATE_BACKUP_ENABLED="true"
+UPDATE_BACKUP_DIR="$tmp/backups"
+AUTO_UPDATE="true"
+AUTO_RECOVER_NEWER_SCHEMA="true"
+REPORT_CHANNEL="none"
+AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EOF
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" >/dev/null
+  "$JQ_BIN" -e '
+    (.status | startswith("FAILED"))
+    and .updateSucceeded == false
+    and .schemaRecovery.detected == true
+    and .schemaRecovery.applied == false
+    and (.incidentCodes | index("post_update_cli_validation_failed"))
+  ' "$tmp/nurse/doctor-state.json" >/dev/null || fail "incompatible recovery candidate was accepted"
+  pass "schema recovery rejects candidates that cannot read every live database"
+}
+
+smoke_git_updates_require_dev_revision_progress() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/git-progress.XXXXXX")"
+  mkdir -p "$tmp/bin" "$tmp/home" "$tmp/nurse" "$tmp/cfg"
+  printf 'oldsha 2 dev\n' >"$tmp/git-state"
+  cat >"$tmp/bin/openclaw" <<EOF
+#!/usr/bin/env bash
+read -r sha behind channel <"$tmp/git-state"
+case "\${1:-}" in
+  --version) printf 'OpenClaw 2026.1.0\\n' ;;
+  update)
+    if [[ "\${2:-}" == "status" ]]; then
+      printf '{"update":{"installKind":"git","git":{"sha":"%s","upstreamSha":"newsha","behind":%s}},"availability":{"available":true,"gitBehind":%s},"channel":{"value":"%s"}}\\n' "\$sha" "\$behind" "\$behind" "\$channel"
+    else
+      : >"$tmp/update-ran"
+      if [[ ! -f "$tmp/no-progress" ]]; then printf 'newsha 0 dev\\n' >"$tmp/git-state"; fi
+      printf '{"ok":true}\\n'
+    fi
+    ;;
+  doctor) printf 'doctor complete\\n' ;;
+  health) printf '{"ok":true}\\n' ;;
+  status) printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":0},"tasks":{},"taskAudit":{}}\\n' ;;
+  *) printf '{}\\n' ;;
+esac
+EOF
+  chmod +x "$tmp/bin/openclaw"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/nurse"
+UPDATE_BACKUP_ENABLED="false"
+AUTO_UPDATE="true"
+UPDATE_CHANNEL="dev"
+REPORT_CHANNEL="none"
+AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EOF
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" >/dev/null
+  "$JQ_BIN" -e '.status == "UPDATED" and .updateSucceeded == true' "$tmp/nurse/doctor-state.json" >/dev/null || fail "advancing Git update failed validation"
+
+  printf 'oldsha 2 dev\n' >"$tmp/git-state"
+  : >"$tmp/no-progress"
+  rm -f "$tmp/nurse/doctor-state.json"
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" >/dev/null
+  "$JQ_BIN" -e '(.status | startswith("FAILED")) and .updateSucceeded == false and (.incidentCodes | index("post_update_cli_validation_failed"))' "$tmp/nurse/doctor-state.json" >/dev/null ||
+    fail "Git updater success without SHA progress was accepted"
+
+  rm -f "$tmp/no-progress" "$tmp/update-ran" "$tmp/nurse/doctor-state.json"
+  printf 'oldsha 2 stable\n' >"$tmp/git-state"
+  sed -i 's/UPDATE_CHANNEL="dev"/UPDATE_CHANNEL="stable"/' "$tmp/cfg/openclawnurse.env"
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" >/dev/null
+  [[ ! -e "$tmp/update-ran" ]] || fail "stable Git checkout followed main gitBehind"
+  pass "Git updates require dev channel and verified SHA progress"
+}
+
 smoke_failed_status_exits_nonzero() {
   local tmp status
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/failed-exit.XXXXXX")"
@@ -3650,6 +3843,9 @@ main() {
   smoke_accepts_configured_security_warnings
   smoke_verified_update_backup
   smoke_required_backup_failure_blocks_update
+  smoke_schema_mismatch_uses_origin_database_and_bypasses_failure_gate
+  smoke_schema_recovery_rejects_incompatible_candidate
+  smoke_git_updates_require_dev_revision_progress
   smoke_failed_status_exits_nonzero
   smoke_rejects_insecure_telegram_token_file
 }
