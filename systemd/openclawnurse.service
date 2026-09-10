@@ -9,7 +9,9 @@ EnvironmentFile=-%h/.openclaw/gateway.systemd.env
 Environment=PATH=%h/.npm-global/bin:%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=__INSTALL_DIR__
 ExecStart=__INSTALL_DIR__/bin/openclaw-doctor.sh --config __CONFIG_FILE__
-MemoryMax=1200M
-MemorySwapMax=256M
-CPUQuota=60%
-TasksMax=128
+# Source-checkout updates build a staged candidate before activation.
+MemoryHigh=__MEMORY_HIGH__
+MemoryMax=__MEMORY_MAX__
+MemorySwapMax=__MEMORY_SWAP_MAX__
+CPUQuota=__CPU_QUOTA__
+TasksMax=__TASKS_MAX__

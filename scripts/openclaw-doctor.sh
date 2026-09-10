@@ -221,6 +221,13 @@ AUTO_UPDATE="${AUTO_UPDATE:-true}"
 UPDATE_CHANNEL="${UPDATE_CHANNEL:-stable}"
 UPDATE_TAG="${UPDATE_TAG:-}"
 UPDATE_TIMEOUT="${UPDATE_TIMEOUT:-900}"
+UPDATE_BACKUP_ENABLED="${UPDATE_BACKUP_ENABLED:-true}"
+UPDATE_BACKUP_REQUIRED="${UPDATE_BACKUP_REQUIRED:-true}"
+UPDATE_BACKUP_MODE="${UPDATE_BACKUP_MODE:-sqlite}"
+UPDATE_BACKUP_TIMEOUT="${UPDATE_BACKUP_TIMEOUT:-1800}"
+UPDATE_BACKUP_DIR="${UPDATE_BACKUP_DIR:-$STATE_DIR/update-backups}"
+UPDATE_BACKUP_RETENTION="${UPDATE_BACKUP_RETENTION:-5}"
+SQLITE3_BIN="${SQLITE3_BIN:-sqlite3}"
 AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE="${AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE:-true}"
 OPENCLAW_NODE_CANDIDATES="${OPENCLAW_NODE_CANDIDATES:-}"
 OPENCLAW_NODE_CANDIDATES_ONLY="${OPENCLAW_NODE_CANDIDATES_ONLY:-false}"
@@ -391,6 +398,9 @@ prepare_openclaw_env
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$STATE_DIR" "$LOG_DIR"
 if [[ "$CONFIG_BACKUP_ENABLED" == "true" ]]; then
   mkdir -p "$CONFIG_BACKUP_DIR"
+fi
+if [[ "$UPDATE_BACKUP_ENABLED" == "true" ]]; then
+  mkdir -p "$UPDATE_BACKUP_DIR"
 fi
 
 RUN_ID="$(TZ="$TIMEZONE" date '+%Y%m%d-%H%M%S')"
@@ -958,6 +968,9 @@ CONFIG_VERSION_DRIFT_ACTION=""
 GATEWAY_SERVICE_REFRESH_FAILED=0
 GATEWAY_SERVICE_REFRESH_BLOCKS_RESTART=0
 TELEGRAM_TOKEN_FILE_INVALID=0
+UPDATE_BACKUP_CREATED=0
+UPDATE_BACKUP_PATH=""
+UPDATE_BACKUP_FAILURE_DETAIL=""
 
 load_previous_state() {
   if [[ -f "$STATE_FILE" ]] && jq empty "$STATE_FILE" >/dev/null 2>&1; then
@@ -1112,6 +1125,7 @@ persist_json() {
     --arg configHealth "$CONFIG_HEALTH" \
     --arg configLastTouchedVersion "$CONFIG_LAST_TOUCHED_VERSION" \
     --arg configRestoreDiff "$CONFIG_RESTORE_DIFF" \
+    --arg updateBackupPath "$UPDATE_BACKUP_PATH" \
     --arg openclawInstallations "$OPENCLAW_INSTALLATIONS_SUMMARY" \
     --arg gatewayExecStart "$GATEWAY_EXECSTART" \
     --arg gatewayServiceVersion "$GATEWAY_SERVICE_VERSION" \
@@ -1157,6 +1171,7 @@ persist_json() {
     --argjson configRestored "$(json_bool "$CONFIG_RESTORED")" \
     --argjson configBackupCreated "$(json_bool "$CONFIG_BACKUP_CREATED")" \
     --argjson configVersionDrift "$(json_bool "$CONFIG_VERSION_DRIFT")" \
+    --argjson updateBackupCreated "$(json_bool "$UPDATE_BACKUP_CREATED")" \
     --argjson diagnostics "$diagnostics_json" \
     --argjson statusReasons "$status_reasons_json" \
     --argjson sanityAttempted "$(json_bool "$SANITY_ATTEMPTED")" \
@@ -1191,6 +1206,10 @@ persist_json() {
       dryRun: $dryRun,
       updateAttempted: $updateAttempted,
       updateSucceeded: $updateSucceeded,
+      updateBackup: {
+        created: $updateBackupCreated,
+        path: $updateBackupPath
+      },
       selfUpdate: {
         attempted: $selfUpdateAttempted,
         available: $selfUpdateAvailable,
@@ -4644,6 +4663,207 @@ build_openclaw_update_cmd() {
   fi
 }
 
+rotate_update_backups() {
+  [[ "$UPDATE_BACKUP_RETENTION" =~ ^[0-9]+$ ]] || return 0
+  (( UPDATE_BACKUP_RETENTION > 0 )) || return 0
+  local backups=()
+  mapfile -t backups < <(find "$UPDATE_BACKUP_DIR" -maxdepth 1 -type f -name 'openclaw-pre-update-*.tar.gz' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+  local index
+  for ((index=UPDATE_BACKUP_RETENTION; index<${#backups[@]}; index++)); do
+    rm -f -- "${backups[$index]}"
+  done
+}
+
+update_backup_database_paths() {
+  local shared="$OPENCLAW_STATE_HOME/state/openclaw.sqlite"
+  [[ -f "$shared" ]] && printf '%s\n' "$shared"
+
+  if command_exists "$SQLITE3_BIN" && [[ -r "$shared" ]]; then
+    local registered
+    while IFS= read -r registered; do
+      [[ -n "$registered" ]] || continue
+      if [[ "$registered" == /* ]]; then
+        printf '%s\n' "$registered"
+      else
+        printf '%s/%s\n' "$OPENCLAW_STATE_HOME" "$registered"
+      fi
+    done < <("$SQLITE3_BIN" -readonly "$shared" 'SELECT path FROM agent_databases ORDER BY agent_id;' 2>/dev/null || true)
+  fi
+
+  find "$OPENCLAW_STATE_HOME/agents" -type f -path '*/agent/openclaw-agent.sqlite' -print 2>/dev/null
+}
+
+create_sqlite_config_update_backup() {
+  UPDATE_BACKUP_FAILURE_DETAIL=""
+  local required_command
+  for required_command in "$SQLITE3_BIN" tar gzip sha256sum; do
+    if ! command_exists "$required_command"; then
+      UPDATE_BACKUP_FAILURE_DETAIL="missing required backup command: $required_command"
+      return 1
+    fi
+  done
+  if [[ ! -f "$OPENCLAW_CONFIG_FILE" || -L "$OPENCLAW_CONFIG_FILE" ]]; then
+    UPDATE_BACKUP_FAILURE_DETAIL="OpenClaw config is missing or is not a regular non-symlink file: $OPENCLAW_CONFIG_FILE"
+    return 1
+  fi
+
+  local package_root package_version build_info git_revision=""
+  package_root="$(active_openclaw_package_root || true)"
+  if [[ -z "$package_root" || ! -f "$package_root/package.json" ]]; then
+    UPDATE_BACKUP_FAILURE_DETAIL="active OpenClaw package root could not be resolved"
+    return 1
+  fi
+  package_version="$(jq -r '.version // empty' "$package_root/package.json" 2>/dev/null || true)"
+  if [[ -z "$package_version" ]]; then
+    UPDATE_BACKUP_FAILURE_DETAIL="active OpenClaw package version could not be read"
+    return 1
+  fi
+  git_revision="$(git -C "$package_root" rev-parse HEAD 2>/dev/null || true)"
+  if git -C "$package_root" rev-parse --is-inside-work-tree >/dev/null 2>&1 && [[ -z "$git_revision" ]]; then
+    UPDATE_BACKUP_FAILURE_DETAIL="active OpenClaw Git revision could not be read"
+    return 1
+  fi
+  build_info="$package_root/dist/build-info.json"
+
+  local snapshot archive database canonical relative archive_path destination integrity
+  local database_count=0 external_count=0
+  local -A seen_databases=()
+  snapshot="$(mktemp -d "$UPDATE_BACKUP_DIR/.snapshot.XXXXXX")" || {
+    UPDATE_BACKUP_FAILURE_DETAIL="could not create backup staging directory"
+    return 1
+  }
+  archive="$UPDATE_BACKUP_DIR/openclaw-pre-update-$RUN_ID.tar.gz"
+  mkdir -p "$snapshot/state" "$snapshot/external-databases"
+  : >"$snapshot/database-map.tsv"
+
+  while IFS= read -r database; do
+    [[ -n "$database" ]] || continue
+    if [[ "$database" == *$'\n'* || "$database" == *$'\t'* || "$database" == *"'"* ]]; then
+      UPDATE_BACKUP_FAILURE_DETAIL="database path contains unsupported characters"
+      rm -rf "$snapshot"
+      return 1
+    fi
+    canonical="$(readlink -f "$database" 2>/dev/null || true)"
+    if [[ -z "$canonical" || ! -f "$canonical" ]]; then
+      UPDATE_BACKUP_FAILURE_DETAIL="registered OpenClaw database is missing: $database"
+      rm -rf "$snapshot"
+      return 1
+    fi
+    [[ -z "${seen_databases[$canonical]:-}" ]] || continue
+    seen_databases[$canonical]=1
+
+    if [[ "$canonical" == "$OPENCLAW_STATE_HOME/"* ]]; then
+      relative="${canonical#"$OPENCLAW_STATE_HOME"/}"
+      archive_path="state/$relative"
+    else
+      external_count=$((external_count + 1))
+      archive_path="external-databases/$external_count/$(basename "$canonical")"
+    fi
+    destination="$snapshot/$archive_path"
+    [[ "$destination" != *"'"* ]] || {
+      UPDATE_BACKUP_FAILURE_DETAIL="backup destination contains unsupported characters"
+      rm -rf "$snapshot"
+      return 1
+    }
+    mkdir -p "$(dirname "$destination")"
+    if ! "$SQLITE3_BIN" -readonly "$canonical" ".backup '$destination'" >/dev/null 2>&1; then
+      UPDATE_BACKUP_FAILURE_DETAIL="SQLite backup failed for $canonical"
+      rm -rf "$snapshot"
+      return 1
+    fi
+    integrity="$("$SQLITE3_BIN" -readonly "$destination" 'PRAGMA integrity_check;' 2>/dev/null)"
+    if [[ "$integrity" != "ok" ]]; then
+      UPDATE_BACKUP_FAILURE_DETAIL="SQLite integrity check failed for $canonical"
+      rm -rf "$snapshot"
+      return 1
+    fi
+    printf '%s\t%s\n' "$canonical" "$archive_path" >>"$snapshot/database-map.tsv"
+    database_count=$((database_count + 1))
+  done < <(update_backup_database_paths)
+
+  if (( database_count == 0 )); then
+    UPDATE_BACKUP_FAILURE_DETAIL="no OpenClaw databases were found"
+    rm -rf "$snapshot"
+    return 1
+  fi
+
+  install -m 0600 "$OPENCLAW_CONFIG_FILE" "$snapshot/openclaw.json"
+  if [[ -f "$build_info" ]] && jq empty "$build_info" >/dev/null 2>&1; then
+    install -m 0600 "$build_info" "$snapshot/build-info.json"
+  fi
+  {
+    printf 'created_at=%q\n' "$RUN_ISO"
+    printf 'openclaw_version=%q\n' "${CURRENT_VERSION_BEFORE:-$package_version}"
+    printf 'package_version=%q\n' "$package_version"
+    printf 'schema_writer_version=%q\n' "${SCHEMA_WRITER_VERSION:-unknown}"
+    printf 'state_home=%q\n' "$OPENCLAW_STATE_HOME"
+    printf 'config_path=%q\n' "$OPENCLAW_CONFIG_FILE"
+    printf 'package_root=%q\n' "$package_root"
+    printf 'git_revision=%q\n' "$git_revision"
+    printf 'database_count=%q\n' "$database_count"
+  } >"$snapshot/manifest.env"
+
+  if ! (cd "$snapshot" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS && sha256sum -c SHA256SUMS >/dev/null); then
+    UPDATE_BACKUP_FAILURE_DETAIL="backup checksum verification failed"
+    rm -rf "$snapshot"
+    return 1
+  fi
+  if ! tar -czf "$archive" -C "$snapshot" . || ! gzip -t "$archive" || ! tar -tzf "$archive" >/dev/null; then
+    UPDATE_BACKUP_FAILURE_DETAIL="backup archive verification failed"
+    rm -rf "$snapshot" "$archive"
+    return 1
+  fi
+  chmod 0600 "$archive"
+  rm -rf "$snapshot"
+  UPDATE_BACKUP_PATH="$archive"
+  return 0
+}
+
+create_pre_update_backup() {
+  [[ "$UPDATE_BACKUP_ENABLED" == "true" ]] || return 0
+  [[ "$UPDATE_BACKUP_CREATED" -eq 0 ]] || return 0
+  mkdir -p "$UPDATE_BACKUP_DIR"
+
+  local cmd output="" status=1 native_path=""
+  if [[ "$UPDATE_BACKUP_MODE" == "openclaw" ]]; then
+    build_openclaw_cmd cmd
+    cmd+=(backup create --output "$UPDATE_BACKUP_DIR" --verify --no-include-workspace --json)
+    local backup_cmd=(timeout --kill-after=30s "${UPDATE_BACKUP_TIMEOUT}s" "${cmd[@]}")
+    run_capture_with_heartbeat output status "Creating verified pre-update backup" 30 "${backup_cmd[@]}"
+    if [[ "$status" -eq 0 ]]; then
+      native_path="$(printf '%s\n' "$output" | json_payload_from_output | jq -r '.archivePath // .outputPath // .path // empty' 2>/dev/null)"
+      if [[ -n "$native_path" && -f "$native_path" ]]; then
+        UPDATE_BACKUP_CREATED=1
+        UPDATE_BACKUP_PATH="$(readlink -f "$native_path" 2>/dev/null || printf '%s' "$native_path")"
+        append_array FIXES "Created a verified pre-update OpenClaw backup at $UPDATE_BACKUP_PATH."
+        return 0
+      fi
+      UPDATE_BACKUP_FAILURE_DETAIL="OpenClaw backup returned success without a readable archive path"
+    else
+      UPDATE_BACKUP_FAILURE_DETAIL="$(remediation_detail_from_output "$output")"
+    fi
+  elif [[ "$UPDATE_BACKUP_MODE" != "sqlite" ]]; then
+    UPDATE_BACKUP_FAILURE_DETAIL="unsupported UPDATE_BACKUP_MODE=$UPDATE_BACKUP_MODE"
+  fi
+
+  if [[ "$UPDATE_BACKUP_MODE" == "sqlite" || "$UPDATE_BACKUP_MODE" == "openclaw" ]] && create_sqlite_config_update_backup; then
+    UPDATE_BACKUP_CREATED=1
+    rotate_update_backups
+    append_array FIXES "Created and verified SQLite/config update backup at $UPDATE_BACKUP_PATH."
+    return 0
+  fi
+
+  UPDATE_ERROR="$UPDATE_BACKUP_FAILURE_DETAIL"
+  add_incident_code "update_backup_failed"
+  if [[ "$UPDATE_BACKUP_REQUIRED" == "true" ]]; then
+    append_array ERRORS "Verified pre-update backup failed; update was blocked to preserve a recoverable code/state pair."
+    append_array ACTIONS "Repair the reported backup prerequisite before retrying the update."
+    return 1
+  fi
+  append_sanity_finding "Verified pre-update backup failed; policy allowed the update to continue."
+  return 0
+}
+
 validate_openclaw_cli_after_update() {
   local output status version recovery_status=0 detail=""
 
@@ -4694,6 +4914,12 @@ run_update() {
     append_array FIXES "Dry-run active: update was evaluated but not applied."
     UPDATE_SUCCEEDED=0
     return 0
+  fi
+
+  if ! create_pre_update_backup; then
+    UPDATE_SUCCEEDED=0
+    CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+    return 1
   fi
 
   local cmd
@@ -5313,6 +5539,10 @@ EOF
 
   if [[ "$CONFIG_BACKUP_CREATED" -eq 1 ]]; then
     printf '\nConfig backup: created\n'
+  fi
+
+  if [[ "$UPDATE_BACKUP_CREATED" -eq 1 ]]; then
+    printf '\nPre-update backup: %s\n' "${UPDATE_BACKUP_PATH:-created and verified}"
   fi
 
   if [[ "$CONFIG_RESTORED" -eq 1 ]]; then
