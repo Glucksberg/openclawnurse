@@ -60,6 +60,13 @@ Common settings:
 - `RUN_PROFILE`: `light` for the normal daily run, or `heavy` for full doctor/security maintenance.
 - `openclawnurse-heavy`: installed wrapper/trigger key for agents to request the heavy profile explicitly.
 - `AUTO_UPDATE`: whether the Nurse should apply available updates.
+- `UPDATE_BACKUP_ENABLED` / `UPDATE_BACKUP_REQUIRED`: create and require a
+  consistency-checked recovery bundle before every mutable OpenClaw update.
+- `UPDATE_BACKUP_MODE`: `sqlite` (default) captures the active config, shared and
+  registered per-agent SQLite databases, source revision, package version, build
+  metadata, path map, and checksums. `openclaw` requests a full portable archive
+  first and falls back to the compact bundle.
+- `UPDATE_BACKUP_RETENTION`: number of compact pre-update archives retained.
 - `AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE`: validates the target release's Node
   engine before an update, selects a compatible installed runtime for the CLI
   and its child processes, and retries maintenance with it if an update strands
@@ -87,7 +94,7 @@ Common settings:
 - `SELF_UPDATE_REPO_DIR`: local OpenClawNurse git checkout used for self-update. The installer writes this automatically.
 - `SELF_UPDATE_POLICY`: `reset-to-remote` for aggressive upstream convergence with a clean-worktree guard, or `fast-forward` for stricter history preservation.
 - `SELF_UPDATE_TIMEOUT`: per-step timeout for self-update fetch, validation and apply operations. The default is 900 seconds to leave room for smoke tests on small hosts.
-- The systemd unit constrains Nurse runs with memory/swap/CPU limits so a stuck OpenClaw maintenance command is killed with the service instead of exhausting the host. A final `FAILED*` report exits nonzero so systemd and external monitors can escalate it.
+- The systemd unit constrains Nurse runs with memory/swap/CPU limits while reserving enough memory for OpenClaw's staged source-checkout build. A final `FAILED*` report exits nonzero so systemd and external monitors can escalate it.
 - `RESTART_MODE`: gateway restart strategy, usually `systemd_user`.
 - `SYSTEMD_UNIT_NAME`: gateway service name, usually `openclaw-gateway.service`.
 - `REPORT_CHANNEL`: report channel, for example `telegram` or `none`.

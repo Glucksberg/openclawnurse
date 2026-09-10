@@ -16,6 +16,11 @@ ON_CALENDAR="${ON_CALENDAR:-*-*-* 04:30:00}"
 CRON_SCHEDULE="${CRON_SCHEDULE:-30 4 * * *}"
 ENABLE_TIMER="${ENABLE_TIMER:-true}"
 RUN_DRY_RUN="${RUN_DRY_RUN:-true}"
+NURSE_MEMORY_HIGH="${NURSE_MEMORY_HIGH:-4G}"
+NURSE_MEMORY_MAX="${NURSE_MEMORY_MAX:-5G}"
+NURSE_MEMORY_SWAP_MAX="${NURSE_MEMORY_SWAP_MAX:-2G}"
+NURSE_CPU_QUOTA="${NURSE_CPU_QUOTA:-80%}"
+NURSE_TASKS_MAX="${NURSE_TASKS_MAX:-512}"
 CONFIGURE_OPENCLAW_ALERT="${CONFIGURE_OPENCLAW_ALERT:-auto}"
 OPENCLAW_BIN="${OPENCLAW_BIN:-openclaw}"
 OPENCLAW_ALERT_TARGET="${OPENCLAW_ALERT_TARGET:-}"
@@ -565,6 +570,11 @@ render_systemd_units() {
   sed \
     -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" \
     -e "s|__CONFIG_FILE__|$CONFIG_FILE|g" \
+    -e "s|__MEMORY_HIGH__|$NURSE_MEMORY_HIGH|g" \
+    -e "s|__MEMORY_MAX__|$NURSE_MEMORY_MAX|g" \
+    -e "s|__MEMORY_SWAP_MAX__|$NURSE_MEMORY_SWAP_MAX|g" \
+    -e "s|__CPU_QUOTA__|$NURSE_CPU_QUOTA|g" \
+    -e "s|__TASKS_MAX__|$NURSE_TASKS_MAX|g" \
     "$REPO_ROOT/systemd/openclawnurse.service" >"$SYSTEMD_USER_DIR/openclawnurse.service"
 
   sed \
@@ -647,6 +657,12 @@ main() {
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
   apply_cli_overrides
+  if [[ "${UPDATE_BACKUP_ENABLED:-true}" == "true" ]]; then
+    require_cmd "${SQLITE3_BIN:-sqlite3}"
+    require_cmd tar
+    require_cmd gzip
+    require_cmd sha256sum
+  fi
   install_runtime_files
   configure_self_update_env
   install_cli_wrapper

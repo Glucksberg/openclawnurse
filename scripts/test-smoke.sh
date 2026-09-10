@@ -19,6 +19,7 @@ fi
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 JQ_BIN="${JQ_BIN:-$(command -v jq 2>/dev/null || printf jq)}"
+SQLITE3_BIN="${SQLITE3_BIN:-$(command -v sqlite3 2>/dev/null || printf sqlite3)}"
 SMOKE_TMP_ROOT="${OPENCLAWNURSE_SMOKE_TMP_ROOT:-$(mktemp -d)}"
 
 # Keep smoke runs hermetic even when they are launched by a live Nurse process
@@ -65,6 +66,8 @@ export SELF_UPDATE_POST_SELF_TEST=false
 # Legacy fixtures inspect persisted FAILED reports after the command returns.
 # Dedicated coverage below verifies the production-default nonzero exit contract.
 export EXIT_NONZERO_ON_FAILED_STATUS=false
+# Backup-specific fixtures enable the required recovery point explicitly.
+export UPDATE_BACKUP_ENABLED=false
 # Most legacy smoke fixtures use standalone fake CLIs without a package root or
 # registry metadata. Runtime-selection tests opt in explicitly below.
 export AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE=false
@@ -3412,6 +3415,128 @@ EOF
   pass "configured security warnings are accepted without hiding new warnings"
 }
 
+make_updatable_packaged_openclaw() {
+  local root="$1" marker="$2"
+  mkdir -p "$root/bin" "$root/dist"
+  printf '{"name":"openclaw","version":"2026.1.0"}\n' >"$root/package.json"
+  printf '{"version":"2026.1.0","commit":"abc123","buildId":"test-build"}\n' >"$root/dist/build-info.json"
+  printf '2026.1.0\n' >"$root/version"
+  cat >"$root/bin/openclaw" <<EOF
+#!/usr/bin/env bash
+root="$root"
+marker="$marker"
+if [[ "\${1:-}" == "--profile" ]]; then shift 2; fi
+case "\${1:-}" in
+  --version) printf 'OpenClaw %s\\n' "\$(<"\$root/version")" ;;
+  update)
+    if [[ "\${2:-}" == "status" ]]; then
+      printf '{"availability":{"available":true,"latestVersion":"2026.1.1"},"channel":{"value":"stable"}}\\n'
+    else
+      printf 'updated\\n' >"\$marker"
+      printf '2026.1.1\\n' >"\$root/version"
+      printf '{"ok":true}\\n'
+    fi
+    ;;
+  doctor) printf 'doctor complete\\n' ;;
+  health) printf '{"ok":true}\\n' ;;
+  status) printf '{"runtimeVersion":"fake","gateway":{"reachable":true},"sessions":{"count":0},"tasks":{},"taskAudit":{}}\\n' ;;
+  *) printf '{}\\n' ;;
+esac
+EOF
+  chmod +x "$root/bin/openclaw"
+}
+
+smoke_verified_update_backup() {
+  local tmp archive extract
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/update-backup.XXXXXX")"
+  mkdir -p "$tmp/home" "$tmp/state/state" "$tmp/state/agents/a/agent" "$tmp/nurse" "$tmp/cfg" "$tmp/external"
+  make_updatable_packaged_openclaw "$tmp/package" "$tmp/update-ran"
+  "$SQLITE3_BIN" "$tmp/state/state/openclaw.sqlite" \
+    "CREATE TABLE agent_databases(agent_id TEXT, path TEXT); INSERT INTO agent_databases VALUES('external','$tmp/external/agent.sqlite'); CREATE TABLE sample(value TEXT); INSERT INTO sample VALUES('shared');"
+  "$SQLITE3_BIN" "$tmp/state/agents/a/agent/openclaw-agent.sqlite" \
+    "CREATE TABLE sample(value TEXT); INSERT INTO sample VALUES('standard-agent');"
+  "$SQLITE3_BIN" "$tmp/external/agent.sqlite" \
+    "CREATE TABLE sample(value TEXT); INSERT INTO sample VALUES('external-agent');"
+  printf '{"gateway":{"mode":"local"}}\n' >"$tmp/openclaw.json"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/package/bin/openclaw"
+OPENCLAW_STATE_HOME="$tmp/state"
+OPENCLAW_CONFIG_FILE="$tmp/openclaw.json"
+STATE_DIR="$tmp/nurse"
+UPDATE_BACKUP_ENABLED="true"
+UPDATE_BACKUP_REQUIRED="true"
+UPDATE_BACKUP_MODE="sqlite"
+UPDATE_BACKUP_DIR="$tmp/backups"
+AUTO_UPDATE="true"
+REPORT_CHANNEL="none"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EOF
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" >/dev/null
+  [[ -f "$tmp/update-ran" ]] || fail "verified backup did not allow the update"
+  archive="$(find "$tmp/backups" -maxdepth 1 -name 'openclaw-pre-update-*.tar.gz' -print -quit)"
+  [[ -n "$archive" ]] || fail "pre-update archive was not created"
+  [[ "$(stat -c '%a' "$archive")" == "600" ]] || fail "pre-update archive is not mode 0600"
+  extract="$tmp/extract"
+  mkdir -p "$extract"
+  tar -xzf "$archive" -C "$extract"
+  (cd "$extract" && sha256sum -c SHA256SUMS >/dev/null) || fail "archive checksums do not verify"
+  grep -Fq "$tmp/external/agent.sqlite" "$extract/database-map.tsv" || fail "external registered database is missing from path map"
+  grep -Fq 'git_revision=' "$extract/manifest.env" || fail "source revision metadata is missing"
+  "$SQLITE3_BIN" -readonly "$extract/external-databases/1/agent.sqlite" 'SELECT value FROM sample;' | grep -Fxq external-agent ||
+    fail "external registered database was not restored into the archive"
+  "$JQ_BIN" -e '.updateBackup.created == true and (.updateBackup.path | length > 0)' "$tmp/nurse/doctor-state.json" >/dev/null ||
+    fail "verified backup was not recorded in state"
+  pass "updates require a verified config and multi-database recovery bundle"
+}
+
+smoke_required_backup_failure_blocks_update() {
+  local tmp
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/update-backup-failure.XXXXXX")"
+  mkdir -p "$tmp/home" "$tmp/state/state" "$tmp/nurse" "$tmp/cfg"
+  make_updatable_packaged_openclaw "$tmp/package" "$tmp/update-ran"
+  "$SQLITE3_BIN" "$tmp/state/state/openclaw.sqlite" 'CREATE TABLE sample(value TEXT);'
+  printf '{}\n' >"$tmp/openclaw.json"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/package/bin/openclaw"
+OPENCLAW_STATE_HOME="$tmp/state"
+OPENCLAW_CONFIG_FILE="$tmp/openclaw.json"
+STATE_DIR="$tmp/nurse"
+UPDATE_BACKUP_ENABLED="true"
+UPDATE_BACKUP_REQUIRED="true"
+UPDATE_BACKUP_MODE="sqlite"
+UPDATE_BACKUP_DIR="$tmp/backups"
+SQLITE3_BIN="/bin/false"
+AUTO_UPDATE="true"
+REPORT_CHANNEL="none"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EOF
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" >/dev/null
+  [[ ! -e "$tmp/update-ran" ]] || fail "update ran after its required backup failed"
+  "$JQ_BIN" -e '.status | startswith("FAILED")' "$tmp/nurse/doctor-state.json" >/dev/null ||
+    fail "required backup failure did not fail the run"
+  "$JQ_BIN" -e '.incidentCodes | index("update_backup_failed")' "$tmp/nurse/doctor-state.json" >/dev/null ||
+    fail "required backup failure incident code is missing"
+  pass "required backup failures block updates"
+}
+
 smoke_failed_status_exits_nonzero() {
   local tmp status
   tmp="$(mktemp -d "$SMOKE_TMP_ROOT/failed-exit.XXXXXX")"
@@ -3477,6 +3602,7 @@ EOF
 
 main() {
   require_cmd "$JQ_BIN"
+  require_cmd "$SQLITE3_BIN"
   require_cmd git
 
   smoke_doctor_without_complete_config
@@ -3522,6 +3648,8 @@ main() {
   smoke_dry_run_reports_openclaw_pm2_daemon_cleanup
   smoke_blocks_gateway_restart_when_pm2_daemon_is_in_gateway_cgroup
   smoke_accepts_configured_security_warnings
+  smoke_verified_update_backup
+  smoke_required_backup_failure_blocks_update
   smoke_failed_status_exits_nonzero
   smoke_rejects_insecure_telegram_token_file
 }
