@@ -195,6 +195,7 @@ OPENCLAW_STATE_HOME="${OPENCLAW_STATE_HOME:-$HOME/.openclaw}"
 REPORT_CHANNEL="${REPORT_CHANNEL:-telegram}"
 TELEGRAM_TARGET="${TELEGRAM_TARGET:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_BOT_TOKEN_FILE="${TELEGRAM_BOT_TOKEN_FILE:-}"
 AUTO_DETECT_TELEGRAM_TARGET="${AUTO_DETECT_TELEGRAM_TARGET:-true}"
 TELEGRAM_MESSAGE_THREAD_ID="${TELEGRAM_MESSAGE_THREAD_ID:-}"
 TELEGRAM_API_BASE_URL="${TELEGRAM_API_BASE_URL:-https://api.telegram.org}"
@@ -242,6 +243,7 @@ GATEWAY_WAIT_TIMEOUT="${GATEWAY_WAIT_TIMEOUT:-180}"
 GATEWAY_WAIT_INTERVAL="${GATEWAY_WAIT_INTERVAL:-5}"
 HEALTH_TIMEOUT_MS="${HEALTH_TIMEOUT_MS:-10000}"
 MAX_CONSECUTIVE_UPDATE_FAILURES="${MAX_CONSECUTIVE_UPDATE_FAILURES:-3}"
+EXIT_NONZERO_ON_FAILED_STATUS="${EXIT_NONZERO_ON_FAILED_STATUS:-true}"
 RETRY_NOTIFICATION_ON_NEXT_RUN="${RETRY_NOTIFICATION_ON_NEXT_RUN:-true}"
 AUTO_REMEDIATE_MISSING_TRANSCRIPTS="${AUTO_REMEDIATE_MISSING_TRANSCRIPTS:-true}"
 AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS="${AUTO_REMEDIATE_ORPHAN_TRANSCRIPTS:-true}"
@@ -731,9 +733,33 @@ openclaw_config_telegram_bot_token() {
   fi
 }
 
+telegram_bot_token_file_is_secure() {
+  local path="$1"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+
+  local owner mode
+  owner="$(stat -c '%u' "$path" 2>/dev/null || true)"
+  mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+  [[ "$owner" =~ ^[0-9]+$ && "$owner" -eq "$(id -u)" ]] || return 1
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#$mode & 077) == 0 ))
+}
+
 detect_telegram_bot_token() {
   [[ -z "$TELEGRAM_BOT_TOKEN" ]] || return 0
   [[ "$REPORT_CHANNEL" == "telegram" ]] || return 0
+  if [[ -n "$TELEGRAM_BOT_TOKEN_FILE" ]]; then
+    if telegram_bot_token_file_is_secure "$TELEGRAM_BOT_TOKEN_FILE"; then
+      IFS= read -r TELEGRAM_BOT_TOKEN <"$TELEGRAM_BOT_TOKEN_FILE" || true
+      if [[ -n "$TELEGRAM_BOT_TOKEN" ]]; then
+        log INFO "Loaded TELEGRAM_BOT_TOKEN from owner-managed token file"
+        return 0
+      fi
+    else
+      TELEGRAM_TOKEN_FILE_INVALID=1
+      log WARN "Refusing insecure TELEGRAM_BOT_TOKEN_FILE; require a regular owner-owned file with no group/other permissions"
+    fi
+  fi
   command_exists jq || return 0
 
   local cfg_file="$OPENCLAW_CONFIG_FILE"
@@ -931,6 +957,7 @@ CONFIG_VERSION_DRIFT_FINDING=""
 CONFIG_VERSION_DRIFT_ACTION=""
 GATEWAY_SERVICE_REFRESH_FAILED=0
 GATEWAY_SERVICE_REFRESH_BLOCKS_RESTART=0
+TELEGRAM_TOKEN_FILE_INVALID=0
 
 load_previous_state() {
   if [[ -f "$STATE_FILE" ]] && jq empty "$STATE_FILE" >/dev/null 2>&1; then
@@ -4293,6 +4320,11 @@ run_preflight_checks() {
     fi
   done
 
+  if [[ "$TELEGRAM_TOKEN_FILE_INVALID" -eq 1 ]]; then
+    append_array ERRORS "TELEGRAM_BOT_TOKEN_FILE must be a regular owner-owned file with no group/other permissions."
+    missing_required=1
+  fi
+
   if [[ "$NO_NOTIFY" -eq 0 && "$REPORT_CHANNEL" == "telegram" && -z "$TELEGRAM_TARGET" ]]; then
     append_unique_array ACTIONS "Configure TELEGRAM_TARGET so OpenClawNurse can deliver reports."
   fi
@@ -5606,6 +5638,12 @@ main() {
 
   rotate_logs
   log INFO "$PROGRAM_NAME finished with status $STATUS in ${DURATION_SECONDS}s"
+  if [[ "$EXIT_NONZERO_ON_FAILED_STATUS" == "true" ]]; then
+    case "$STATUS" in
+      FAILED*) return 1 ;;
+    esac
+  fi
+  return 0
 }
 
 main "$@"

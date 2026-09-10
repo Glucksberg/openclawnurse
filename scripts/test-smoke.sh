@@ -62,6 +62,9 @@ export RUN_PROFILE=heavy
 # by self-update validation recursively start another self-update validation.
 export AUTO_SELF_UPDATE=false
 export SELF_UPDATE_POST_SELF_TEST=false
+# Legacy fixtures inspect persisted FAILED reports after the command returns.
+# Dedicated coverage below verifies the production-default nonzero exit contract.
+export EXIT_NONZERO_ON_FAILED_STATUS=false
 # Most legacy smoke fixtures use standalone fake CLIs without a package root or
 # registry metadata. Runtime-selection tests opt in explicitly below.
 export AUTO_SELECT_COMPATIBLE_OPENCLAW_NODE=false
@@ -3409,6 +3412,69 @@ EOF
   pass "configured security warnings are accepted without hiding new warnings"
 }
 
+smoke_failed_status_exits_nonzero() {
+  local tmp status
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/failed-exit.XXXXXX")"
+  mkdir -p "$tmp/bin" "$tmp/home" "$tmp/state" "$tmp/cfg"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="telegram"
+TELEGRAM_TARGET="123"
+TELEGRAM_BOT_TOKEN=""
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+ENABLE_COMMITMENTS_SANITY="false"
+ENABLE_SECURITY_AUDIT="false"
+ENABLE_PACKAGE_DRIFT_SANITY="false"
+ENABLE_DISK_SANITY="false"
+ENABLE_CRON_SANITY="false"
+CONFIG_BACKUP_ENABLED="false"
+RESTART_MODE="custom"
+EXIT_NONZERO_ON_FAILED_STATUS="true"
+EOF
+  set +e
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" >/dev/null
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "final FAILED status returned exit zero"
+  "$JQ_BIN" -e '.status == "FAILED_NOTIFICATION_PENDING"' "$tmp/state/doctor-state.json" >/dev/null ||
+    fail "nonzero exit test did not persist the failed report"
+  pass "final FAILED status exits nonzero"
+}
+
+smoke_rejects_insecure_telegram_token_file() {
+  local tmp status
+  tmp="$(mktemp -d "$SMOKE_TMP_ROOT/insecure-token-file.XXXXXX")"
+  mkdir -p "$tmp/bin" "$tmp/home" "$tmp/state" "$tmp/cfg"
+  make_fake_openclaw "$tmp/bin/openclaw"
+  printf 'fake-token\n' >"$tmp/token"
+  chmod 0644 "$tmp/token"
+  cat >"$tmp/cfg/openclawnurse.env" <<EOF
+OPENCLAW_BIN="$tmp/bin/openclaw"
+STATE_DIR="$tmp/state"
+REPORT_CHANNEL="telegram"
+TELEGRAM_TARGET="123"
+TELEGRAM_BOT_TOKEN_FILE="$tmp/token"
+AUTO_UPDATE="false"
+ENABLE_RUNTIME_SANITY="false"
+ENABLE_TELEGRAM_SANITY="false"
+ENABLE_GATEWAY_LOG_SCAN="false"
+CONFIG_BACKUP_ENABLED="false"
+EOF
+  set +e
+  HOME="$tmp/home" "$ROOT_DIR/scripts/openclaw-doctor.sh" --config "$tmp/cfg/openclawnurse.env" --self-test --no-notify >/dev/null
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "insecure Telegram token file was accepted"
+  grep -Fq 'Refusing insecure TELEGRAM_BOT_TOKEN_FILE' "$tmp/state/logs/"*.log ||
+    fail "insecure Telegram token file refusal was not logged"
+  pass "insecure Telegram token files are rejected"
+}
+
 main() {
   require_cmd "$JQ_BIN"
   require_cmd git
@@ -3456,6 +3522,8 @@ main() {
   smoke_dry_run_reports_openclaw_pm2_daemon_cleanup
   smoke_blocks_gateway_restart_when_pm2_daemon_is_in_gateway_cgroup
   smoke_accepts_configured_security_warnings
+  smoke_failed_status_exits_nonzero
+  smoke_rejects_insecure_telegram_token_file
 }
 
 main "$@"
